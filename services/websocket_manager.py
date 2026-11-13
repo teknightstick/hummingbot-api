@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import logging
 import time
 import uuid
@@ -51,6 +52,111 @@ class WebSocketManager:
         mn = settings.market_data.ws_min_update_interval
         mx = settings.market_data.ws_max_update_interval
         return max(mn, min(mx, interval))
+
+    def _cached_order_book_owner(self, connector_name: str):
+        """Find an already-published connector without invoking a resolver."""
+        connector_service = getattr(
+            self._market_data_service, "_connector_service", None
+        )
+        if connector_service is None:
+            return None
+        matches = [
+            connectors[connector_name]
+            for connectors in getattr(
+                connector_service, "_trading_connectors", {}
+            ).values()
+            if connector_name in connectors
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            return None
+        return getattr(connector_service, "_data_connectors", {}).get(
+            connector_name
+        )
+
+    @staticmethod
+    def _snapshot_order_book_ownership(connector):
+        tracker = getattr(connector, "order_book_tracker", None)
+        snapshots = []
+        for owner, attributes in (
+            (connector, ("_trading_pairs",)),
+            (
+                tracker,
+                (
+                    "_trading_pairs",
+                    "order_books",
+                    "_order_books",
+                    "_tracking_message_queues",
+                    "_saved_message_queues",
+                    "_past_diffs_windows",
+                    "_tracking_tasks",
+                ),
+            ),
+        ):
+            if owner is None:
+                continue
+            for attribute in attributes:
+                value = getattr(owner, attribute, None)
+                if isinstance(value, list):
+                    snapshots.append((value, list(value)))
+                elif isinstance(value, set):
+                    snapshots.append((value, set(value)))
+                elif isinstance(value, dict):
+                    snapshots.append((value, dict(value)))
+        return snapshots
+
+    @staticmethod
+    def _restore_order_book_ownership(snapshots) -> None:
+        for value, snapshot in snapshots:
+            if isinstance(value, list):
+                value[:] = snapshot
+            elif isinstance(value, set):
+                value.clear()
+                value.update(snapshot)
+            else:
+                value.clear()
+                value.update(snapshot)
+
+    async def _validate_order_book_replacement(
+        self, connector_name: str, trading_pair: str
+    ) -> bool:
+        """Validate a duplicate subscription without endangering its old feed."""
+        validate = getattr(
+            self._market_data_service, "validate_order_book_ready", None
+        )
+        if validate is not None:
+            result = validate(connector_name, trading_pair)
+            if inspect.isawaitable(result):
+                result = await result
+            return result is True
+
+        connector = self._cached_order_book_owner(connector_name)
+        tracker = getattr(connector, "order_book_tracker", None)
+        order_books = getattr(tracker, "order_books", {})
+        if trading_pair in order_books:
+            return True
+
+        get_order_book = getattr(self._market_data_service, "get_order_book", None)
+        if get_order_book is not None and get_order_book(
+            connector_name, trading_pair
+        ) is not None:
+            return True
+
+        snapshots = self._snapshot_order_book_ownership(connector)
+        try:
+            result = self._market_data_service.initialize_order_book(
+                connector_name, trading_pair
+            )
+            if inspect.isawaitable(result):
+                result = await result
+        except BaseException:
+            self._restore_order_book_ownership(snapshots)
+            raise
+        if result is not True:
+            self._restore_order_book_ownership(snapshots)
+            return False
+        return True
 
     async def handle_subscribe(self, conn_id: str, websocket: WebSocket, msg: dict):
         sub_type = msg.get("type")
@@ -119,6 +225,9 @@ class WebSocketManager:
                 update_interval=update_interval,
             )
 
+        existing_subs = self._connections.get(conn_id, {})
+        previous = existing_subs.get(sub_id)
+
         # Start the feed / ensure it exists. For candles, creating the feed also validates
         # the trading pair on first use (cache hit afterwards); an invalid pair raises ValueError.
         try:
@@ -132,9 +241,14 @@ class WebSocketManager:
                 await self._market_data_service.get_candles_feed(config)
             else:
                 # Both order_book and trades need the order book initialized
-                initialized = await self._market_data_service.initialize_order_book(
-                    connector, trading_pair
-                )
+                if previous is not None:
+                    initialized = await self._validate_order_book_replacement(
+                        connector, trading_pair
+                    )
+                else:
+                    initialized = await self._market_data_service.initialize_order_book(
+                        connector, trading_pair
+                    )
                 if initialized is not True:
                     await self._send_error(websocket, "feed_validation_failed")
                     return
@@ -173,7 +287,6 @@ class WebSocketManager:
         # Commit only after the replacement feed and task are valid. Every earlier
         # failure leaves the existing subscription and connection map untouched.
         subs = self._connections.setdefault(conn_id, {})
-        previous = subs.get(sub_id)
         subs[sub_id] = sub
         if previous is not None:
             self._cleanup_subscription(previous)

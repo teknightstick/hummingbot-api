@@ -87,6 +87,8 @@ class AccountTradingInterface:
             connector_service._market_cleanup_owners = {}
         if not hasattr(connector_service, "_market_residual_tasks"):
             connector_service._market_residual_tasks = {}
+        if not hasattr(connector_service, "_market_cleanup_phases"):
+            connector_service._market_cleanup_phases = {}
         self._market_locks = connector_service._market_locks
         self._market_lock_users = connector_service._market_lock_users
         self._market_locks_guard = connector_service._market_locks_guard
@@ -94,6 +96,7 @@ class AccountTradingInterface:
         self._cleanup_residuals = connector_service._market_cleanup_residuals
         self._cleanup_owners = connector_service._market_cleanup_owners
         self._residual_tasks = connector_service._market_residual_tasks
+        self._cleanup_phases = connector_service._market_cleanup_phases
         self._market_owner_token = object()
         self._capability_registry = ConnectorCapabilityRegistry()
 
@@ -592,40 +595,126 @@ class AccountTradingInterface:
             "remote_cleanup",
             trading_pair,
         )
+        phase = self._cleanup_phases.get(task_key)
+        if (
+            phase is not None
+            and phase["complete"]
+            and not phase["was_retained"]
+            and phase["error_code"] is not None
+        ):
+            # An immediate false/raise is retryable on a later public call. A
+            # retained timeout owner is different: its terminal result is the
+            # authoritative operation result and must never be repeated.
+            self._cleanup_phases.pop(task_key, None)
+            phase = None
+        if phase is None:
+            phase = {
+                "task": None,
+                "complete": False,
+                "result": None,
+                "error_code": None,
+                "cancel_requested": False,
+                "was_retained": False,
+                "connector_preexisting": connector_preexisting,
+            }
+            self._cleanup_phases[task_key] = phase
+        if phase["complete"]:
+            return phase["error_code"]
+
         try:
-            if connector_preexisting:
-                cleanup = getattr(self._market_data_service, "remove_trading_pair", None)
-                if cleanup is None:
-                    return "pair_cleanup_unavailable"
-                awaitable = cleanup(
-                    connector_name=connector_name,
-                    trading_pair=trading_pair,
-                    account_name=self._account_name,
+            cleanup_task = phase["task"]
+            if cleanup_task is None:
+                if connector_preexisting:
+                    cleanup = getattr(
+                        self._market_data_service, "remove_trading_pair", None
+                    )
+                    if cleanup is None:
+                        phase["complete"] = True
+                        phase["error_code"] = "pair_cleanup_unavailable"
+                        return phase["error_code"]
+                    awaitable = cleanup(
+                        connector_name=connector_name,
+                        trading_pair=trading_pair,
+                        account_name=self._account_name,
+                    )
+                else:
+                    cleanup = getattr(
+                        self._connector_service,
+                        "stop_trading_connector",
+                        None,
+                    )
+                    if cleanup is None:
+                        phase["complete"] = True
+                        phase["error_code"] = "connector_cleanup_unavailable"
+                        return phase["error_code"]
+                    awaitable = cleanup(self._account_name, connector_name)
+                cleanup_task = asyncio.ensure_future(awaitable)
+                phase["task"] = cleanup_task
+
+            if not cleanup_task.done():
+                _, pending = await asyncio.wait(
+                    {cleanup_task}, timeout=_REMOTE_CLEANUP_TIMEOUT
                 )
             else:
-                cleanup = getattr(self._connector_service, "stop_trading_connector", None)
-                if cleanup is None:
-                    return "connector_cleanup_unavailable"
-                awaitable = cleanup(self._account_name, connector_name)
-            cleanup_task = asyncio.ensure_future(awaitable)
-            done, pending = await asyncio.wait(
-                {cleanup_task}, timeout=_REMOTE_CLEANUP_TIMEOUT
-            )
+                pending = set()
             if pending:
-                cleanup_task.cancel()
-                self._residual_tasks.setdefault(task_key, set()).add(cleanup_task)
+                if (
+                    not phase["cancel_requested"]
+                    and cleanup_task.cancelling() == 0
+                ):
+                    cleanup_task.cancel()
+                    phase["cancel_requested"] = True
+                phase["was_retained"] = True
+                self._residual_tasks.setdefault(task_key, set()).add(
+                    cleanup_task
+                )
                 return "cleanup_deadline_exceeded"
+
+            retained = self._residual_tasks.get(task_key)
+            if retained is not None:
+                retained.discard(cleanup_task)
+                if not retained:
+                    self._residual_tasks.pop(task_key, None)
             try:
                 result = cleanup_task.result()
             except asyncio.CancelledError:
-                return "cleanup_cancelled"
+                phase["complete"] = True
+                phase["error_code"] = "cleanup_cancelled"
+                return phase["error_code"]
+            except BaseException:
+                phase["complete"] = True
+                phase["error_code"] = "cleanup_raised"
+                return phase["error_code"]
+            phase["complete"] = True
+            phase["result"] = result
             if result is False:
-                return "cleanup_returned_false"
+                phase["error_code"] = "cleanup_returned_false"
+                return phase["error_code"]
             return None
         except asyncio.CancelledError:
+            cleanup_task = phase.get("task")
+            if cleanup_task is not None:
+                phase["was_retained"] = True
+                self._residual_tasks.setdefault(task_key, set()).add(
+                    cleanup_task
+                )
             raise
         except BaseException:
-            return "cleanup_raised"
+            phase["complete"] = True
+            phase["error_code"] = "cleanup_raised"
+            return phase["error_code"]
+
+    def _finish_remote_cleanup_phase(
+        self, connector_name: str, trading_pair: str
+    ) -> None:
+        task_key = (
+            self._account_name,
+            connector_name,
+            "remote_cleanup",
+            trading_pair,
+        )
+        self._cleanup_phases.pop(task_key, None)
+        self._residual_tasks.pop(task_key, None)
 
     async def _retry_market_cleanup_residual(
         self, connector_name: str, trading_pair: str
@@ -692,6 +781,7 @@ class AccountTradingInterface:
             else False
         )
         if reason is None and tasks_ok and local_ok and not stale_local:
+            self._finish_remote_cleanup_phase(connector_name, residual_pair)
             self._cleanup_residuals.pop(key, None)
             self._cleanup_owners.pop(key, None)
             return
@@ -743,6 +833,7 @@ class AccountTradingInterface:
             "pair" if connector_preexisting else "connector",
         )
         if reason is None and local_ok and not stale_local:
+            self._finish_remote_cleanup_phase(connector_name, trading_pair)
             self._cleanup_residuals.pop(key, None)
             self._cleanup_owners.pop(key, None)
             return None
@@ -1052,6 +1143,50 @@ class AccountTradingInterface:
         """
         Cleanup resources. Called when shutting down.
         """
+        for connector_name, pairs in list(self._markets.items()):
+            for trading_pair in list(pairs):
+                connector = self.connectors.get(connector_name)
+                peer_owned = self._has_other_market_owners(
+                    connector_name, trading_pair
+                )
+                self._remove_local_market_ownership(
+                    connector_name, trading_pair
+                )
+                tracker = getattr(connector, "order_book_tracker", None)
+                remote_state_remains = (
+                    connector is not None
+                    and self._pair_exists_in_connector_state(
+                        connector, tracker, trading_pair
+                    )
+                )
+                if peer_owned or not remote_state_remains:
+                    continue
+                key = self._residual_key(
+                    connector_name, trading_pair, "pair"
+                )
+                detail = CapabilityErrorDetail(
+                    code="market_cleanup_residual",
+                    message=(
+                        f"Cleanup is incomplete for "
+                        f"'{connector_name}/{trading_pair}'"
+                    ),
+                    connector=connector_name,
+                    feature=ConnectorFeature.DYNAMIC_SUBSCRIPTION.value,
+                    trading_pair=trading_pair,
+                    reason="cleanup_incomplete",
+                    cleanup_scope="pair",
+                    cleanup_code="interface_cleanup_pending",
+                )
+                self._cleanup_residuals.setdefault(
+                    key, detail.model_dump(exclude_none=True)
+                )
+                self._cleanup_owners.setdefault(
+                    key,
+                    {
+                        "connector": connector,
+                        "connector_preexisting": True,
+                    },
+                )
         self._markets.clear()
         logger.info(f"AccountTradingInterface cleanup completed for account {self._account_name}")
 

@@ -200,6 +200,23 @@ class MarketDataService:
         """Public route boundary for a connector-declared operation."""
         self._require_capability(connector_name, feature, trading_pair)
 
+    def validate_order_book_ready(
+            self,
+            connector_name: str,
+            trading_pair: str,
+            account_name: Optional[str] = None,
+    ) -> bool:
+        """Validate an existing live feed without adding or removing anything."""
+        self._require_capability(
+            connector_name, ConnectorFeature.LIVE_ORDER_BOOK, trading_pair
+        )
+        validate = getattr(
+            self._connector_service, "validate_order_book_ready", None
+        )
+        if validate is None:
+            return False
+        return validate(connector_name, trading_pair, account_name)
+
     async def initialize_order_book(
             self,
             connector_name: str,

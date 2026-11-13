@@ -493,6 +493,74 @@ class UnifiedConnectorService:
         logger.debug(f"Using data connector for {connector_name} (no trading connector)")
         return self.get_data_connector(connector_name)
 
+    def _resolve_restart_connector_owner(
+        self,
+        connector_name: str,
+        account_name: Optional[str],
+    ) -> Tuple[Optional[str], Optional[ConnectorBase], Optional[str]]:
+        """Resolve a restart's physical connector and lock owner without guessing."""
+        if account_name is not None:
+            connector = self._trading_connectors.get(account_name, {}).get(
+                connector_name
+            )
+            if connector is None:
+                # Dependency-light callers may override the strict resolver. The
+                # production implementation preserves the same account boundary.
+                connector = self.get_best_connector_for_market(
+                    connector_name, account_name
+                )
+            return account_name, connector, None
+
+        matches = [
+            (owner_account, connectors[connector_name])
+            for owner_account, connectors in self._trading_connectors.items()
+            if connector_name in connectors
+        ]
+        if len(matches) > 1:
+            return None, None, "ambiguous_connector_owner"
+        if matches:
+            owner_account, connector = matches[0]
+            return owner_account, connector, None
+
+        connector = self._data_connectors.get(connector_name)
+        if connector is None:
+            connector = self.get_best_connector_for_market(connector_name)
+        return "__data__", connector, None
+
+    def validate_order_book_ready(
+        self,
+        connector_name: str,
+        trading_pair: str,
+        account_name: Optional[str] = None,
+    ) -> bool:
+        """Read existing feed state without constructing or mutating a connector."""
+        if account_name is not None:
+            connector = self._trading_connectors.get(account_name, {}).get(
+                connector_name
+            )
+        else:
+            matches = [
+                connectors[connector_name]
+                for connectors in self._trading_connectors.values()
+                if connector_name in connectors
+            ]
+            if len(matches) > 1:
+                return False
+            connector = matches[0] if matches else self._data_connectors.get(
+                connector_name
+            )
+        tracker = getattr(connector, "order_book_tracker", None)
+        if tracker is None:
+            return False
+        order_books = getattr(tracker, "order_books", {})
+        if trading_pair not in order_books:
+            return False
+        for owner in (connector, tracker):
+            pairs = getattr(owner, "_trading_pairs", None)
+            if pairs is not None and trading_pair not in pairs:
+                return False
+        return True
+
     # =========================================================================
     # Order Book Initialization
     # =========================================================================
@@ -1587,32 +1655,89 @@ class UnifiedConnectorService:
         except Exception as e:
             logger.error(f"Error updating connector state: {e}")
 
-    async def _cleanup_restart_owner(
+    async def _verify_restart_owner_phases(
         self, owner_key: Tuple[str, str, str]
     ) -> bool:
-        """Consume or execute the private tracker cleanup owned by a restart."""
+        """Consume retained restart stop/start results before a final stop."""
+        self._ensure_connector_cleanup_state()
+        owner = self._connector_cleanup_owners.get(owner_key)
+        if owner is None:
+            return True
+        tracker = owner.get("tracker") if isinstance(owner, dict) else owner
+        if tracker is None:
+            return False
+        phases = self._connector_cleanup_phases.get(owner_key, {})
+        verified = True
+        for phase_name, method_name in (
+            ("restart_stop", "stop"),
+            ("restart_start", "start"),
+        ):
+            if phase_name not in phases:
+                continue
+            operation = getattr(tracker, method_name)
+            if phase_name == "restart_start" and isinstance(owner, dict):
+                owner["start_may_activate"] = True
+            try:
+                await self._run_owner_operation(
+                    owner_key, phase_name, operation
+                )
+                if phase_name == "restart_start" and isinstance(owner, dict):
+                    owner["tracker_started"] = True
+            except asyncio.CancelledError:
+                raise
+            except BaseException:
+                # A terminal false/raise/cancel is still an inspected result:
+                # the final-generation stop must run because start may already
+                # have activated. Only a nonterminal retained task defers it.
+                phase = phases[phase_name]
+                task = phase.get("task")
+                if not phase.get("complete") and task is not None and task.done():
+                    try:
+                        await self._run_owner_operation(
+                            owner_key, phase_name, operation
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except BaseException:
+                        pass
+                if not phase.get("complete"):
+                    verified = False
+        return verified and await self._drain_owner_tasks(owner_key)
+
+    async def _cleanup_restart_owner(
+        self,
+        owner_key: Tuple[str, str, str],
+        stopped_tracker=None,
+    ) -> bool:
+        """Finish one restart owner, coalescing a later network final stop."""
         self._ensure_connector_cleanup_state()
         owner = self._connector_cleanup_owners.get(owner_key)
         if owner is None:
             self._finish_owner_cleanup(owner_key)
             return True
         tracker = owner.get("tracker") if isinstance(owner, dict) else owner
-        if tracker is None:
-            return False
-        if not await self._drain_owner_tasks(owner_key):
+        if tracker is None or not await self._verify_restart_owner_phases(owner_key):
             return False
 
         phases = self._connector_cleanup_phases.get(owner_key, {})
-        if isinstance(owner, dict) and owner.get("tracker_started", False):
-            phase_name = "restart_cleanup_stop"
-        elif "restart_stop" in phases:
-            phase_name = "restart_stop"
-        else:
-            phase_name = "restart_cleanup_stop"
+        start_may_activate = isinstance(owner, dict) and owner.get(
+            "start_may_activate", False
+        )
+        if stopped_tracker is tracker:
+            self._finish_owner_cleanup(owner_key)
+            return True
+
+        # A completed restart_stop is the pre-start generation. It proves final
+        # inactivity only when no start task could subsequently activate.
+        if "restart_stop" in phases and not start_may_activate:
+            self._finish_owner_cleanup(owner_key)
+            return True
 
         tracker_tasks = self._collect_tracker_tasks(tracker)
         try:
-            await self._run_owner_operation(owner_key, phase_name, tracker.stop)
+            await self._run_owner_operation(
+                owner_key, "restart_cleanup_stop", tracker.stop
+            )
         except asyncio.CancelledError:
             raise
         except BaseException:
@@ -2224,15 +2349,35 @@ class UnifiedConnectorService:
                 if mapping.get(cache_key) is value:
                     mapping.pop(cache_key, None)
 
+        restart_owner_keys = {
+            owner_key
+            for registry in (
+                self._connector_cleanup_owners,
+                self._connector_residual_tasks,
+                self._connector_cleanup_phases,
+            )
+            for owner_key in registry
+            if owner_key[:2] == connector_key and owner_key[2] == "restart"
+        }
+        verified_restart_owners = set()
+        for owner_key in sorted(restart_owner_keys):
+            if await self._verify_restart_owner_phases(owner_key):
+                verified_restart_owners.add(owner_key)
+            else:
+                cleanup_codes.append("restart_cleanup_incomplete")
+
+        restart_phase_failed = bool(
+            restart_owner_keys - verified_restart_owners
+        )
         account_connectors = self._trading_connectors.get(account_name)
         connector = account_connectors.get(connector_name) if account_connectors else None
         stopped_connectors = []
-        network_cleanup_failed = False
+        network_cleanup_failed = restart_phase_failed
         if connector is None:
             connector = self._connector_cleanup_owners.get(
                 self._owner_key(account_name, connector_name, "network")
             )
-        if connector is not None:
+        if connector is not None and not restart_phase_failed:
             try:
                 await self._stop_connector_network(
                     connector, account_name, connector_name
@@ -2252,6 +2397,7 @@ class UnifiedConnectorService:
         # owner handles as part of the same account/connector transaction.
         market_owners = getattr(self, "_market_cleanup_owners", {})
         market_residuals = getattr(self, "_market_cleanup_residuals", {})
+        market_phases = getattr(self, "_market_cleanup_phases", {})
         for market_key in list(market_owners):
             if market_key[:2] != connector_key:
                 continue
@@ -2265,6 +2411,8 @@ class UnifiedConnectorService:
                     market_connector is stopped for stopped in stopped_connectors
                 )
             ):
+                if restart_phase_failed:
+                    continue
                 try:
                     await self._stop_connector_network(
                         market_connector, account_name, connector_name
@@ -2277,12 +2425,26 @@ class UnifiedConnectorService:
             market_owners.pop(market_key, None)
             market_residuals.pop(market_key, None)
 
-        # A restart owner can be the only reference to an unpublished tracker.
-        # Actively execute or consume its authoritative cleanup phase.
-        for owner_key in list(self._connector_cleanup_owners):
-            if owner_key[:2] != connector_key or owner_key[2] != "restart":
-                continue
-            if not await self._cleanup_restart_owner(owner_key):
+        # Network shutdown is the final-generation stop for the same published
+        # tracker. Private-only or distinct restart trackers still need their own
+        # final stop after retained phases have been verified.
+        for owner_key in sorted(verified_restart_owners):
+            owner = self._connector_cleanup_owners.get(owner_key)
+            restart_tracker = (
+                owner.get("tracker") if isinstance(owner, dict) else owner
+            )
+            stopped_tracker = next(
+                (
+                    restart_tracker
+                    for stopped_connector in stopped_connectors
+                    if getattr(stopped_connector, "order_book_tracker", None)
+                    is restart_tracker
+                ),
+                None,
+            )
+            if not await self._cleanup_restart_owner(
+                owner_key, stopped_tracker=stopped_tracker
+            ):
                 cleanup_codes.append("restart_cleanup_incomplete")
 
         # Future owner kinds retain task handles under the same identity.
@@ -2290,8 +2452,6 @@ class UnifiedConnectorService:
             if owner_key[:2] != connector_key:
                 continue
             if owner_key[2] == "restart":
-                if not await self._cleanup_restart_owner(owner_key):
-                    cleanup_codes.append("restart_cleanup_incomplete")
                 continue
             if not await self._drain_owner_tasks(owner_key):
                 cleanup_codes.append(f"{owner_key[2]}_cleanup_incomplete")
@@ -2312,6 +2472,13 @@ class UnifiedConnectorService:
                 market_tasks[owner_key] = set(pending)
                 cleanup_codes.append("market_task_cleanup_incomplete")
 
+        if not network_cleanup_failed and not any(
+            key[:2] == connector_key for key in market_tasks
+        ):
+            for phase_key in list(market_phases):
+                if phase_key[:2] == connector_key:
+                    market_phases.pop(phase_key, None)
+
         if not network_cleanup_failed:
             market_pair_owners = getattr(self, "_market_pair_owners", {})
             for pair_key in list(market_pair_owners):
@@ -2327,6 +2494,7 @@ class UnifiedConnectorService:
                 self._connector_cleanup_phases,
                 market_owners,
                 market_tasks,
+                market_phases,
             )
             for key in registry
         )
@@ -2380,6 +2548,7 @@ class UnifiedConnectorService:
             getattr(self, "_market_cleanup_owners", {}),
             getattr(self, "_market_pair_owners", {}),
             getattr(self, "_market_residual_tasks", {}),
+            getattr(self, "_market_cleanup_phases", {}),
             self._orders_recorders,
             self._funding_recorders,
             self._metrics_collectors,
@@ -2579,22 +2748,43 @@ class UnifiedConnectorService:
     ) -> Dict:
         """Restart one tracker as a durable owner-scoped transaction."""
         self.require_capability(connector_name, ConnectorFeature.LIVE_ORDER_BOOK)
-        owner_account = account_name if account_name is not None else "__data__"
-        owner_key = self._owner_key(owner_account, connector_name, "restart")
         self._ensure_connector_cleanup_state()
-        async with self._connector_creation_lock((owner_account, connector_name)):
-            return await self._restart_order_book_tracker_locked(
-                connector_name, account_name, owner_key
+        while True:
+            owner_account, connector, error = self._resolve_restart_connector_owner(
+                connector_name, account_name
             )
+            if error is not None:
+                return {"success": False, "error": error}
+            owner_key = self._owner_key(
+                owner_account, connector_name, "restart"
+            )
+            async with self._connector_creation_lock(
+                (owner_account, connector_name)
+            ):
+                if account_name is None:
+                    current_owner, current_connector, current_error = (
+                        self._resolve_restart_connector_owner(
+                            connector_name, account_name
+                        )
+                    )
+                    if current_error is not None:
+                        return {"success": False, "error": current_error}
+                    if (
+                        current_owner != owner_account
+                        or current_connector is not connector
+                    ):
+                        continue
+                return await self._restart_order_book_tracker_locked(
+                    connector_name, connector, owner_key
+                )
 
     async def _restart_order_book_tracker_locked(
         self,
         connector_name: str,
-        account_name: Optional[str],
+        connector: Optional[ConnectorBase],
         owner_key: Tuple[str, str, str],
     ) -> Dict:
         owner = self._connector_cleanup_owners.get(owner_key)
-        connector = self.get_best_connector_for_market(connector_name, account_name)
         if isinstance(owner, dict):
             connector = owner.get("connector") or connector
             tracker = owner.get("tracker")
@@ -2607,6 +2797,7 @@ class UnifiedConnectorService:
                 "tracker": tracker,
                 "trading_pairs": list(getattr(tracker, "_trading_pairs", ())),
                 "tracker_started": False,
+                "start_may_activate": False,
             }
             self._connector_cleanup_owners[owner_key] = owner
         else:
@@ -2644,6 +2835,7 @@ class UnifiedConnectorService:
                 "tracker": tracker,
                 "trading_pairs": trading_pairs,
                 "tracker_started": False,
+                "start_may_activate": False,
                 "old_tasks": self._collect_tracker_tasks(tracker),
             }
             self._connector_cleanup_owners[owner_key] = owner
@@ -2652,6 +2844,7 @@ class UnifiedConnectorService:
             owner.setdefault("tracker", tracker)
             owner.setdefault("trading_pairs", trading_pairs)
             owner.setdefault("tracker_started", False)
+            owner.setdefault("start_may_activate", False)
             owner.setdefault("old_tasks", self._collect_tracker_tasks(tracker))
 
         try:
@@ -2684,6 +2877,9 @@ class UnifiedConnectorService:
                 tracker._trading_pairs.clear()
                 for trading_pair in trading_pairs:
                     tracker._trading_pairs.append(trading_pair)
+                # An awaitable start can finish after its caller is cancelled.
+                # Publish that authority before _run_owner_operation's first await.
+                owner["start_may_activate"] = True
                 await self._run_owner_operation(
                     owner_key, "restart_start", tracker.start
                 )

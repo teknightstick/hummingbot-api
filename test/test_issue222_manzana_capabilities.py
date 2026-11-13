@@ -4616,3 +4616,436 @@ def test_final_adjacent_b8_active_feed_failures_are_non_2xx_typed_and_declared()
         "#/components/schemas/PublicErrorResponse",
         responses["500"]["content"]["application/json"]["schema"]["$ref"],
     )
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_b1_unscoped_restart_uses_physical_owner_lock_and_rejects_ambiguity():
+    module, registry_type = _load_unified_service_module()
+    service = _adjacent_unified_service(module, registry_type)
+    first_stop_entered = asyncio.Event()
+    overlapping_stop_entered = asyncio.Event()
+    release_first_stop = asyncio.Event()
+
+    class Tracker:
+        _trading_pairs = ["BTC-USD"]
+        _tracking_tasks = {}
+        order_books = {}
+
+        def __init__(self):
+            self.stop_calls = 0
+            self.active_stops = 0
+            self.max_active_stops = 0
+
+        async def stop(self):
+            self.stop_calls += 1
+            self.active_stops += 1
+            self.max_active_stops = max(
+                self.max_active_stops, self.active_stops
+            )
+            if self.active_stops > 1:
+                overlapping_stop_entered.set()
+            try:
+                if self.stop_calls == 1:
+                    first_stop_entered.set()
+                    await release_first_stop.wait()
+                else:
+                    await asyncio.sleep(0)
+            finally:
+                self.active_stops -= 1
+
+        def start(self):
+            return None
+
+        async def wait_ready(self):
+            return True
+
+    tracker = Tracker()
+    connector = types.SimpleNamespace(order_book_tracker=tracker)
+    service._trading_connectors = {"master": {"generic": connector}}
+    service._wait_for_websocket_ready = lambda *args, **kwargs: asyncio.sleep(
+        0, result=True
+    )
+
+    restart = asyncio.create_task(service.restart_order_book_tracker("generic"))
+    await first_stop_entered.wait()
+    stopping = asyncio.create_task(
+        service.stop_trading_connector("master", "generic")
+    )
+    await asyncio.sleep(0.01)
+    release_first_stop.set()
+    results = await asyncio.gather(restart, stopping, return_exceptions=True)
+
+    CHECK.assertFalse(
+        any(isinstance(result, BaseException) for result in results), results
+    )
+    CHECK.assertEqual(1, tracker.max_active_stops)
+    CHECK.assertEqual(2, tracker.stop_calls)
+
+    ambiguous = _adjacent_unified_service(module, registry_type)
+
+    class QuietTracker:
+        _trading_pairs = ["BTC-USD"]
+        _tracking_tasks = {}
+        order_books = {}
+
+        def __init__(self):
+            self.stop_calls = 0
+
+        def stop(self):
+            self.stop_calls += 1
+
+    first = QuietTracker()
+    second = QuietTracker()
+    ambiguous._trading_connectors = {
+        "account-a": {
+            "generic": types.SimpleNamespace(order_book_tracker=first)
+        },
+        "account-b": {
+            "generic": types.SimpleNamespace(order_book_tracker=second)
+        },
+    }
+    result = await ambiguous.restart_order_book_tracker("generic")
+    CHECK.assertIs(False, result["success"])
+    CHECK.assertEqual("ambiguous_connector_owner", result["error"])
+    CHECK.assertEqual((0, 0), (first.stop_calls, second.stop_calls))
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_b2_published_restart_owner_coalesces_final_stop():
+    module, registry_type = _load_unified_service_module()
+    service = _adjacent_unified_service(module, registry_type)
+
+    class Tracker:
+        _trading_pairs = ["BTC-USD"]
+        _tracking_tasks = {}
+        order_books = {}
+
+        def __init__(self):
+            self.stop_calls = 0
+
+        def stop(self):
+            self.stop_calls += 1
+
+        def start(self):
+            return None
+
+        async def wait_ready(self):
+            return True
+
+    tracker = Tracker()
+    connector = types.SimpleNamespace(order_book_tracker=tracker)
+    service._trading_connectors = {"master": {"generic": connector}}
+    service._wait_for_websocket_ready = lambda *args, **kwargs: asyncio.sleep(
+        0, result=False
+    )
+
+    restart = await service.restart_order_book_tracker("generic", "master")
+    CHECK.assertEqual("tracker_websocket_not_ready", restart["error"])
+    await service.stop_all()
+
+    CHECK.assertEqual(2, tracker.stop_calls)
+    CHECK.assertEqual({}, service._connector_cleanup_owners)
+    CHECK.assertEqual({}, service._connector_cleanup_phases)
+    CHECK.assertEqual({}, service._connector_residual_tasks)
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_b3_cancelled_async_start_is_stopped_after_activation():
+    module, registry_type = _load_unified_service_module()
+    service = _adjacent_unified_service(module, registry_type)
+    start_entered = asyncio.Event()
+    release_start = asyncio.Event()
+
+    class Tracker:
+        _trading_pairs = ["BTC-USD"]
+        _tracking_tasks = {}
+        order_books = {}
+
+        def __init__(self):
+            self.active = True
+            self.stop_calls = 0
+
+        def stop(self):
+            self.stop_calls += 1
+            self.active = False
+
+        async def start(self):
+            start_entered.set()
+            await release_start.wait()
+            self.active = True
+
+        async def wait_ready(self):
+            return True
+
+    tracker = Tracker()
+    connector = types.SimpleNamespace(order_book_tracker=tracker)
+    service._trading_connectors = {"master": {"generic": connector}}
+    service._wait_for_websocket_ready = lambda *args, **kwargs: asyncio.sleep(
+        0, result=True
+    )
+    owner_key = ("master", "generic", "restart")
+
+    caller = asyncio.create_task(
+        service.restart_order_book_tracker("generic", "master")
+    )
+    await start_entered.wait()
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    start_task = service._connector_cleanup_phases[owner_key]["restart_start"]["task"]
+    CHECK.assertIn(start_task, service._connector_residual_tasks[owner_key])
+
+    shutdown = asyncio.create_task(service.stop_all())
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    release_start.set()
+    await shutdown
+
+    CHECK.assertFalse(tracker.active)
+    CHECK.assertEqual(2, tracker.stop_calls)
+    CHECK.assertEqual({}, service._connector_cleanup_owners)
+    CHECK.assertEqual({}, service._connector_cleanup_phases)
+    CHECK.assertEqual({}, service._connector_residual_tasks)
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_b4_websocket_replacement_validation_is_read_only():
+    from services.connector_capabilities import ConnectorCapabilityRegistry
+
+    module = _load_websocket_manager_module()
+
+    class Task:
+        def __init__(self):
+            self.cancelled = False
+
+        def done(self):
+            return False
+
+        def cancel(self):
+            self.cancelled = True
+
+    class WebSocket:
+        def __init__(self):
+            self.payloads = []
+
+        async def send_json(self, payload):
+            self.payloads.append(payload)
+
+    class Tracker:
+        def __init__(self):
+            self._trading_pairs = ["BTC-USD"]
+            self.order_books = {"BTC-USD": object()}
+
+    tracker = Tracker()
+    connector = types.SimpleNamespace(
+        _trading_pairs=["BTC-USD"], order_book_tracker=tracker
+    )
+    initialization_calls = []
+
+    class ReadOnlyValidationService:
+        registry = ConnectorCapabilityRegistry()
+
+        def require_capability(self, connector_name, feature, trading_pair=None):
+            self.registry.require(connector_name, feature, trading_pair)
+
+        def validate_order_book_ready(self, connector_name, trading_pair):
+            return False
+
+        async def initialize_order_book(self, connector_name, trading_pair):
+            initialization_calls.append((connector_name, trading_pair))
+            connector._trading_pairs.clear()
+            tracker._trading_pairs.clear()
+            tracker.order_books.clear()
+            return False
+
+    old_task = Task()
+    sub_id = "order_book_generic_BTC-USD"
+    old = module.Subscription(
+        subscription_id=sub_id,
+        sub_type="order_book",
+        connector="generic",
+        trading_pair="BTC-USD",
+        update_interval=1.0,
+        task=old_task,
+    )
+    websocket = WebSocket()
+    manager = module.WebSocketManager(ReadOnlyValidationService())
+    manager._connections = {"connection": {sub_id: old}}
+    await manager.handle_subscribe(
+        "connection",
+        websocket,
+        {
+            "type": "order_book",
+            "connector": "generic",
+            "trading_pair": "BTC-USD",
+        },
+    )
+
+    CHECK.assertIs(old, manager._connections["connection"][sub_id])
+    CHECK.assertFalse(old_task.cancelled)
+    CHECK.assertEqual([], initialization_calls)
+    CHECK.assertEqual(["BTC-USD"], connector._trading_pairs)
+    CHECK.assertEqual(["BTC-USD"], tracker._trading_pairs)
+    CHECK.assertEqual(["BTC-USD"], list(tracker.order_books))
+    CHECK.assertEqual("feed_validation_failed", websocket.payloads[-1]["message"])
+
+    fallback_calls = []
+
+    class CompatibilityService:
+        registry = ConnectorCapabilityRegistry()
+
+        def __init__(self):
+            self._connector_service = types.SimpleNamespace(
+                _trading_connectors={"master": {"generic": connector}},
+                _data_connectors={},
+            )
+
+        def require_capability(self, connector_name, feature, trading_pair=None):
+            self.registry.require(connector_name, feature, trading_pair)
+
+        async def initialize_order_book(self, connector_name, trading_pair):
+            fallback_calls.append((connector_name, trading_pair))
+            return False
+
+    fallback_old_task = Task()
+    fallback_old = module.Subscription(
+        subscription_id=sub_id,
+        sub_type="order_book",
+        connector="generic",
+        trading_pair="BTC-USD",
+        update_interval=1.0,
+        task=fallback_old_task,
+    )
+    fallback = module.WebSocketManager(CompatibilityService())
+    fallback._connections = {"connection": {sub_id: fallback_old}}
+    await fallback.handle_subscribe(
+        "connection",
+        WebSocket(),
+        {
+            "type": "order_book",
+            "connector": "generic",
+            "trading_pair": "BTC-USD",
+        },
+    )
+
+    CHECK.assertEqual([], fallback_calls)
+    CHECK.assertTrue(fallback_old_task.cancelled)
+    CHECK.assertEqual(["BTC-USD"], connector._trading_pairs)
+    CHECK.assertEqual(["BTC-USD"], tracker._trading_pairs)
+    CHECK.assertEqual(["BTC-USD"], list(tracker.order_books))
+    fallback.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_b5_terminal_remote_cleanup_result_is_consumed_once():
+    from services.connector_capabilities import ConnectorCapabilityError
+    from services.trading_service import AccountTradingInterface
+
+    class ReadyBook:
+        snapshot = ([1], [1])
+
+    tracker = TransactionTracker()
+    connector = TransactionConnector(tracker)
+    connector_service = TransactionConnectorService(connector)
+    cleanup_entered = asyncio.Event()
+    cleanup_release = asyncio.Event()
+    initialize_calls = 0
+    remove_calls = 0
+
+    async def initialize_order_book(**kwargs):
+        nonlocal initialize_calls
+        initialize_calls += 1
+        connector._trading_pairs.append("BTC-USD")
+        tracker._trading_pairs.append("BTC-USD")
+        tracker.order_books["BTC-USD"] = ReadyBook()
+        return initialize_calls > 1
+
+    async def remove_trading_pair(**kwargs):
+        nonlocal remove_calls
+        remove_calls += 1
+        if remove_calls == 1:
+            cleanup_entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await cleanup_release.wait()
+        return True
+
+    interface = AccountTradingInterface(
+        connector_service,
+        types.SimpleNamespace(
+            initialize_order_book=initialize_order_book,
+            remove_trading_pair=remove_trading_pair,
+        ),
+        "master",
+    )
+    with pytest.raises(ConnectorCapabilityError):
+        await interface.add_market("generic", "BTC-USD")
+    await cleanup_entered.wait()
+    CHECK.assertEqual(1, remove_calls)
+
+    cleanup_release.set()
+    retained = {
+        task
+        for tasks in interface._residual_tasks.values()
+        for task in tasks
+    }
+    await asyncio.gather(*retained)
+    await interface.add_market("generic", "BTC-USD")
+
+    CHECK.assertEqual(1, remove_calls)
+    CHECK.assertEqual({}, interface.cleanup_residuals)
+    CHECK.assertEqual({}, interface._residual_tasks)
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_b6_interface_cleanup_releases_tokens_and_records_sole_owner():
+    from services.trading_service import AccountTradingInterface
+
+    class ReadyBook:
+        snapshot = ([1], [1])
+
+    tracker = TransactionTracker("BTC-USD", ReadyBook())
+    connector = TransactionConnector(tracker, "BTC-USD")
+
+    class ConnectorService:
+        def get_account_connectors(self, account):
+            return {"generic": connector}
+
+    remove_calls = []
+
+    async def remove_trading_pair(**kwargs):
+        remove_calls.append(dict(kwargs))
+        connector._trading_pairs.clear()
+        tracker._trading_pairs.clear()
+        tracker.order_books.clear()
+        return True
+
+    connector_service = ConnectorService()
+    market_data = types.SimpleNamespace(remove_trading_pair=remove_trading_pair)
+    first = AccountTradingInterface(connector_service, market_data, "master")
+    second = AccountTradingInterface(connector_service, market_data, "master")
+    await first.add_market("generic", "BTC-USD")
+    await second.add_market("generic", "BTC-USD")
+
+    await first.cleanup()
+    CHECK.assertEqual({}, first.markets)
+    CHECK.assertFalse(first._owns_market_pair("generic", "BTC-USD"))
+    CHECK.assertEqual(1, len(second._market_owner_set("generic", "BTC-USD")))
+    await second.remove_market("generic", "BTC-USD")
+    CHECK.assertEqual(1, len(remove_calls))
+    CHECK.assertEqual(set(), second._market_owner_set("generic", "BTC-USD"))
+
+    connector._trading_pairs[:] = ["ETH-USD"]
+    tracker._trading_pairs[:] = ["ETH-USD"]
+    tracker.order_books["ETH-USD"] = ReadyBook()
+    sole = AccountTradingInterface(connector_service, market_data, "master")
+    await sole.add_market("generic", "ETH-USD")
+    await sole.cleanup()
+
+    residual_key = ("master", "generic", "pair", "ETH-USD")
+    CHECK.assertFalse(sole._owns_market_pair("generic", "ETH-USD"))
+    CHECK.assertIn(("generic", "ETH-USD"), sole.cleanup_residuals)
+    CHECK.assertIn(residual_key, sole._cleanup_owners)
+    CHECK.assertIs(connector, sole._cleanup_owners[residual_key]["connector"])
+    CHECK.assertEqual(1, len(remove_calls))
