@@ -4,7 +4,8 @@ Pydantic models for the connectors router.
 These models define the request/response schemas for connector-related endpoints.
 """
 
-from typing import Dict, List, Any, Optional
+from typing import Any, Dict, FrozenSet, List, Optional
+
 from pydantic import BaseModel, Field
 
 
@@ -13,6 +14,79 @@ class ConnectorInfo(BaseModel):
     name: str = Field(description="Connector name")
     is_perpetual: bool = Field(default=False, description="Whether the connector supports perpetual trading")
     supported_order_types: Optional[List[str]] = Field(default=None, description="Supported order types")
+
+
+class ConnectorCapabilities(BaseModel):
+    """Connector-declared API semantics.
+
+    ``declared=False`` is intentionally different from claiming every capability. It means
+    the connector predates this seam, so the API preserves its existing generic behavior.
+    """
+
+    declared: bool = Field(default=False, description="Whether the capability set is explicit")
+    source: str = Field(default="undeclared", description="Origin of the declaration")
+    supported_pairs: Optional[FrozenSet[str]] = Field(
+        default=None, description="Static supported pairs, or null when the connector is not pair-bounded"
+    )
+    features: FrozenSet[str] = Field(
+        default_factory=frozenset,
+        description=(
+            "Explicitly supported API features; order_book is snapshot access, while "
+            "live_order_book is authenticated stream readiness"
+        ),
+    )
+    dynamic_subscription: Optional[bool] = Field(
+        default=None, description="Whether pairs may be subscribed or removed dynamically"
+    )
+    perpetual: Optional[bool] = Field(default=None, description="Whether perpetual reads are supported")
+    candles: Optional[bool] = Field(default=None, description="Whether candle reads are supported")
+    last_trade: Optional[bool] = Field(
+        default=None, description="Whether the connector exposes an actual last-trade price"
+    )
+
+
+class CapabilityErrorDetail(BaseModel):
+    """Stable detail object returned for an unsupported connector operation."""
+
+    code: str
+    message: str
+    connector: str
+    feature: str
+    trading_pair: Optional[str] = None
+    supported_pairs: Optional[List[str]] = None
+
+
+class CapabilityErrorResponse(BaseModel):
+    """FastAPI error envelope for capability rejections."""
+
+    detail: CapabilityErrorDetail
+
+
+class TradingRuleError(BaseModel):
+    """One requested pair whose rule was unavailable."""
+
+    code: str = "trading_pair_not_found"
+    message: str
+    trading_pair: str
+
+
+class TradingRulesPartialResponse(BaseModel):
+    """HTTP 207 result with successful rules separated from typed pair errors."""
+
+    connector: str
+    rules: Dict[str, Dict[str, Any]]
+    errors: Dict[str, TradingRuleError]
+
+
+class TradingRulesNotFoundDetail(BaseModel):
+    code: str = "trading_rules_not_found"
+    message: str
+    connector: str
+    trading_pairs: List[str]
+
+
+class TradingRulesNotFoundResponse(BaseModel):
+    detail: TradingRulesNotFoundDetail
 
 
 class ConnectorConfigMapResponse(BaseModel):

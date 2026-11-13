@@ -160,10 +160,9 @@ class OrderBookQueryResult(BaseModel):
     is_buy: bool = Field(description="Query side (buy/sell)")
     query_volume: Optional[float] = Field(default=None, description="Queried volume")
     query_price: Optional[float] = Field(default=None, description="Queried price")
-    result_price: Optional[float] = Field(default=None, description="Resulting price")
+    result_price: float = Field(description="Resulting price; never null in a successful response")
     result_volume: Optional[float] = Field(default=None, description="Resulting volume")
     result_quote_volume: Optional[float] = Field(default=None, description="Resulting quote volume")
-    average_price: Optional[float] = Field(default=None, description="Average/VWAP price")
     timestamp: float = Field(description="Query timestamp")
 
 
@@ -251,6 +250,19 @@ class SingleRateResponse(BaseModel):
     rate: Optional[float] = Field(description="The resolved rate (None if not found)")
     quote_token: str = Field(description="Configured global quote token")
     connector: Optional[str] = Field(default=None, description="Connector used, if scoped")
+
+
+class RateNotFoundDetail(BaseModel):
+    """Typed detail for a connector-scoped rate miss."""
+
+    code: str = "connector_rate_not_found"
+    message: str
+    connector: str
+    trading_pairs: List[str]
+
+
+class RateNotFoundResponse(BaseModel):
+    detail: RateNotFoundDetail
 
 
 class PoolPricesResponse(BaseModel):

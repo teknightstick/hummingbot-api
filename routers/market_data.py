@@ -11,6 +11,7 @@ from config import settings
 from deps import get_market_data_service
 from models import (
     AddTradingPairRequest,
+    CapabilityErrorResponse,
     FundingInfoRequest,
     FundingInfoResponse,
     OrderBookLevel,
@@ -23,6 +24,8 @@ from models import (
     PriceRequest,
     PricesResponse,
     QuoteVolumeForPriceRequest,
+    RateNotFoundDetail,
+    RateNotFoundResponse,
     RateRequest,
     RatesResponse,
     RemoveTradingPairRequest,
@@ -34,6 +37,7 @@ from models import (
     VWAPForVolumeRequest,
 )
 from models.market_data import CandlesConfigRequest
+from services.connector_capabilities import ConnectorFeature
 from services.market_data_service import MarketDataService
 from services.ticker_sources import TickerFetchError, TickerUnsupportedError
 from services.unified_connector_service import UnknownConnectorError
@@ -43,8 +47,10 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Market Data"], prefix="/market-data")
 
+CAPABILITY_ERROR_RESPONSES = {400: {"model": CapabilityErrorResponse}}
 
-@router.post("/candles")
+
+@router.post("/candles", responses=CAPABILITY_ERROR_RESPONSES)
 async def get_candles(request: Request, candles_config: CandlesConfigRequest):
     """
     Get real-time candles data for a specific trading pair.
@@ -60,6 +66,13 @@ async def get_candles(request: Request, candles_config: CandlesConfigRequest):
     Returns:
         Real-time candles data or error message
     """
+    market_data_service: MarketDataService = request.app.state.market_data_service
+    market_data_service.require_capability(
+        candles_config.connector_name,
+        ConnectorFeature.CANDLES,
+        candles_config.trading_pair,
+    )
+
     available = list(CandlesFactory._candles_map.keys())
     if candles_config.connector_name not in CandlesFactory._candles_map:
         raise HTTPException(
@@ -76,8 +89,6 @@ async def get_candles(request: Request, candles_config: CandlesConfigRequest):
         )
 
     try:
-        market_data_service: MarketDataService = request.app.state.market_data_service
-
         candles_cfg = CandlesConfig(
             connector=candles_config.connector_name, trading_pair=candles_config.trading_pair,
             interval=candles_config.interval, max_records=candles_config.max_records)
@@ -122,7 +133,7 @@ async def get_candles(request: Request, candles_config: CandlesConfigRequest):
         raise HTTPException(status_code=500, detail=f"Internal error fetching candles: {str(e)}")
 
 
-@router.post("/historical-candles")
+@router.post("/historical-candles", responses=CAPABILITY_ERROR_RESPONSES)
 async def get_historical_candles(request: Request, config: HistoricalCandlesConfig):
     """
     Get historical candles data for a specific trading pair.
@@ -133,6 +144,13 @@ async def get_historical_candles(request: Request, config: HistoricalCandlesConf
     Returns:
         Historical candles data or error message
     """
+    market_data_service: MarketDataService = request.app.state.market_data_service
+    market_data_service.require_capability(
+        config.connector_name,
+        ConnectorFeature.CANDLES,
+        config.trading_pair,
+    )
+
     available = list(CandlesFactory._candles_map.keys())
     if config.connector_name not in CandlesFactory._candles_map:
         raise HTTPException(
@@ -149,8 +167,6 @@ async def get_historical_candles(request: Request, config: HistoricalCandlesConf
         )
 
     try:
-        market_data_service: MarketDataService = request.app.state.market_data_service
-
         candles_config = CandlesConfig(
             connector=config.connector_name,
             trading_pair=config.trading_pair,
@@ -241,7 +257,7 @@ async def get_available_candle_connectors():
 
 # Enhanced Market Data Endpoints
 
-@router.post("/prices", response_model=PricesResponse)
+@router.post("/prices", response_model=PricesResponse, responses=CAPABILITY_ERROR_RESPONSES)
 async def get_prices(
         request: PriceRequest,
         market_data_manager: MarketDataService = Depends(get_market_data_service)
@@ -366,7 +382,14 @@ async def get_tickers(
     return _build_tickers_response(tickers, errors, market_data_manager)
 
 
-@router.post("/rates", response_model=RatesResponse)
+@router.post(
+    "/rates",
+    response_model=RatesResponse,
+    responses={
+        400: {"model": CapabilityErrorResponse},
+        404: {"model": RateNotFoundResponse},
+    },
+)
 async def get_rates(
         request: RateRequest,
         market_data_manager: MarketDataService = Depends(get_market_data_service)
@@ -378,13 +401,25 @@ async def get_rates(
     that exchange's tickers are used; otherwise the merged multi-exchange pool is used.
     """
     rates = {}
+    missing = []
     for pair in request.trading_pairs:
         if request.connector:
             base, quote = split_trading_pair(pair) if "-" in pair else (pair, None)
             rate = market_data_manager.get_rate_for_connector(request.connector, base, quote) if quote else None
+            if rate is None:
+                missing.append(pair)
         else:
             rate = market_data_manager.get_pair_rate(pair)
         rates[pair] = float(rate) if rate else None
+    if request.connector and missing:
+        raise HTTPException(
+            status_code=404,
+            detail=RateNotFoundDetail(
+                message=f"Rate not found for connector '{request.connector}'",
+                connector=request.connector,
+                trading_pairs=missing,
+            ).model_dump(),
+        )
     return RatesResponse(
         quote_token=market_data_manager.quote_token,
         connector=request.connector,
@@ -392,7 +427,14 @@ async def get_rates(
     )
 
 
-@router.get("/rate/{trading_pair}", response_model=SingleRateResponse)
+@router.get(
+    "/rate/{trading_pair}",
+    response_model=SingleRateResponse,
+    responses={
+        400: {"model": CapabilityErrorResponse},
+        404: {"model": RateNotFoundResponse},
+    },
+)
 async def get_single_rate(
         trading_pair: str,
         connector: str = None,
@@ -406,6 +448,15 @@ async def get_single_rate(
     if connector:
         base, quote = split_trading_pair(trading_pair) if "-" in trading_pair else (trading_pair, None)
         rate = market_data_manager.get_rate_for_connector(connector, base, quote) if quote else None
+        if rate is None:
+            raise HTTPException(
+                status_code=404,
+                detail=RateNotFoundDetail(
+                    message=f"Rate not found for connector '{connector}'",
+                    connector=connector,
+                    trading_pairs=[trading_pair],
+                ).model_dump(),
+            )
     else:
         rate = market_data_manager.get_pair_rate(trading_pair)
     return SingleRateResponse(
@@ -429,7 +480,7 @@ async def get_pool_prices(
     )
 
 
-@router.post("/funding-info", response_model=FundingInfoResponse)
+@router.post("/funding-info", response_model=FundingInfoResponse, responses=CAPABILITY_ERROR_RESPONSES)
 async def get_funding_info(
         request: FundingInfoRequest,
         market_data_manager: MarketDataService = Depends(get_market_data_service)
@@ -468,7 +519,7 @@ async def get_funding_info(
         raise HTTPException(status_code=500, detail=f"Error fetching funding info: {str(e)}")
 
 
-@router.post("/order-book", response_model=OrderBookResponse)
+@router.post("/order-book", response_model=OrderBookResponse, responses=CAPABILITY_ERROR_RESPONSES)
 async def get_order_book(
         request: OrderBookRequest,
         market_data_manager: MarketDataService = Depends(get_market_data_service)
@@ -514,7 +565,11 @@ async def get_order_book(
 
 # Order Book Query Endpoints
 
-@router.post("/order-book/price-for-volume", response_model=OrderBookQueryResult)
+@router.post(
+    "/order-book/price-for-volume",
+    response_model=OrderBookQueryResult,
+    responses=CAPABILITY_ERROR_RESPONSES,
+)
 async def get_price_for_volume(
         request: PriceForVolumeRequest,
         market_data_manager: MarketDataService = Depends(get_market_data_service)
@@ -547,7 +602,11 @@ async def get_price_for_volume(
         raise HTTPException(status_code=500, detail=f"Error in order book query: {str(e)}")
 
 
-@router.post("/order-book/volume-for-price", response_model=OrderBookQueryResult)
+@router.post(
+    "/order-book/volume-for-price",
+    response_model=OrderBookQueryResult,
+    responses=CAPABILITY_ERROR_RESPONSES,
+)
 async def get_volume_for_price(
         request: VolumeForPriceRequest,
         market_data_manager: MarketDataService = Depends(get_market_data_service)
@@ -580,7 +639,11 @@ async def get_volume_for_price(
         raise HTTPException(status_code=500, detail=f"Error in order book query: {str(e)}")
 
 
-@router.post("/order-book/price-for-quote-volume", response_model=OrderBookQueryResult)
+@router.post(
+    "/order-book/price-for-quote-volume",
+    response_model=OrderBookQueryResult,
+    responses=CAPABILITY_ERROR_RESPONSES,
+)
 async def get_price_for_quote_volume(
         request: PriceForQuoteVolumeRequest,
         market_data_manager: MarketDataService = Depends(get_market_data_service)
@@ -613,7 +676,11 @@ async def get_price_for_quote_volume(
         raise HTTPException(status_code=500, detail=f"Error in order book query: {str(e)}")
 
 
-@router.post("/order-book/quote-volume-for-price", response_model=OrderBookQueryResult)
+@router.post(
+    "/order-book/quote-volume-for-price",
+    response_model=OrderBookQueryResult,
+    responses=CAPABILITY_ERROR_RESPONSES,
+)
 async def get_quote_volume_for_price(
         request: QuoteVolumeForPriceRequest,
         market_data_manager: MarketDataService = Depends(get_market_data_service)
@@ -646,7 +713,11 @@ async def get_quote_volume_for_price(
         raise HTTPException(status_code=500, detail=f"Error in order book query: {str(e)}")
 
 
-@router.post("/order-book/vwap-for-volume", response_model=OrderBookQueryResult)
+@router.post(
+    "/order-book/vwap-for-volume",
+    response_model=OrderBookQueryResult,
+    responses=CAPABILITY_ERROR_RESPONSES,
+)
 async def get_vwap_for_volume(
         request: VWAPForVolumeRequest,
         market_data_manager: MarketDataService = Depends(get_market_data_service)
@@ -681,7 +752,11 @@ async def get_vwap_for_volume(
 
 # Trading Pair Management Endpoints
 
-@router.post("/trading-pair/add", response_model=TradingPairResponse)
+@router.post(
+    "/trading-pair/add",
+    response_model=TradingPairResponse,
+    responses=CAPABILITY_ERROR_RESPONSES,
+)
 async def add_trading_pair(
         request: AddTradingPairRequest,
         market_data_service: MarketDataService = Depends(get_market_data_service)
@@ -702,6 +777,11 @@ async def add_trading_pair(
         HTTPException: 500 if initialization fails
     """
     try:
+        market_data_service.require_capability(
+            request.connector_name,
+            ConnectorFeature.DYNAMIC_SUBSCRIPTION,
+            request.trading_pair,
+        )
         success = await market_data_service.initialize_order_book(
             connector_name=request.connector_name,
             trading_pair=request.trading_pair,
@@ -731,7 +811,11 @@ async def add_trading_pair(
         )
 
 
-@router.post("/trading-pair/remove", response_model=TradingPairResponse)
+@router.post(
+    "/trading-pair/remove",
+    response_model=TradingPairResponse,
+    responses=CAPABILITY_ERROR_RESPONSES,
+)
 async def remove_trading_pair(
         request: RemoveTradingPairRequest,
         market_data_service: MarketDataService = Depends(get_market_data_service)

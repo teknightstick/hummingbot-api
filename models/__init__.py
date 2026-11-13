@@ -48,12 +48,19 @@ from .bot_orchestration import (
 
 # Connector models
 from .connectors import (
+    CapabilityErrorDetail,
+    CapabilityErrorResponse,
+    ConnectorCapabilities,
     ConnectorConfigMapResponse,
     ConnectorInfo,
     ConnectorListResponse,
     ConnectorOrderTypesResponse,
     ConnectorTradingRulesResponse,
     TradingRule,
+    TradingRuleError,
+    TradingRulesNotFoundDetail,
+    TradingRulesNotFoundResponse,
+    TradingRulesPartialResponse,
 )
 
 # Controller models
@@ -149,6 +156,8 @@ from .market_data import (  # New enhanced market data models; Ticker & rate mod
     PricesResponse,
     QuoteVolumeForPriceRequest,
     RateRequest,
+    RateNotFoundDetail,
+    RateNotFoundResponse,
     RatesResponse,
     RemoveTradingPairRequest,
     SingleRateResponse,
@@ -280,6 +289,8 @@ __all__ = [
     "TickerInfo",
     "TickersResponse",
     "RateRequest",
+    "RateNotFoundDetail",
+    "RateNotFoundResponse",
     "RatesResponse",
     "SingleRateResponse",
     "PoolPricesResponse",
@@ -307,8 +318,15 @@ __all__ = [
     "TimeRangePaginationParams",
     # Connector models
     "ConnectorInfo",
+    "ConnectorCapabilities",
+    "CapabilityErrorDetail",
+    "CapabilityErrorResponse",
     "ConnectorConfigMapResponse",
     "TradingRule",
+    "TradingRuleError",
+    "TradingRulesPartialResponse",
+    "TradingRulesNotFoundDetail",
+    "TradingRulesNotFoundResponse",
     "ConnectorTradingRulesResponse",
     "ConnectorOrderTypesResponse",
     "ConnectorListResponse",

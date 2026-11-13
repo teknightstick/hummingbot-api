@@ -28,6 +28,7 @@ from hummingbot.core.data_type.common import OrderType, PositionAction, Position
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
 from hummingbot.core.utils.async_utils import safe_ensure_future
 
+from services.connector_capabilities import ConnectorCapabilityRegistry, ConnectorFeature
 from utils.file_system import fs_util
 from utils.hummingbot_api_config_adapter import HummingbotAPIConfigAdapter
 from utils.security import BackendAPISecurity
@@ -84,9 +85,38 @@ class UnifiedConnectorService:
         # Exposes get_pair_rate(pair) -> Decimal, the RateOracle-compatible interface.
         self._rate_provider = None
 
+        # API-local declarations preserve existing behavior for undeclared connectors while
+        # allowing static connectors to publish bounded semantics without route-specific logic.
+        self._capability_registry = ConnectorCapabilityRegistry()
+
     def set_rate_provider(self, rate_provider):
         """Set the rate provider used by trade-volume telemetry (MarketDataService)."""
         self._rate_provider = rate_provider
+
+    def get_connector_capabilities(self, connector_name: str, connector: ConnectorBase = None):
+        """Return declared semantics without constructing a connector or starting its network."""
+        if connector is None:
+            connector = self._data_connectors.get(connector_name)
+            if connector is None:
+                for account_connectors in self._trading_connectors.values():
+                    if connector_name in account_connectors:
+                        connector = account_connectors[connector_name]
+                        break
+        return self._capability_registry.get(connector_name, connector)
+
+    def register_connector_capabilities(self, connector_name: str, capabilities) -> None:
+        """Register a declaration supplied by an API-local adapter or accepted connector seam."""
+        self._capability_registry.register(connector_name, capabilities)
+
+    def require_capability(
+        self,
+        connector_name: str,
+        feature: ConnectorFeature,
+        trading_pair: str = None,
+        connector: ConnectorBase = None,
+    ) -> None:
+        """Reject unsupported semantics before connector or tracker lookup."""
+        self._capability_registry.require(connector_name, feature, trading_pair, connector)
 
     def _is_perpetual_connector(self, connector: ConnectorBase) -> bool:
         """Check if connector is a perpetual derivative connector.
@@ -98,6 +128,17 @@ class UnifiedConnectorService:
             True if perpetual connector, False otherwise
         """
         return isinstance(connector, PerpetualDerivativePyBase)
+
+    def connector_supports_perpetual(
+        self, connector_name: str, connector: ConnectorBase = None
+    ) -> bool:
+        """Return declared semantics first, then preserve the legacy type check."""
+        capabilities = self.get_connector_capabilities(connector_name, connector)
+        if capabilities.declared and capabilities.perpetual is not None:
+            return capabilities.perpetual
+        if connector is not None:
+            return self._is_perpetual_connector(connector)
+        return connector_name.endswith("_perpetual")
 
     def is_gateway_connector(self, connector: ConnectorBase) -> bool:
         """Check if connector is a unified Gateway (on-chain) connector.

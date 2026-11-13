@@ -18,6 +18,7 @@ from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.data_feed.candles_feed.candles_factory import CandlesFactory, UnsupportedConnectorException
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 
+from services.connector_capabilities import ConnectorFeature
 from services.ticker_sources import Ticker, TickerFetchError, TickerUnsupportedError, fetch_tickers
 from services.unified_connector_service import UnknownConnectorError
 from utils.rate_finder import find_rate
@@ -173,6 +174,26 @@ class MarketDataService:
 
     # ==================== Order Book Access ====================
 
+    def _require_capability(
+            self,
+            connector_name: str,
+            feature: ConnectorFeature,
+            trading_pair: Optional[str] = None,
+    ) -> None:
+        """Use the optional declaration seam while preserving legacy connector behavior."""
+        require = getattr(self._connector_service, "require_capability", None)
+        if require is not None:
+            require(connector_name, feature, trading_pair)
+
+    def require_capability(
+            self,
+            connector_name: str,
+            feature: ConnectorFeature,
+            trading_pair: Optional[str] = None,
+    ) -> None:
+        """Public route boundary for a connector-declared operation."""
+        self._require_capability(connector_name, feature, trading_pair)
+
     async def initialize_order_book(
             self,
             connector_name: str,
@@ -195,6 +216,12 @@ class MarketDataService:
         Returns:
             True if order book is ready, False otherwise
         """
+        # Snapshot reads and authenticated live readiness are deliberately distinct.
+        # Static adapters can expose ORDER_BOOK while leaving LIVE_ORDER_BOOK absent
+        # until an accepted connector/core integration declares that pending seam.
+        self._require_capability(
+            connector_name, ConnectorFeature.LIVE_ORDER_BOOK, trading_pair
+        )
         return await self._connector_service.initialize_order_book(
             connector_name=connector_name,
             trading_pair=trading_pair,
@@ -221,6 +248,10 @@ class MarketDataService:
         Returns:
             True if successfully removed, False otherwise
         """
+        self._require_capability(
+            connector_name, ConnectorFeature.DYNAMIC_SUBSCRIPTION, trading_pair
+        )
+
         # Clean up our local tracking for this feed
         feed_key = self._generate_feed_key(FeedType.ORDER_BOOK, connector_name, trading_pair)
         self._last_access_times.pop(feed_key, None)
@@ -244,6 +275,7 @@ class MarketDataService:
         Returns:
             OrderBook instance or None
         """
+        self._require_capability(connector_name, ConnectorFeature.ORDER_BOOK, trading_pair)
         feed_key = self._generate_feed_key(FeedType.ORDER_BOOK, connector_name, trading_pair)
         self._last_access_times[feed_key] = time.time()
         self._feed_configs[feed_key] = (FeedType.ORDER_BOOK, (connector_name, trading_pair))
@@ -304,6 +336,7 @@ class MarketDataService:
         Returns:
             Dictionary with bids, asks, and metadata
         """
+        self._require_capability(connector_name, ConnectorFeature.ORDER_BOOK, trading_pair)
         try:
             connector = self._connector_service.get_best_connector_for_market(
                 connector_name, account_name
@@ -366,6 +399,7 @@ class MarketDataService:
         Returns:
             Query result dictionary
         """
+        self._require_capability(connector_name, ConnectorFeature.ORDER_BOOK_QUERY, trading_pair)
         try:
             current_time = time.time()
             connector = self._connector_service.get_best_connector_for_market(
@@ -411,13 +445,35 @@ class MarketDataService:
                     "timestamp": current_time
                 }
 
+            elif 'quote_volume' in kwargs:
+                result = order_book.get_price_for_quote_volume(is_buy, kwargs['quote_volume'])
+                return {
+                    "trading_pair": trading_pair,
+                    "is_buy": is_buy,
+                    "query_volume": kwargs['quote_volume'],
+                    "result_price": float(result.result_price) if result.result_price else None,
+                    "result_quote_volume": float(result.result_volume) if result.result_volume else None,
+                    "timestamp": current_time
+                }
+
+            elif 'quote_price' in kwargs:
+                result = order_book.get_quote_volume_for_price(is_buy, kwargs['quote_price'])
+                return {
+                    "trading_pair": trading_pair,
+                    "is_buy": is_buy,
+                    "query_price": kwargs['quote_price'],
+                    "result_price": float(result.result_price) if result.result_price else None,
+                    "result_quote_volume": float(result.result_volume) if result.result_volume else None,
+                    "timestamp": current_time
+                }
+
             elif 'vwap_volume' in kwargs:
                 result = order_book.get_vwap_for_volume(is_buy, kwargs['vwap_volume'])
                 return {
                     "trading_pair": trading_pair,
                     "is_buy": is_buy,
                     "query_volume": kwargs['vwap_volume'],
-                    "average_price": float(result.result_price) if result.result_price else None,
+                    "result_price": float(result.result_price) if result.result_price else None,
                     "result_volume": float(result.result_volume) if result.result_volume else None,
                     "timestamp": current_time
                 }
@@ -487,6 +543,7 @@ class MarketDataService:
         Raises:
             ValueError: If the trading pair does not exist on the exchange.
         """
+        self._require_capability(config.connector, ConnectorFeature.CANDLES, config.trading_pair)
         feed_key = self._generate_feed_key(
             FeedType.CANDLES, config.connector, config.trading_pair, config.interval
         )
@@ -582,6 +639,10 @@ class MarketDataService:
         Returns:
             Dictionary mapping trading pairs to prices
         """
+        for trading_pair in trading_pairs:
+            self._require_capability(
+                connector_name, ConnectorFeature.LAST_TRADE, trading_pair
+            )
         try:
             connector = self._connector_service.get_best_connector_for_market(
                 connector_name, account_name
@@ -654,6 +715,11 @@ class MarketDataService:
     ) -> Optional[Decimal]:
         """Resolve a rate using only a single connector's tickers (no cross-exchange merge)."""
         quote = quote or self._quote_token
+        self._require_capability(
+            connector_name,
+            ConnectorFeature.RATES,
+            combine_to_hb_trading_pair(base=base, quote=quote),
+        )
         connector_prices = {pair: t.price for pair, t in self._tickers.get(connector_name, {}).items()}
         try:
             return find_rate(connector_prices, combine_to_hb_trading_pair(base=base, quote=quote))
@@ -688,6 +754,7 @@ class MarketDataService:
             TickerUnsupportedError: the connector cannot serve public tickers without credentials
             TickerFetchError: the fetch or parse failed
         """
+        self._require_capability(connector_name, ConnectorFeature.TICKERS)
         if not self._connector_service.is_known_connector(connector_name):
             raise UnknownConnectorError(f"Connector {connector_name} not found")
 
@@ -911,6 +978,13 @@ class MarketDataService:
         Returns:
             Dictionary mapping trading pairs to their rules
         """
+        if trading_pairs:
+            for trading_pair in trading_pairs:
+                self._require_capability(
+                    connector_name, ConnectorFeature.TRADING_RULES, trading_pair
+                )
+        else:
+            self._require_capability(connector_name, ConnectorFeature.TRADING_RULES)
         try:
             connector = self._connector_service.get_best_connector_for_market(
                 connector_name, account_name
@@ -971,6 +1045,7 @@ class MarketDataService:
         Returns:
             Dictionary with funding information
         """
+        self._require_capability(connector_name, ConnectorFeature.PERPETUAL, trading_pair)
         try:
             connector = self._connector_service.get_best_connector_for_market(
                 connector_name, account_name

@@ -128,11 +128,8 @@ class AccountTradingInterface:
         """
         await self.ensure_connector(connector_name)
 
-        if connector_name not in self._markets:
-            self._markets[connector_name] = set()
-
         # Check if already tracking this pair AND order book is ready
-        if trading_pair in self._markets[connector_name]:
+        if trading_pair in self._markets.get(connector_name, set()):
             # Verify order book actually has data before returning early
             connector = self.connectors.get(connector_name)
             if connector and hasattr(connector, 'order_book_tracker'):
@@ -148,8 +145,6 @@ class AccountTradingInterface:
                         pass
             # Order book not ready, need to re-initialize
             logger.info(f"Market {connector_name}/{trading_pair} tracked but order book not ready, re-initializing")
-
-        self._markets[connector_name].add(trading_pair)
 
         # Get connector from our account's connectors
         connector = self.connectors.get(connector_name)
@@ -180,6 +175,10 @@ class AccountTradingInterface:
                 logger.debug(f"Updated balances for {connector_name} after adding {trading_pair}")
             except Exception as e:
                 logger.warning(f"Failed to update balances for {connector_name}: {e}")
+
+        # Commit interface membership only after every required initialization step
+        # succeeds. A failed attempt therefore preserves the prior mapping exactly.
+        self._markets.setdefault(connector_name, set()).add(trading_pair)
 
         logger.info(f"Market {connector_name}/{trading_pair} added to trading interface")
 

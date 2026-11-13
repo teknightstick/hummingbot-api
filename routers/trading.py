@@ -19,14 +19,46 @@ from models import (
     TradeResponse,
 )
 from models.accounts import LeverageRequest, PositionModeRequest
+from models.connectors import CapabilityErrorDetail, CapabilityErrorResponse
 from models.pagination import paginate_by_cursor
 from services.accounts_service import AccountsService
+from services.connector_capabilities import ConnectorCapabilityError, ConnectorFeature
 from services.trading_history_service import TradingHistoryService
 
 # Create module-specific logger
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Trading"], prefix="/trading")
+
+
+def _reject_explicit_nonperpetual_connectors(
+    filter_request,
+    all_connectors: Dict,
+    connector_service,
+) -> None:
+    """Reject a named spot connector without changing unfiltered aggregate reads."""
+    if not filter_request.connector_names:
+        return
+
+    accounts_to_check = filter_request.account_names or list(all_connectors.keys())
+    for account_name in accounts_to_check:
+        account_connectors = all_connectors.get(account_name, {})
+        for connector_name in filter_request.connector_names:
+            connector = account_connectors.get(connector_name)
+            if connector is not None and not connector_service.connector_supports_perpetual(
+                connector_name, connector
+            ):
+                raise ConnectorCapabilityError(
+                    CapabilityErrorDetail(
+                        code="unsupported_connector_feature",
+                        message=(
+                            f"Connector '{connector_name}' does not support feature "
+                            f"'{ConnectorFeature.PERPETUAL.value}'"
+                        ),
+                        connector=connector_name,
+                        feature=ConnectorFeature.PERPETUAL.value,
+                    )
+                )
 
 
 # Trade Execution
@@ -116,7 +148,11 @@ async def cancel_order(
         raise HTTPException(status_code=500, detail=f"Error cancelling order: {str(e)}")
 
 
-@router.post("/positions", response_model=PaginatedResponse)
+@router.post(
+    "/positions",
+    response_model=PaginatedResponse,
+    responses={400: {"model": CapabilityErrorResponse}},
+)
 async def get_positions(
     filter_request: PositionFilterRequest,
     accounts_service: AccountsService = Depends(get_accounts_service),
@@ -140,6 +176,9 @@ async def get_positions(
     try:
         all_positions = []
         all_connectors = connector_service.get_all_trading_connectors()
+        _reject_explicit_nonperpetual_connectors(
+            filter_request, all_connectors, connector_service
+        )
 
         # Filter accounts
         accounts_to_check = filter_request.account_names if filter_request.account_names else list(all_connectors.keys())
@@ -171,6 +210,8 @@ async def get_positions(
         # Sort by cursor_id and apply cursor-based pagination
         return paginate_by_cursor(all_positions, filter_request.cursor, filter_request.limit)
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching positions: {str(e)}")
 
@@ -495,7 +536,11 @@ async def set_leverage(
         raise HTTPException(status_code=500, detail=f"Unexpected error setting leverage: {str(e)}")
 
 
-@router.post("/funding-payments", response_model=PaginatedResponse)
+@router.post(
+    "/funding-payments",
+    response_model=PaginatedResponse,
+    responses={400: {"model": CapabilityErrorResponse}},
+)
 async def get_funding_payments(
     filter_request: FundingPaymentFilterRequest,
     trading_history_service: TradingHistoryService = Depends(get_trading_history_service),
@@ -519,6 +564,9 @@ async def get_funding_payments(
     try:
         all_funding_payments = []
         all_connectors = connector_service.get_all_trading_connectors()
+        _reject_explicit_nonperpetual_connectors(
+            filter_request, all_connectors, connector_service
+        )
 
         # Filter accounts
         accounts_to_check = filter_request.account_names if filter_request.account_names else list(all_connectors.keys())
@@ -563,6 +611,8 @@ async def get_funding_payments(
             reverse=True,
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching funding payments: {str(e)}")
 

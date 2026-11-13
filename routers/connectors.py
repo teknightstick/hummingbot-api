@@ -1,9 +1,18 @@
 from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from hummingbot.client.settings import AllConnectorSettings
 
 from deps import get_accounts_service
+from models.connectors import (
+    CapabilityErrorResponse,
+    ConnectorCapabilities,
+    TradingRuleError,
+    TradingRulesNotFoundDetail,
+    TradingRulesNotFoundResponse,
+    TradingRulesPartialResponse,
+)
 from services.accounts_service import AccountsService
 from services.market_data_service import MarketDataService
 
@@ -42,7 +51,25 @@ async def get_connector_config_map(connector_name: str, accounts_service: Accoun
     return accounts_service.get_connector_config_map(connector_name)
 
 
-@router.get("/{connector_name}/trading-rules")
+@router.get("/{connector_name}/capabilities", response_model=ConnectorCapabilities)
+async def get_connector_capabilities(request: Request, connector_name: str):
+    """Return explicit connector semantics without constructing it or touching its network."""
+    market_data_service: MarketDataService = request.app.state.market_data_service
+    connector_service = market_data_service.connector_service
+    capabilities = connector_service.get_connector_capabilities(connector_name)
+    if not connector_service.is_known_connector(connector_name) and not capabilities.declared:
+        raise HTTPException(status_code=404, detail=f"Connector '{connector_name}' not found")
+    return capabilities
+
+
+@router.get(
+    "/{connector_name}/trading-rules",
+    responses={
+        207: {"model": TradingRulesPartialResponse},
+        400: {"model": CapabilityErrorResponse},
+        404: {"model": TradingRulesNotFoundResponse},
+    },
+)
 async def get_trading_rules(
     request: Request,
     connector_name: str,
@@ -72,9 +99,46 @@ async def get_trading_rules(
         rules = await market_data_service.get_trading_rules(connector_name, trading_pairs)
 
         if "error" in rules:
-            raise HTTPException(status_code=404, detail=f"Connector '{connector_name}' not found or error: {rules['error']}")
+            raise HTTPException(
+                status_code=404,
+                detail=TradingRulesNotFoundDetail(
+                    message="Trading rules are not available for this connector",
+                    connector=connector_name,
+                    trading_pairs=trading_pairs or [],
+                ).model_dump(),
+            )
 
-        return rules
+        valid_rules = {}
+        pair_errors = {}
+        for trading_pair, rule in rules.items():
+            if isinstance(rule, dict) and "error" in rule:
+                pair_errors[trading_pair] = TradingRuleError(
+                    message=f"Trading pair '{trading_pair}' is not available",
+                    trading_pair=trading_pair,
+                )
+            else:
+                valid_rules[trading_pair] = rule
+
+        if pair_errors and not valid_rules:
+            raise HTTPException(
+                status_code=404,
+                detail=TradingRulesNotFoundDetail(
+                    message="No trading rules found for the requested pairs",
+                    connector=connector_name,
+                    trading_pairs=list(pair_errors),
+                ).model_dump(),
+            )
+
+        if pair_errors:
+            partial = TradingRulesPartialResponse(
+                connector=connector_name,
+                rules=valid_rules,
+                errors=pair_errors,
+            )
+            return JSONResponse(status_code=207, content=partial.model_dump(mode="json"))
+
+        # Preserve the existing all-success mapping for SDK compatibility.
+        return valid_rules
 
     except HTTPException:
         raise
