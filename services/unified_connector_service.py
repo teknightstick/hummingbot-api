@@ -93,15 +93,21 @@ class UnifiedConnectorService:
         """Set the rate provider used by trade-volume telemetry (MarketDataService)."""
         self._rate_provider = rate_provider
 
+    def _get_cached_connector(self, connector_name: str) -> Optional[ConnectorBase]:
+        """Resolve an existing instance without constructing or authenticating anything."""
+        connector = self._data_connectors.get(connector_name)
+        if connector is not None:
+            return connector
+        for account_connectors in self._trading_connectors.values():
+            connector = account_connectors.get(connector_name)
+            if connector is not None:
+                return connector
+        return None
+
     def get_connector_capabilities(self, connector_name: str, connector: ConnectorBase = None):
         """Return declared semantics without constructing a connector or starting its network."""
         if connector is None:
-            connector = self._data_connectors.get(connector_name)
-            if connector is None:
-                for account_connectors in self._trading_connectors.values():
-                    if connector_name in account_connectors:
-                        connector = account_connectors[connector_name]
-                        break
+            connector = self._get_cached_connector(connector_name)
         return self._capability_registry.get(connector_name, connector)
 
     def register_connector_capabilities(self, connector_name: str, capabilities) -> None:
@@ -116,6 +122,8 @@ class UnifiedConnectorService:
         connector: ConnectorBase = None,
     ) -> None:
         """Reject unsupported semantics before connector or tracker lookup."""
+        if connector is None:
+            connector = self._get_cached_connector(connector_name)
         self._capability_registry.require(connector_name, feature, trading_pair, connector)
 
     def _is_perpetual_connector(self, connector: ConnectorBase) -> bool:

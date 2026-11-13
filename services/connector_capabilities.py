@@ -24,6 +24,7 @@ class ConnectorFeature(str, Enum):
     PERPETUAL = "perpetual"
     CANDLES = "candles"
     LAST_TRADE = "last_trade"
+    ORDER_SUBMISSION = "order_submission"
 
 
 class ConnectorCapabilityError(HTTPException):

@@ -16,6 +16,7 @@ from services.gateway_transaction_poller import GatewayTransactionPoller
 from services.gateway_wallet_service import GatewayWalletService, balance_entry
 from services.perpetual_trading_service import PerpetualTradingService
 from services.portfolio_analytics_service import PortfolioAnalyticsService
+from services.connector_capabilities import ConnectorFeature
 from utils.file_system import fs_util
 from utils.gateway_certs import build_client_ssl_context
 
@@ -137,6 +138,10 @@ class AccountsService:
 
     def get_accounts_state(self):
         return self.accounts_state
+
+    def require_capability(self, connector_name, feature, trading_pair=None) -> None:
+        """Expose the shared pre-authentication capability gate to trading routes."""
+        self._connector_service.require_capability(connector_name, feature, trading_pair)
 
     def _market_components(self, token: str, connector_name: str) -> tuple[str, str]:
         """Resolve the (base, quote) used to price a token on a connector.
@@ -893,6 +898,12 @@ class AccountsService:
         Raises:
             HTTPException: If account, connector not found, or trade fails
         """
+        # Reject unsupported order semantics before account lookup, authentication,
+        # connector creation, network tasks, or order submission.
+        self.require_capability(
+            connector_name, ConnectorFeature.ORDER_SUBMISSION, trading_pair
+        )
+
         # Validate account exists
         if account_name not in self.list_accounts():
             raise HTTPException(status_code=404, detail=f"Account '{account_name}' not found")

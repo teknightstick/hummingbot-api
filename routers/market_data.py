@@ -11,6 +11,7 @@ from config import settings
 from deps import get_market_data_service
 from models import (
     AddTradingPairRequest,
+    CapabilityErrorDetail,
     CapabilityErrorResponse,
     FundingInfoRequest,
     FundingInfoResponse,
@@ -37,7 +38,7 @@ from models import (
     VWAPForVolumeRequest,
 )
 from models.market_data import CandlesConfigRequest
-from services.connector_capabilities import ConnectorFeature
+from services.connector_capabilities import ConnectorCapabilityError, ConnectorFeature
 from services.market_data_service import MarketDataService
 from services.ticker_sources import TickerFetchError, TickerUnsupportedError
 from services.unified_connector_service import UnknownConnectorError
@@ -499,8 +500,25 @@ async def get_funding_info(
         HTTPException: 400 for non-perpetual connectors, 500 for other errors
     """
     try:
+        market_data_manager.require_capability(
+            request.connector_name,
+            ConnectorFeature.PERPETUAL,
+            request.trading_pair,
+        )
         if "_perpetual" not in request.connector_name.lower():
-            raise HTTPException(status_code=400, detail="Funding info is only available for perpetual trading pairs.")
+            raise ConnectorCapabilityError(
+                CapabilityErrorDetail(
+                    code="unsupported_connector_feature",
+                    message=(
+                        f"Connector '{request.connector_name}' does not support feature "
+                        f"'{ConnectorFeature.PERPETUAL.value}'"
+                    ),
+                    connector=request.connector_name,
+                    feature=ConnectorFeature.PERPETUAL.value,
+                    trading_pair=request.trading_pair,
+                    reason="funding info is available only for perpetual connectors",
+                )
+            )
         funding_info = await market_data_manager.get_funding_info(
             request.connector_name,
             request.trading_pair

@@ -6,7 +6,7 @@ These models define the request/response schemas for connector-related endpoints
 
 from typing import Any, Dict, FrozenSet, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_serializer
 
 
 class ConnectorInfo(BaseModel):
@@ -44,6 +44,11 @@ class ConnectorCapabilities(BaseModel):
         default=None, description="Whether the connector exposes an actual last-trade price"
     )
 
+    @field_serializer("supported_pairs", "features", when_used="json")
+    def serialize_ordered_membership(self, value):
+        """Keep set-like validation while making every public JSON array deterministic."""
+        return None if value is None else sorted(value)
+
 
 class CapabilityErrorDetail(BaseModel):
     """Stable detail object returned for an unsupported connector operation."""
@@ -54,6 +59,7 @@ class CapabilityErrorDetail(BaseModel):
     feature: str
     trading_pair: Optional[str] = None
     supported_pairs: Optional[List[str]] = None
+    reason: Optional[str] = None
 
 
 class CapabilityErrorResponse(BaseModel):

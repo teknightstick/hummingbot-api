@@ -131,27 +131,27 @@ class OrderBookQueryRequest(BaseModel):
 
 class VolumeForPriceRequest(OrderBookQueryRequest):
     """Request model for getting volume at a specific price"""
-    price: float = Field(description="Price to query volume for")
+    price: float = Field(gt=0, allow_inf_nan=False, description="Price to query volume for")
 
 
 class PriceForVolumeRequest(OrderBookQueryRequest):
     """Request model for getting price for a specific volume"""
-    volume: float = Field(description="Volume to query price for")
+    volume: float = Field(gt=0, allow_inf_nan=False, description="Volume to query price for")
 
 
 class QuoteVolumeForPriceRequest(OrderBookQueryRequest):
     """Request model for getting quote volume at a specific price"""
-    price: float = Field(description="Price to query quote volume for")
+    price: float = Field(gt=0, allow_inf_nan=False, description="Price to query quote volume for")
 
 
 class PriceForQuoteVolumeRequest(OrderBookQueryRequest):
     """Request model for getting price for a specific quote volume"""
-    quote_volume: float = Field(description="Quote volume to query price for")
+    quote_volume: float = Field(gt=0, allow_inf_nan=False, description="Quote volume to query price for")
 
 
 class VWAPForVolumeRequest(OrderBookQueryRequest):
     """Request model for getting VWAP for a specific volume"""
-    volume: float = Field(description="Volume to calculate VWAP for")
+    volume: float = Field(gt=0, allow_inf_nan=False, description="Volume to calculate VWAP for")
 
 
 class OrderBookQueryResult(BaseModel):
@@ -160,7 +160,11 @@ class OrderBookQueryResult(BaseModel):
     is_buy: bool = Field(description="Query side (buy/sell)")
     query_volume: Optional[float] = Field(default=None, description="Queried volume")
     query_price: Optional[float] = Field(default=None, description="Queried price")
-    result_price: float = Field(description="Resulting price; never null in a successful response")
+    result_price: float = Field(
+        gt=0,
+        allow_inf_nan=False,
+        description="Finite positive resulting price; never null in a successful response",
+    )
     result_volume: Optional[float] = Field(default=None, description="Resulting volume")
     result_quote_volume: Optional[float] = Field(default=None, description="Resulting quote volume")
     timestamp: float = Field(description="Query timestamp")

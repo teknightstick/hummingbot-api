@@ -6,6 +6,7 @@ from hummingbot.client.settings import AllConnectorSettings
 
 from deps import get_accounts_service
 from models.connectors import (
+    CapabilityErrorDetail,
     CapabilityErrorResponse,
     ConnectorCapabilities,
     TradingRuleError,
@@ -51,14 +52,27 @@ async def get_connector_config_map(connector_name: str, accounts_service: Accoun
     return accounts_service.get_connector_config_map(connector_name)
 
 
-@router.get("/{connector_name}/capabilities", response_model=ConnectorCapabilities)
+@router.get(
+    "/{connector_name}/capabilities",
+    response_model=ConnectorCapabilities,
+    responses={404: {"model": CapabilityErrorResponse}},
+)
 async def get_connector_capabilities(request: Request, connector_name: str):
     """Return explicit connector semantics without constructing it or touching its network."""
     market_data_service: MarketDataService = request.app.state.market_data_service
     connector_service = market_data_service.connector_service
     capabilities = connector_service.get_connector_capabilities(connector_name)
     if not connector_service.is_known_connector(connector_name) and not capabilities.declared:
-        raise HTTPException(status_code=404, detail=f"Connector '{connector_name}' not found")
+        raise HTTPException(
+            status_code=404,
+            detail=CapabilityErrorDetail(
+                code="unknown_connector",
+                message=f"Connector '{connector_name}' not found",
+                connector=connector_name,
+                feature="capabilities",
+                reason="connector is neither installed nor explicitly declared",
+            ).model_dump(exclude_none=True),
+        )
     return capabilities
 
 

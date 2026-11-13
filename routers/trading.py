@@ -41,28 +41,48 @@ def _reject_explicit_nonperpetual_connectors(
         return
 
     accounts_to_check = filter_request.account_names or list(all_connectors.keys())
-    for account_name in accounts_to_check:
-        account_connectors = all_connectors.get(account_name, {})
-        for connector_name in filter_request.connector_names:
-            connector = account_connectors.get(connector_name)
-            if connector is not None and not connector_service.connector_supports_perpetual(
-                connector_name, connector
-            ):
-                raise ConnectorCapabilityError(
-                    CapabilityErrorDetail(
-                        code="unsupported_connector_feature",
-                        message=(
-                            f"Connector '{connector_name}' does not support feature "
-                            f"'{ConnectorFeature.PERPETUAL.value}'"
-                        ),
-                        connector=connector_name,
-                        feature=ConnectorFeature.PERPETUAL.value,
-                    )
+    for connector_name in filter_request.connector_names:
+        connector = next(
+            (
+                all_connectors.get(account_name, {}).get(connector_name)
+                for account_name in accounts_to_check
+                if all_connectors.get(account_name, {}).get(connector_name) is not None
+            ),
+            None,
+        )
+        if connector is None:
+            get_capabilities = getattr(
+                connector_service, "get_connector_capabilities", None
+            )
+            if get_capabilities is not None:
+                capabilities = get_capabilities(connector_name)
+                if not capabilities.declared:
+                    # Preserve legacy empty behavior for unloaded connectors that
+                    # have not opted into the declaration seam.
+                    continue
+        if not connector_service.connector_supports_perpetual(
+            connector_name, connector
+        ):
+            raise ConnectorCapabilityError(
+                CapabilityErrorDetail(
+                    code="unsupported_connector_feature",
+                    message=(
+                        f"Connector '{connector_name}' does not support feature "
+                        f"'{ConnectorFeature.PERPETUAL.value}'"
+                    ),
+                    connector=connector_name,
+                    feature=ConnectorFeature.PERPETUAL.value,
                 )
+            )
 
 
 # Trade Execution
-@router.post("/orders", response_model=TradeResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/orders",
+    response_model=TradeResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses={400: {"model": CapabilityErrorResponse}},
+)
 async def place_trade(
     trade_request: TradeRequest,
     accounts_service: AccountsService = Depends(get_accounts_service),
@@ -81,6 +101,11 @@ async def place_trade(
         HTTPException: 400 for invalid parameters, 404 for account/connector not found, 500 for trade execution errors
     """
     try:
+        accounts_service.require_capability(
+            trade_request.connector_name,
+            ConnectorFeature.ORDER_SUBMISSION,
+            trade_request.trading_pair,
+        )
         # Convert string names to enum instances
         trade_type_enum = TradeType[trade_request.trade_type]
         order_type_enum = OrderType[trade_request.order_type]

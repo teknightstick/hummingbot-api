@@ -6,6 +6,7 @@ using the UnifiedConnectorService to ensure proper connector usage.
 """
 import asyncio
 import logging
+import math
 import time
 from decimal import Decimal
 from enum import Enum
@@ -18,7 +19,8 @@ from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.data_feed.candles_feed.candles_factory import CandlesFactory, UnsupportedConnectorException
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 
-from services.connector_capabilities import ConnectorFeature
+from models.connectors import CapabilityErrorDetail
+from services.connector_capabilities import ConnectorCapabilityError, ConnectorFeature
 from services.ticker_sources import Ticker, TickerFetchError, TickerUnsupportedError, fetch_tickers
 from services.unified_connector_service import UnknownConnectorError
 from utils.rate_finder import find_rate
@@ -400,90 +402,136 @@ class MarketDataService:
             Query result dictionary
         """
         self._require_capability(connector_name, ConnectorFeature.ORDER_BOOK_QUERY, trading_pair)
+        query_keys = ("volume", "price", "quote_volume", "quote_price", "vwap_volume")
+        supplied = [key for key in query_keys if key in kwargs]
+        if len(supplied) != 1:
+            self._raise_order_book_query_error(
+                connector_name, trading_pair, "invalid_order_book_query",
+                "exactly one query value is required",
+            )
+        query_key = supplied[0]
+        query_value = kwargs[query_key]
+        try:
+            query_number = (
+                float(query_value)
+                if not isinstance(query_value, bool)
+                and isinstance(query_value, (int, float, Decimal))
+                else float("nan")
+            )
+        except (TypeError, ValueError, OverflowError):
+            query_number = float("nan")
+        if not math.isfinite(query_number) or query_number <= 0:
+            self._raise_order_book_query_error(
+                connector_name, trading_pair, "invalid_order_book_query",
+                f"{query_key} must be finite and greater than zero",
+            )
+
         try:
             current_time = time.time()
             connector = self._connector_service.get_best_connector_for_market(
                 connector_name, account_name
             )
-
             if not connector:
                 return {"error": f"No connector available for {connector_name}"}
 
-            # Get order book
             order_book = None
-            if hasattr(connector, 'order_book_tracker') and connector.order_book_tracker:
+            if hasattr(connector, "order_book_tracker") and connector.order_book_tracker:
                 tracker = connector.order_book_tracker
                 if trading_pair in tracker.order_books:
                     order_book = tracker.order_books[trading_pair]
-
-            if not order_book and hasattr(connector, '_orderbook_ds') and connector._orderbook_ds:
+            if not order_book and hasattr(connector, "_orderbook_ds") and connector._orderbook_ds:
                 order_book = await connector._orderbook_ds.get_new_order_book(trading_pair)
-
             if not order_book:
                 return {"error": f"No order book available for {connector_name}/{trading_pair}"}
 
-            # Process query
-            if 'volume' in kwargs:
-                result = order_book.get_price_for_volume(is_buy, kwargs['volume'])
-                return {
-                    "trading_pair": trading_pair,
-                    "is_buy": is_buy,
-                    "query_volume": kwargs['volume'],
-                    "result_price": float(result.result_price) if result.result_price else None,
-                    "result_volume": float(result.result_volume) if result.result_volume else None,
-                    "timestamp": current_time
-                }
-
-            elif 'price' in kwargs:
-                result = order_book.get_volume_for_price(is_buy, kwargs['price'])
-                return {
-                    "trading_pair": trading_pair,
-                    "is_buy": is_buy,
-                    "query_price": kwargs['price'],
-                    "result_volume": float(result.result_volume) if result.result_volume else None,
-                    "result_price": float(result.result_price) if result.result_price else None,
-                    "timestamp": current_time
-                }
-
-            elif 'quote_volume' in kwargs:
-                result = order_book.get_price_for_quote_volume(is_buy, kwargs['quote_volume'])
-                return {
-                    "trading_pair": trading_pair,
-                    "is_buy": is_buy,
-                    "query_volume": kwargs['quote_volume'],
-                    "result_price": float(result.result_price) if result.result_price else None,
-                    "result_quote_volume": float(result.result_volume) if result.result_volume else None,
-                    "timestamp": current_time
-                }
-
-            elif 'quote_price' in kwargs:
-                result = order_book.get_quote_volume_for_price(is_buy, kwargs['quote_price'])
-                return {
-                    "trading_pair": trading_pair,
-                    "is_buy": is_buy,
-                    "query_price": kwargs['quote_price'],
-                    "result_price": float(result.result_price) if result.result_price else None,
-                    "result_quote_volume": float(result.result_volume) if result.result_volume else None,
-                    "timestamp": current_time
-                }
-
-            elif 'vwap_volume' in kwargs:
-                result = order_book.get_vwap_for_volume(is_buy, kwargs['vwap_volume'])
-                return {
-                    "trading_pair": trading_pair,
-                    "is_buy": is_buy,
-                    "query_volume": kwargs['vwap_volume'],
-                    "result_price": float(result.result_price) if result.result_price else None,
-                    "result_volume": float(result.result_volume) if result.result_volume else None,
-                    "timestamp": current_time
-                }
-
+            if query_key == "volume":
+                result = order_book.get_price_for_volume(is_buy, query_value)
+                query_field, result_field = "query_volume", "result_volume"
+            elif query_key == "price":
+                result = order_book.get_volume_for_price(is_buy, query_value)
+                query_field, result_field = "query_price", "result_volume"
+            elif query_key == "quote_volume":
+                result = order_book.get_price_for_quote_volume(is_buy, query_value)
+                query_field, result_field = "query_volume", "result_quote_volume"
+            elif query_key == "quote_price":
+                result = order_book.get_quote_volume_for_price(is_buy, query_value)
+                query_field, result_field = "query_price", "result_quote_volume"
             else:
-                return {"error": "Invalid query parameters"}
+                result = order_book.get_vwap_for_volume(is_buy, query_value)
+                query_field, result_field = "query_volume", "result_volume"
 
+            result_price, result_volume = self._validate_order_book_query_result(
+                connector_name, trading_pair, query_key, query_value, result
+            )
+            return {
+                "trading_pair": trading_pair,
+                "is_buy": is_buy,
+                query_field: query_value,
+                "result_price": result_price,
+                result_field: result_volume,
+                "timestamp": current_time,
+            }
+        except ConnectorCapabilityError:
+            raise
         except Exception as e:
             logger.error(f"Error in order book query for {connector_name}/{trading_pair}: {e}")
             return {"error": str(e)}
+
+    @staticmethod
+    def _raise_order_book_query_error(
+            connector_name: str,
+            trading_pair: str,
+            code: str,
+            reason: str,
+    ) -> None:
+        raise ConnectorCapabilityError(
+            CapabilityErrorDetail(
+                code=code,
+                message=f"Order book query failed for {connector_name}/{trading_pair}",
+                connector=connector_name,
+                feature=ConnectorFeature.ORDER_BOOK_QUERY.value,
+                trading_pair=trading_pair,
+                reason=reason,
+            )
+        )
+
+    @classmethod
+    def _validate_order_book_query_result(
+            cls,
+            connector_name: str,
+            trading_pair: str,
+            query_key: str,
+            query_value: float,
+        result,
+    ) -> Tuple[float, float]:
+        """Reject pinned primitive sentinels and partial depth before response construction."""
+        try:
+            if isinstance(result.result_price, bool) or isinstance(result.result_volume, bool):
+                raise TypeError("boolean primitive result")
+            result_price = float(result.result_price)
+            result_volume = float(result.result_volume)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            cls._raise_order_book_query_error(
+                connector_name, trading_pair, "invalid_order_book_result",
+                "primitive returned a non-numeric result",
+            )
+
+        if not math.isfinite(result_price) or result_price <= 0:
+            cls._raise_order_book_query_error(
+                connector_name, trading_pair, "insufficient_order_book_depth",
+                "no finite positive price is available at the requested depth",
+            )
+        if not math.isfinite(result_volume) or result_volume <= 0:
+            cls._raise_order_book_query_error(
+                connector_name, trading_pair, "insufficient_order_book_depth",
+                "no positive volume is available at the requested price",
+            )
+        if query_key in {"volume", "quote_volume", "vwap_volume"} and result_volume < float(query_value):
+            cls._raise_order_book_query_error(
+                connector_name, trading_pair, "insufficient_order_book_depth",
+                f"requested {float(query_value)} but only {result_volume} is available",
+            )
+        return result_price, result_volume
 
     # ==================== Candles ====================
 
