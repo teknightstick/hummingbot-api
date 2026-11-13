@@ -69,22 +69,30 @@ class AccountTradingInterface:
 
         # Track active markets (connector_name -> set of trading_pairs)
         self._markets: Dict[str, Set[str]] = {}
-        # Initialization touches connector-wide tracker structures, so transactions for
-        # different pairs on the same account/connector must share one bounded lock.
-        self._market_locks: Dict[str, asyncio.Lock] = {}
-        self._market_lock_users: Dict[str, int] = {}
-        self._market_locks_guard = asyncio.Lock()
-        # Cleanup ownership is service-scoped so a second trading-interface
-        # instance cannot forget a residual created by the first one.
+        # Connector-wide transaction and cleanup authority belongs to UCS. Every
+        # interface for the same account/connector therefore shares the same key.
+        if not hasattr(connector_service, "_market_locks"):
+            connector_service._market_locks = {}
+        if not hasattr(connector_service, "_market_lock_users"):
+            connector_service._market_lock_users = {}
+        if not hasattr(connector_service, "_market_locks_guard"):
+            connector_service._market_locks_guard = asyncio.Lock()
+        if not hasattr(connector_service, "_market_pair_owners"):
+            connector_service._market_pair_owners = {}
         if not hasattr(connector_service, "_market_cleanup_residuals"):
             connector_service._market_cleanup_residuals = {}
         if not hasattr(connector_service, "_market_cleanup_owners"):
             connector_service._market_cleanup_owners = {}
         if not hasattr(connector_service, "_market_residual_tasks"):
             connector_service._market_residual_tasks = {}
+        self._market_locks = connector_service._market_locks
+        self._market_lock_users = connector_service._market_lock_users
+        self._market_locks_guard = connector_service._market_locks_guard
+        self._market_pair_owners = connector_service._market_pair_owners
         self._cleanup_residuals = connector_service._market_cleanup_residuals
         self._cleanup_owners = connector_service._market_cleanup_owners
         self._residual_tasks = connector_service._market_residual_tasks
+        self._market_owner_token = object()
         self._capability_registry = ConnectorCapabilityRegistry()
 
         # Timestamp tracking
@@ -116,7 +124,8 @@ class AccountTradingInterface:
         """Return observable cleanup failures without exposing mutable ledger state."""
         return {
             (value["connector"], value.get("trading_pair")): dict(value)
-            for value in self._cleanup_residuals.values()
+            for key, value in self._cleanup_residuals.items()
+            if key[0] == self._account_name
         }
 
     def _residual_key(
@@ -131,6 +140,40 @@ class AccountTradingInterface:
         key = self._residual_key(connector_name, trading_pair, "pair")
         self._cleanup_residuals.pop(key, None)
         self._cleanup_owners.pop(key, None)
+
+    def _pair_owner_key(
+        self, connector_name: str, trading_pair: str
+    ) -> Tuple[str, str, str]:
+        return (self._account_name, connector_name, trading_pair)
+
+    def _register_market_owner(
+        self, connector_name: str, trading_pair: str
+    ) -> None:
+        key = self._pair_owner_key(connector_name, trading_pair)
+        self._market_pair_owners.setdefault(key, set()).add(self._market_owner_token)
+
+    def _unregister_market_owner(
+        self, connector_name: str, trading_pair: str
+    ) -> None:
+        key = self._pair_owner_key(connector_name, trading_pair)
+        owners = self._market_pair_owners.get(key)
+        if owners is None:
+            return
+        owners.discard(self._market_owner_token)
+        if not owners:
+            self._market_pair_owners.pop(key, None)
+
+    def _other_owned_pairs(
+        self, connector_name: str, trading_pair: str
+    ) -> Set[str]:
+        return {
+            pair
+            for (account, connector, pair), owners in self._market_pair_owners.items()
+            if account == self._account_name
+            and connector == connector_name
+            and pair != trading_pair
+            and owners
+        }
 
     @property
     def current_timestamp(self) -> float:
@@ -221,6 +264,7 @@ class AccountTradingInterface:
                 if self._pair_exists_in_connector_state(connector, tracker, trading_pair):
                     if self._order_book_is_ready(tracker, trading_pair):
                         self._markets.setdefault(connector_name, set()).add(trading_pair)
+                        self._register_market_owner(connector_name, trading_pair)
                         self._clear_pair_residual(connector_name, trading_pair)
                         return
                     self._raise_ambiguous_market_state(connector_name, trading_pair)
@@ -236,6 +280,7 @@ class AccountTradingInterface:
                 if self._pair_exists_in_connector_state(connector, tracker, trading_pair):
                     if self._order_book_is_ready(tracker, trading_pair):
                         self._markets.setdefault(connector_name, set()).add(trading_pair)
+                        self._register_market_owner(connector_name, trading_pair)
                         self._clear_pair_residual(connector_name, trading_pair)
                         return
                     self._raise_ambiguous_market_state(connector_name, trading_pair)
@@ -257,6 +302,7 @@ class AccountTradingInterface:
                     await connector._update_balances()
 
                 self._markets.setdefault(connector_name, set()).add(trading_pair)
+                self._register_market_owner(connector_name, trading_pair)
                 self._clear_pair_residual(connector_name, trading_pair)
                 logger.info(f"Market {connector_name}/{trading_pair} added to trading interface")
             except BaseException as primary_error:
@@ -275,9 +321,10 @@ class AccountTradingInterface:
     @asynccontextmanager
     async def _market_transaction(self, connector_name: str):
         """Serialize connector-wide mutations and prune the caller-controlled lock key."""
+        transaction_key = (self._account_name, connector_name)
         async with self._market_locks_guard:
-            lock = self._market_locks.setdefault(connector_name, asyncio.Lock())
-            self._market_lock_users[connector_name] = self._market_lock_users.get(connector_name, 0) + 1
+            lock = self._market_locks.setdefault(transaction_key, asyncio.Lock())
+            self._market_lock_users[transaction_key] = self._market_lock_users.get(transaction_key, 0) + 1
         acquired = False
         try:
             await lock.acquire()
@@ -287,18 +334,18 @@ class AccountTradingInterface:
             if acquired:
                 lock.release()
             try:
-                # Preserve cancellation delivered while another user holds the
-                # guard, but perform the actual pruning synchronously below.
-                if self._market_locks_guard.locked():
-                    await asyncio.sleep(0)
+                # Preserve a queued caller cancellation after the connector lock
+                # is released. The nested finally keeps map pruning atomic even
+                # when this checkpoint raises CancelledError repeatedly.
+                await asyncio.sleep(0)
             finally:
-                users = self._market_lock_users.get(connector_name, 1) - 1
+                users = self._market_lock_users.get(transaction_key, 1) - 1
                 if users:
-                    self._market_lock_users[connector_name] = users
+                    self._market_lock_users[transaction_key] = users
                 else:
-                    self._market_lock_users.pop(connector_name, None)
-                    if self._market_locks.get(connector_name) is lock:
-                        self._market_locks.pop(connector_name, None)
+                    self._market_lock_users.pop(transaction_key, None)
+                    if self._market_locks.get(transaction_key) is lock:
+                        self._market_locks.pop(transaction_key, None)
 
     @staticmethod
     def _order_book_is_ready(tracker, trading_pair: str) -> bool:
@@ -358,18 +405,27 @@ class AccountTradingInterface:
 
     async def _drain_tasks(
         self,
-        key: Tuple[str, str],
+        key: Tuple[str, ...],
         tasks: Set[asyncio.Task],
     ) -> bool:
         """Cancel tasks with a real deadline and retain cancellation suppressors."""
         current = asyncio.current_task()
-        tasks.update(self._residual_tasks.pop(key, set()))
-        tasks = {task for task in tasks if task is not current and not task.done()}
-        for task in tasks:
+        new_tasks = set(tasks)
+        retained_tasks = self._residual_tasks.pop(key, set())
+        owned = new_tasks | retained_tasks
+        pending_tasks = {
+            task for task in owned if task is not current and not task.done()
+        }
+        # A retained task already received cancellation. Retry observes its
+        # terminal state without a second cancellation that could hide a
+        # cancellation-suppressing cleanup owner.
+        for task in pending_tasks & new_tasks:
             task.cancel()
-        if not tasks:
+        if not pending_tasks:
             return True
-        done, pending = await asyncio.wait(tasks, timeout=_TASK_CLEANUP_TIMEOUT)
+        done, pending = await asyncio.wait(
+            pending_tasks, timeout=_TASK_CLEANUP_TIMEOUT
+        )
         for task in done:
             try:
                 task.exception()
@@ -391,9 +447,17 @@ class AccountTradingInterface:
             pairs.discard(trading_pair)
             if not pairs:
                 self._markets.pop(connector_name, None)
+        self._unregister_market_owner(connector_name, trading_pair)
+
+        task_key = (
+            self._account_name,
+            connector_name,
+            "pair_tasks",
+            trading_pair,
+        )
 
         if connector is None:
-            return await self._drain_tasks((connector_name, trading_pair), set())
+            return await self._drain_tasks(task_key, set())
         tracker = getattr(connector, "order_book_tracker", None)
         tasks: Set[asyncio.Task] = set()
         for owner in (connector, tracker):
@@ -417,7 +481,25 @@ class AccountTradingInterface:
                 mapping = getattr(tracker, attr, None)
                 if isinstance(mapping, dict):
                     tasks.update(self._tasks_in_value(mapping.pop(trading_pair, None)))
-        return await self._drain_tasks((connector_name, trading_pair), tasks)
+        return await self._drain_tasks(task_key, tasks)
+
+    async def _drain_market_residual_tasks(
+        self, connector_name: str, trading_pair: str
+    ) -> bool:
+        """Consume every retained task handle owned by this account/pair."""
+        keys = [
+            key
+            for key in self._residual_tasks
+            if len(key) >= 4
+            and key[0] == self._account_name
+            and key[1] == connector_name
+            and key[-1] == trading_pair
+        ]
+        complete = True
+        for key in keys:
+            if not await self._drain_tasks(key, set()):
+                complete = False
+        return complete
 
     async def _remote_cleanup_reason(
         self,
@@ -425,7 +507,12 @@ class AccountTradingInterface:
         trading_pair: str,
         connector_preexisting: bool,
     ) -> Optional[str]:
-        key = (connector_name, trading_pair)
+        task_key = (
+            self._account_name,
+            connector_name,
+            "remote_cleanup",
+            trading_pair,
+        )
         try:
             if connector_preexisting:
                 cleanup = getattr(self._market_data_service, "remove_trading_pair", None)
@@ -447,7 +534,7 @@ class AccountTradingInterface:
             )
             if pending:
                 cleanup_task.cancel()
-                self._residual_tasks.setdefault(key, set()).add(cleanup_task)
+                self._residual_tasks.setdefault(task_key, set()).add(cleanup_task)
                 return "cleanup_deadline_exceeded"
             try:
                 result = cleanup_task.result()
@@ -472,21 +559,21 @@ class AccountTradingInterface:
         key = pair_key
         residual = self._cleanup_residuals.get(pair_key)
         connector_residual = self._cleanup_residuals.get(connector_key)
-        if (
-            residual is None
-            and connector_residual is not None
-            and connector_residual.get("trading_pair") == trading_pair
-        ):
+        if residual is None and connector_residual is not None:
             key = connector_key
             residual = connector_residual
         if residual is None:
             return
+        residual_pair = residual.get("trading_pair") or trading_pair
         owner = self._cleanup_owners.get(key, {})
         connector = owner.get("connector") or self.connectors.get(connector_name)
+        tasks_ok = await self._drain_market_residual_tasks(
+            connector_name, residual_pair
+        )
         local_ok = False
         try:
             local_ok = await self._remove_owned_pair_state(
-                connector_name, trading_pair, connector
+                connector_name, residual_pair, connector
             )
         except asyncio.CancelledError:
             raise
@@ -494,8 +581,10 @@ class AccountTradingInterface:
             local_ok = False
 
         scope = residual.get("cleanup_scope", "pair")
-        other_pairs = self._markets.get(connector_name, set()) - {trading_pair}
-        if not local_ok:
+        other_pairs = self._other_owned_pairs(connector_name, residual_pair)
+        if not tasks_ok:
+            reason = "task_cleanup_pending"
+        elif not local_ok:
             reason = "task_cleanup_pending"
         elif scope == "connector" and other_pairs:
             # A later pair now has independent ownership. Never stop its connector
@@ -504,13 +593,13 @@ class AccountTradingInterface:
         else:
             reason = await self._remote_cleanup_reason(
                 connector_name,
-                trading_pair,
+                residual_pair,
                 scope == "pair",
             )
         stale_local = self._pair_exists_in_connector_state(
-            connector, getattr(connector, "order_book_tracker", None), trading_pair
+            connector, getattr(connector, "order_book_tracker", None), residual_pair
         ) if connector is not None else False
-        if reason is None and local_ok and not stale_local:
+        if reason is None and tasks_ok and local_ok and not stale_local:
             self._cleanup_residuals.pop(key, None)
             self._cleanup_owners.pop(key, None)
             return
@@ -649,6 +738,7 @@ class AccountTradingInterface:
                     )
 
             self._markets[connector_name].discard(trading_pair)
+            self._unregister_market_owner(connector_name, trading_pair)
             if not self._markets[connector_name]:
                 del self._markets[connector_name]
 

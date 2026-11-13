@@ -19,6 +19,7 @@ class ConnectorFeature(str, Enum):
     LIVE_ORDER_BOOK = "live_order_book"
     TRADING_RULES = "trading_rules"
     TICKERS = "tickers"
+    BEST_BID_ASK = "best_bid_ask"
     RATES = "rates"
     DYNAMIC_SUBSCRIPTION = "dynamic_subscription"
     PERPETUAL = "perpetual"
@@ -47,7 +48,6 @@ _API_LOCAL_DECLARATIONS: Dict[str, ConnectorCapabilities] = {
                 ConnectorFeature.ORDER_BOOK.value,
                 ConnectorFeature.ORDER_BOOK_QUERY.value,
                 ConnectorFeature.TRADING_RULES.value,
-                ConnectorFeature.TICKERS.value,
                 ConnectorFeature.RATES.value,
             }
         ),

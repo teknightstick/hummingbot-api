@@ -16,7 +16,7 @@ import logging
 import time
 from contextlib import asynccontextmanager
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from hummingbot.client.config.config_crypt import ETHKeyFileSecretManger
 from hummingbot.client.config.config_helpers import ClientConfigAdapter, api_keys_from_connector_config_map, get_connector_class
@@ -86,14 +86,15 @@ class UnifiedConnectorService:
         self._metrics_collectors: Dict[str, TradeVolumeMetricCollector] = {}
 
         # Locks to prevent race conditions in connector creation
-        self._connector_locks: Dict[str, asyncio.Lock] = {}
-        self._connector_lock_users: Dict[str, int] = {}
+        self._connector_locks: Dict[Tuple[str, str], asyncio.Lock] = {}
+        self._connector_lock_users: Dict[Tuple[str, str], int] = {}
         self._connector_locks_guard = asyncio.Lock()
-        self._connector_creation_residuals: Dict[str, Dict[str, Any]] = {}
-        self._connector_cleanup_owners: Dict[str, ConnectorBase] = {}
-        self._connector_cleanup_indices: Dict[str, Dict[str, Any]] = {}
-        self._connector_residual_tasks: Dict[int, Set[asyncio.Task]] = {}
-        self._connector_stop_requests: Set[str] = set()
+        self._connector_creation_residuals: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._connector_cleanup_owners: Dict[Tuple[str, str, str], Any] = {}
+        self._connector_cleanup_indices: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._connector_residual_tasks: Dict[
+            Tuple[str, str, str], Set[asyncio.Task]
+        ] = {}
 
         # Connector settings cache
         self._conn_settings = AllConnectorSettings.get_connector_settings()
@@ -180,6 +181,32 @@ class UnifiedConnectorService:
     # Trading Connector Management (authenticated, per-account)
     # =========================================================================
 
+    @staticmethod
+    def _connector_key(account_name: str, connector_name: str) -> Tuple[str, str]:
+        return account_name, connector_name
+
+    @staticmethod
+    def _index_key(account_name: str, connector_name: str) -> str:
+        return f"{account_name}:{connector_name}"
+
+    @staticmethod
+    def _owner_key(
+        account_name: str, connector_name: str, owner_kind: str
+    ) -> Tuple[str, str, str]:
+        return account_name, connector_name, owner_kind
+
+    def _ensure_connector_cleanup_state(self) -> None:
+        """Initialize private lifecycle registries for dependency-light instances."""
+        defaults = (
+            ("_connector_creation_residuals", {}),
+            ("_connector_cleanup_owners", {}),
+            ("_connector_cleanup_indices", {}),
+            ("_connector_residual_tasks", {}),
+        )
+        for name, value in defaults:
+            if not hasattr(self, name):
+                setattr(self, name, value)
+
     async def get_trading_connector(
         self,
         account_name: str,
@@ -202,10 +229,11 @@ class UnifiedConnectorService:
         Returns:
             Initialized trading connector
         """
-        cache_key = f"{account_name}:{connector_name}"
+        connector_key = self._connector_key(account_name, connector_name)
 
-        async with self._connector_creation_lock(cache_key):
-            residual = getattr(self, "_connector_creation_residuals", {}).get(cache_key)
+        async with self._connector_creation_lock(connector_key):
+            self._ensure_connector_cleanup_state()
+            residual = self._connector_creation_residuals.get(connector_key)
             if residual is not None:
                 raise ConnectorCapabilityError(
                     CapabilityErrorDetail.model_validate(residual)
@@ -217,31 +245,16 @@ class UnifiedConnectorService:
             connector = await self._create_and_initialize_trading_connector(
                 account_name, connector_name
             )
-            stop_requests = getattr(self, "_connector_stop_requests", set())
-            if cache_key in stop_requests:
-                # A stop raced an in-flight creator. Give the stop a durable
-                # publish barrier, clean anything created after it returned,
-                # and never publish the late connector.
-                stop_requests.discard(cache_key)
-                self._trading_connectors.setdefault(account_name, {})[
-                    connector_name
-                ] = connector
-                detail = await self._finalize_stop_trading_connector(
-                    account_name, connector_name
-                )
-                if detail is not None:
-                    raise ConnectorCapabilityError(detail)
-                return connector
             self._trading_connectors.setdefault(account_name, {})[connector_name] = connector
-            self._connector_creation_residuals.pop(cache_key, None)
+            self._connector_creation_residuals.pop(connector_key, None)
             return connector
 
     @asynccontextmanager
-    async def _connector_creation_lock(self, cache_key: str):
+    async def _connector_creation_lock(self, connector_key: Tuple[str, str]):
         """Serialize creation and prune the caller-controlled cache key after use."""
         async with self._connector_locks_guard:
-            lock = self._connector_locks.setdefault(cache_key, asyncio.Lock())
-            self._connector_lock_users[cache_key] = self._connector_lock_users.get(cache_key, 0) + 1
+            lock = self._connector_locks.setdefault(connector_key, asyncio.Lock())
+            self._connector_lock_users[connector_key] = self._connector_lock_users.get(connector_key, 0) + 1
         acquired = False
         try:
             await lock.acquire()
@@ -251,16 +264,17 @@ class UnifiedConnectorService:
             if acquired:
                 lock.release()
             try:
-                if self._connector_locks_guard.locked():
-                    await asyncio.sleep(0)
+                # Preserve cancellation queued after the transaction releases
+                # its connector lock while keeping lock-index pruning atomic.
+                await asyncio.sleep(0)
             finally:
-                users = self._connector_lock_users[cache_key] - 1
+                users = self._connector_lock_users.get(connector_key, 1) - 1
                 if users:
-                    self._connector_lock_users[cache_key] = users
+                    self._connector_lock_users[connector_key] = users
                 else:
-                    self._connector_lock_users.pop(cache_key, None)
-                    if self._connector_locks.get(cache_key) is lock:
-                        self._connector_locks.pop(cache_key, None)
+                    self._connector_lock_users.pop(connector_key, None)
+                    if self._connector_locks.get(connector_key) is lock:
+                        self._connector_locks.pop(connector_key, None)
 
     def get_all_trading_connectors(self) -> Dict[str, Dict[str, ConnectorBase]]:
         """
@@ -508,7 +522,14 @@ class UnifiedConnectorService:
         self.require_capability(
             connector_name, ConnectorFeature.LIVE_ORDER_BOOK, trading_pair
         )
-        connector = self.get_best_connector_for_market(connector_name, account_name)
+        if account_name is not None:
+            # Account-scoped cleanup must never fall back to a connector owned by
+            # another account (or to a shared data connector).
+            connector = self._trading_connectors.get(account_name, {}).get(
+                connector_name
+            )
+        else:
+            connector = self.get_best_connector_for_market(connector_name)
 
         if not connector:
             logger.error(f"No connector available for {connector_name}")
@@ -681,7 +702,14 @@ class UnifiedConnectorService:
         self.require_capability(
             connector_name, ConnectorFeature.DYNAMIC_SUBSCRIPTION, trading_pair
         )
-        connector = self.get_best_connector_for_market(connector_name, account_name)
+        if account_name is not None:
+            # Never clean another account's connector when the requested account
+            # does not own this connector.
+            connector = self._trading_connectors.get(account_name, {}).get(
+                connector_name
+            )
+        else:
+            connector = self.get_best_connector_for_market(connector_name)
 
         if not connector:
             logger.warning(f"No connector available for {connector_name} to remove {trading_pair}")
@@ -790,7 +818,7 @@ class UnifiedConnectorService:
         connector_name: str
     ) -> ConnectorBase:
         """Create a connector transactionally and clean every owned index on failure."""
-        cache_key = f"{account_name}:{connector_name}"
+        cache_key = self._index_key(account_name, connector_name)
         missing = object()
         baselines = {
             "connector": self._trading_connectors.get(account_name, {}).get(
@@ -830,6 +858,8 @@ class UnifiedConnectorService:
         # Authenticate and create connector
         connector = self._create_trading_connector(account_name, connector_name)
         creation_owner["connector"] = connector
+        setattr(connector, "_api_cleanup_account", account_name)
+        setattr(connector, "_api_cleanup_connector", connector_name)
 
         # Initialize symbol map and trading rules
         await connector._initialize_trading_pair_symbol_map()
@@ -882,13 +912,66 @@ class UnifiedConnectorService:
     def connector_creation_residuals(self) -> Dict[str, Dict[str, Any]]:
         """Expose failed-creation cleanup state without exposing the mutable ledger."""
         return {
-            key: dict(value)
+            (
+                self._index_key(*key)
+                if isinstance(key, tuple) and len(key) >= 2
+                else str(key)
+            ): dict(value)
             for key, value in getattr(self, "_connector_creation_residuals", {}).items()
         }
 
-    async def _stop_owned_index(self, value) -> None:
+    async def _drain_owner_tasks(
+        self,
+        owner_key: Tuple[str, str, str],
+        tasks: Optional[Set[asyncio.Task]] = None,
+    ) -> bool:
+        """Cancel and consume retained owner tasks under one hard deadline."""
+        self._ensure_connector_cleanup_state()
+        current = asyncio.current_task()
+        new_tasks = set(tasks or ())
+        retained_tasks = self._connector_residual_tasks.pop(owner_key, set())
+        owned = new_tasks | retained_tasks
+        pending = {task for task in owned if task is not current and not task.done()}
+        # Retained tasks already received cancellation. Retrying waits for their
+        # terminal state without using repeated cancellation as a false-success
+        # mechanism against cancellation-suppressing cleanup code.
+        for task in pending & new_tasks:
+            task.cancel()
+        if pending:
+            done, pending = await asyncio.wait(
+                pending, timeout=_TASK_DRAIN_TIMEOUT
+            )
+            for task in done:
+                try:
+                    task.exception()
+                except (asyncio.CancelledError, Exception):
+                    pass
+        if pending:
+            self._connector_residual_tasks[owner_key] = set(pending)
+            return False
+        for task in owned:
+            if task.done():
+                try:
+                    task.exception()
+                except (asyncio.CancelledError, Exception):
+                    pass
+        return True
+
+    async def _stop_owned_index(
+        self,
+        account_name: str,
+        connector_name: str,
+        owner_kind: str,
+        value,
+    ) -> None:
+        self._ensure_connector_cleanup_state()
+        owner_key = self._owner_key(account_name, connector_name, owner_kind)
+        self._connector_cleanup_owners[owner_key] = value
+        if not await self._drain_owner_tasks(owner_key):
+            raise RuntimeError("index_cleanup_pending")
         stop = getattr(value, "stop", None)
         if stop is None:
+            self._connector_cleanup_owners.pop(owner_key, None)
             return
         result = stop()
         if inspect.isawaitable(result):
@@ -898,14 +981,16 @@ class UnifiedConnectorService:
             )
             if pending:
                 stop_task.cancel()
-                residual_index = getattr(self, "_connector_residual_tasks", None)
-                if residual_index is None:
-                    residual_index = self._connector_residual_tasks = {}
-                residual_index.setdefault(id(value), set()).add(stop_task)
+                self._connector_residual_tasks.setdefault(owner_key, set()).add(
+                    stop_task
+                )
                 raise RuntimeError("index_cleanup_pending")
             result = stop_task.result()
         if result is False:
             raise RuntimeError("index_cleanup_returned_false")
+        if not await self._drain_owner_tasks(owner_key):
+            raise RuntimeError("index_cleanup_pending")
+        self._connector_cleanup_owners.pop(owner_key, None)
 
     async def _finalize_failed_connector_creation(
         self,
@@ -917,10 +1002,10 @@ class UnifiedConnectorService:
         missing,
     ) -> Optional[CapabilityErrorDetail]:
         """Undo only indices and tasks owned by the failed creation transaction."""
+        self._ensure_connector_cleanup_state()
+        connector_key = self._connector_key(account_name, connector_name)
         cleanup_codes = []
-        retained_indices = getattr(self, "_connector_cleanup_indices", None)
-        if retained_indices is None:
-            retained_indices = self._connector_cleanup_indices = {}
+        retained_indices = self._connector_cleanup_indices
         failed_indices: Dict[str, Any] = {}
         account_connectors = self._trading_connectors.get(account_name)
         current_connector = (
@@ -938,7 +1023,9 @@ class UnifiedConnectorService:
             owned_connector = current_connector
         if owned_connector is not None:
             try:
-                await self._stop_connector_network(owned_connector)
+                await self._stop_connector_network(
+                    owned_connector, account_name, connector_name
+                )
             except BaseException:
                 cleanup_codes.append("connector_cleanup_incomplete")
 
@@ -952,7 +1039,9 @@ class UnifiedConnectorService:
             current = mapping.get(cache_key, missing)
             if current is not missing and current is not baseline:
                 try:
-                    await self._stop_owned_index(current)
+                    await self._stop_owned_index(
+                        account_name, connector_name, label, current
+                    )
                 except BaseException:
                     cleanup_codes.append(f"{label}_cleanup_incomplete")
                     failed_indices[label] = current
@@ -970,21 +1059,13 @@ class UnifiedConnectorService:
             if not account_connectors:
                 self._trading_connectors.pop(account_name, None)
 
-        residuals = getattr(self, "_connector_creation_residuals", None)
-        if residuals is None:
-            residuals = self._connector_creation_residuals = {}
-        owners = getattr(self, "_connector_cleanup_owners", None)
-        if owners is None:
-            owners = self._connector_cleanup_owners = {}
+        residuals = self._connector_creation_residuals
         if not cleanup_codes:
-            residuals.pop(cache_key, None)
-            owners.pop(cache_key, None)
-            retained_indices.pop(cache_key, None)
+            residuals.pop(connector_key, None)
+            retained_indices.pop(connector_key, None)
             return None
-        if owned_connector is not None:
-            owners[cache_key] = owned_connector
         if failed_indices:
-            retained_indices[cache_key] = failed_indices
+            retained_indices[connector_key] = failed_indices
         detail = CapabilityErrorDetail(
             code="connector_creation_cleanup_residual",
             message=f"Connector creation cleanup is incomplete for '{cache_key}'",
@@ -994,7 +1075,7 @@ class UnifiedConnectorService:
             cleanup_scope="connector",
             cleanup_code=cleanup_codes[0],
         )
-        residuals[cache_key] = detail.model_dump(exclude_none=True)
+        residuals[connector_key] = detail.model_dump(exclude_none=True)
         return detail
 
     async def _complete_failed_connector_creation(
@@ -1108,7 +1189,11 @@ class UnifiedConnectorService:
     async def _start_connector_network(self, connector: ConnectorBase):
         """Start connector network tasks."""
         try:
-            await self._stop_connector_network(connector)
+            await self._stop_connector_network(
+                connector,
+                getattr(connector, "_api_cleanup_account", "__unscoped__"),
+                getattr(connector, "_api_cleanup_connector", "__unscoped__"),
+            )
 
             # Gateway/AMM connectors use start_network() instead of individual polling tasks
             if hasattr(connector, '_trading_rules_polling_loop'):
@@ -1252,8 +1337,18 @@ class UnifiedConnectorService:
         found.discard(current)
         return found
 
-    async def _stop_connector_network(self, connector: ConnectorBase):
+    async def _stop_connector_network(
+        self,
+        connector: ConnectorBase,
+        account_name: str = "__unscoped__",
+        connector_name: str = "__unscoped__",
+    ):
         """Stop connector tasks with a hard deadline and retain pending handles."""
+        self._ensure_connector_cleanup_state()
+        owner_key = self._owner_key(account_name, connector_name, "network")
+        self._connector_cleanup_owners[owner_key] = connector
+        if not await self._drain_owner_tasks(owner_key):
+            raise RuntimeError("task_cleanup_pending")
         task_names = (
             '_trading_rules_polling_task',
             '_trading_fees_polling_task',
@@ -1274,12 +1369,7 @@ class UnifiedConnectorService:
             '_order_book_trade_event_listener_task',
             '_update_last_trade_prices_task',
         )
-        residual_index = getattr(self, "_connector_residual_tasks", None)
-        if residual_index is None:
-            residual_index = self._connector_residual_tasks = {}
-        residual_key = id(connector)
         tasks = self._collect_connector_tasks(connector)
-        tasks.update(residual_index.pop(residual_key, set()))
         cleanup_codes = []
         for task_name in task_names:
             task = getattr(connector, task_name, None)
@@ -1347,7 +1437,7 @@ class UnifiedConnectorService:
                 except (asyncio.CancelledError, Exception):
                     pass
             if pending:
-                residual_index[residual_key] = set(pending)
+                self._connector_residual_tasks[owner_key] = set(pending)
                 cleanup_codes.append("task_cleanup_pending")
 
         tracker = getattr(connector, "order_book_tracker", None)
@@ -1371,6 +1461,9 @@ class UnifiedConnectorService:
                         task_mapping.pop(key, None)
         if cleanup_codes:
             raise RuntimeError(cleanup_codes[0])
+        if not await self._drain_owner_tasks(owner_key):
+            raise RuntimeError("task_cleanup_pending")
+        self._connector_cleanup_owners.pop(owner_key, None)
 
     async def refresh_connector_state(
         self,
@@ -1952,22 +2045,8 @@ class UnifiedConnectorService:
 
     async def stop_trading_connector(self, account_name: str, connector_name: str):
         """Stop a trading connector, exposing any residual instead of hiding it."""
-        cache_key = f"{account_name}:{connector_name}"
-        active_lock = getattr(self, "_connector_locks", {}).get(cache_key)
-        if active_lock is not None and active_lock.locked():
-            stop_requests = getattr(self, "_connector_stop_requests", None)
-            if stop_requests is None:
-                stop_requests = self._connector_stop_requests = set()
-            stop_requests.add(cache_key)
-            cleanup_coro = self._finalize_stop_trading_connector(
-                account_name, connector_name
-            )
-        else:
-            cleanup_coro = self._locked_stop_trading_connector(
-                account_name, connector_name
-            )
         cleanup_task = asyncio.create_task(
-            cleanup_coro
+            self._locked_stop_trading_connector(account_name, connector_name)
         )
         cancelled = False
         while not cleanup_task.done():
@@ -1986,8 +2065,8 @@ class UnifiedConnectorService:
         self, account_name: str, connector_name: str
     ) -> Optional[CapabilityErrorDetail]:
         """Use the same per-key transaction lock for ordinary stop and publish."""
-        cache_key = f"{account_name}:{connector_name}"
-        async with self._connector_creation_lock(cache_key):
+        connector_key = self._connector_key(account_name, connector_name)
+        async with self._connector_creation_lock(connector_key):
             return await self._finalize_stop_trading_connector(
                 account_name, connector_name
             )
@@ -1996,13 +2075,12 @@ class UnifiedConnectorService:
         self, account_name: str, connector_name: str
     ) -> Optional[CapabilityErrorDetail]:
         """Run bounded connector cleanup and retain failed indices for an explicit retry."""
-        cache_key = f"{account_name}:{connector_name}"
-        residuals = getattr(self, "_connector_creation_residuals", None)
+        self._ensure_connector_cleanup_state()
+        connector_key = self._connector_key(account_name, connector_name)
+        cache_key = self._index_key(account_name, connector_name)
         cleanup_codes = []
-        retained_indices = getattr(self, "_connector_cleanup_indices", None)
-        if retained_indices is None:
-            retained_indices = self._connector_cleanup_indices = {}
-        retained_for_key = retained_indices.get(cache_key, {})
+        retained_indices = self._connector_cleanup_indices
+        retained_for_key = retained_indices.get(connector_key, {})
         indices = (
             ("orders", self._orders_recorders),
             ("funding", self._funding_recorders),
@@ -2013,11 +2091,18 @@ class UnifiedConnectorService:
             if value is None:
                 value = retained_for_key.get(label)
             if value is None:
+                value = self._connector_cleanup_owners.get(
+                    self._owner_key(account_name, connector_name, label)
+                )
+            if value is None:
                 continue
             try:
-                await self._stop_owned_index(value)
+                await self._stop_owned_index(
+                    account_name, connector_name, label, value
+                )
             except BaseException:
                 cleanup_codes.append(f"{label}_cleanup_incomplete")
+                retained_for_key[label] = value
             else:
                 retained_for_key.pop(label, None)
                 if mapping.get(cache_key) is value:
@@ -2025,34 +2110,114 @@ class UnifiedConnectorService:
 
         account_connectors = self._trading_connectors.get(account_name)
         connector = account_connectors.get(connector_name) if account_connectors else None
-        owners = getattr(self, "_connector_cleanup_owners", None)
-        if owners is None:
-            owners = self._connector_cleanup_owners = {}
+        stopped_connectors = []
+        network_cleanup_failed = False
         if connector is None:
-            connector = owners.get(cache_key)
+            connector = self._connector_cleanup_owners.get(
+                self._owner_key(account_name, connector_name, "network")
+            )
         if connector is not None:
             try:
-                await self._stop_connector_network(connector)
+                await self._stop_connector_network(
+                    connector, account_name, connector_name
+                )
             except BaseException:
                 cleanup_codes.append("connector_cleanup_incomplete")
+                network_cleanup_failed = True
             else:
+                stopped_connectors.append(connector)
                 if account_connectors and account_connectors.get(connector_name) is connector:
                     account_connectors.pop(connector_name, None)
                 if account_connectors is not None and not account_connectors:
                     self._trading_connectors.pop(account_name, None)
-                owners.pop(cache_key, None)
 
-        residuals = getattr(self, "_connector_creation_residuals", None)
-        if residuals is None:
-            residuals = self._connector_creation_residuals = {}
+        # Failed market transactions can be the sole authority retaining an
+        # unpublished connector. Explicit connector stop consumes those private
+        # owner handles as part of the same account/connector transaction.
+        market_owners = getattr(self, "_market_cleanup_owners", {})
+        market_residuals = getattr(self, "_market_cleanup_residuals", {})
+        for market_key in list(market_owners):
+            if market_key[:2] != connector_key:
+                continue
+            owner = market_owners.get(market_key, {})
+            market_connector = (
+                owner.get("connector") if isinstance(owner, dict) else None
+            )
+            if (
+                market_connector is not None
+                and not any(
+                    market_connector is stopped for stopped in stopped_connectors
+                )
+            ):
+                try:
+                    await self._stop_connector_network(
+                        market_connector, account_name, connector_name
+                    )
+                except BaseException:
+                    cleanup_codes.append("market_owner_cleanup_incomplete")
+                    network_cleanup_failed = True
+                    continue
+                stopped_connectors.append(market_connector)
+            market_owners.pop(market_key, None)
+            market_residuals.pop(market_key, None)
+
+        # Restart and future owner kinds retain task handles under the same
+        # account/connector identity. Explicit stop consumes every such handle.
+        for owner_key in list(self._connector_residual_tasks):
+            if owner_key[:2] != connector_key:
+                continue
+            if not await self._drain_owner_tasks(owner_key):
+                cleanup_codes.append(f"{owner_key[2]}_cleanup_incomplete")
+            elif owner_key[2] not in {"orders", "funding", "metrics", "network"}:
+                self._connector_cleanup_owners.pop(owner_key, None)
+        for owner_key in list(self._connector_cleanup_owners):
+            if owner_key[:2] == connector_key and owner_key[2] == "restart":
+                self._connector_cleanup_owners.pop(owner_key, None)
+
+        market_tasks = getattr(self, "_market_residual_tasks", {})
+        for owner_key in list(market_tasks):
+            if owner_key[:2] != connector_key:
+                continue
+            tasks = market_tasks.pop(owner_key, set())
+            pending = {task for task in tasks if not task.done()}
+            if pending:
+                _, pending = await asyncio.wait(
+                    pending, timeout=_TASK_DRAIN_TIMEOUT
+                )
+            if pending:
+                market_tasks[owner_key] = set(pending)
+                cleanup_codes.append("market_task_cleanup_incomplete")
+
+        if not network_cleanup_failed:
+            market_pair_owners = getattr(self, "_market_pair_owners", {})
+            for pair_key in list(market_pair_owners):
+                if pair_key[:2] == connector_key:
+                    market_pair_owners.pop(pair_key, None)
+
+        residuals = self._connector_creation_residuals
+        remaining_private = any(
+            key[:2] == connector_key
+            for registry in (
+                self._connector_cleanup_owners,
+                self._connector_residual_tasks,
+                market_owners,
+                market_tasks,
+            )
+            for key in registry
+        )
+        if remaining_private and not cleanup_codes:
+            cleanup_codes.append("owner_cleanup_incomplete")
         if not cleanup_codes:
-            residuals.pop(cache_key, None)
-            owners.pop(cache_key, None)
-            retained_indices.pop(cache_key, None)
+            residuals.pop(connector_key, None)
+            retained_indices.pop(connector_key, None)
+            for key in list(market_residuals):
+                if key[:2] == connector_key:
+                    market_residuals.pop(key, None)
+                    market_owners.pop(key, None)
             logger.info(f"Stopped trading connector {account_name}/{connector_name}")
             return None
         if retained_for_key:
-            retained_indices[cache_key] = retained_for_key
+            retained_indices[connector_key] = retained_for_key
         detail = CapabilityErrorDetail(
             code="connector_cleanup_residual",
             message=f"Connector cleanup is incomplete for '{cache_key}'",
@@ -2062,26 +2227,69 @@ class UnifiedConnectorService:
             cleanup_scope="connector",
             cleanup_code=cleanup_codes[0],
         )
-        residuals[cache_key] = detail.model_dump(exclude_none=True)
+        residuals[connector_key] = detail.model_dump(exclude_none=True)
         return detail
 
     async def stop_all(self):
         """Stop all connectors and services."""
-        # Stop all trading connectors
-        for account_name, connectors in list(self._trading_connectors.items()):
-            for connector_name in list(connectors.keys()):
+        self._ensure_connector_cleanup_state()
+        connector_keys = {
+            (account_name, connector_name)
+            for account_name, connectors in self._trading_connectors.items()
+            for connector_name in connectors
+        }
+
+        def add_key(raw_key) -> None:
+            if isinstance(raw_key, tuple) and len(raw_key) >= 2:
+                connector_keys.add((raw_key[0], raw_key[1]))
+            elif isinstance(raw_key, str) and ":" in raw_key:
+                connector_keys.add(tuple(raw_key.split(":", 1)))
+
+        for registry in (
+            self._connector_creation_residuals,
+            self._connector_cleanup_owners,
+            self._connector_cleanup_indices,
+            self._connector_residual_tasks,
+            getattr(self, "_market_cleanup_residuals", {}),
+            getattr(self, "_market_cleanup_owners", {}),
+            getattr(self, "_market_pair_owners", {}),
+            getattr(self, "_market_residual_tasks", {}),
+            self._orders_recorders,
+            self._funding_recorders,
+            self._metrics_collectors,
+        ):
+            for raw_key in registry:
+                add_key(raw_key)
+
+        failures = []
+        for account_name, connector_name in sorted(connector_keys):
+            try:
                 await self.stop_trading_connector(account_name, connector_name)
+            except BaseException as exc:
+                failures.append(exc)
+                logger.error(
+                    "Connector shutdown incomplete for %s/%s (%s)",
+                    account_name,
+                    connector_name,
+                    type(exc).__name__,
+                )
 
         # Stop data connectors
         for connector_name, connector in self._data_connectors.items():
             try:
                 await connector.stop_network()
-            except Exception as e:
-                logger.error(f"Error stopping data connector {connector_name}: {e}")
+            except Exception as exc:
+                logger.error(
+                    "Error stopping data connector %s (%s)",
+                    connector_name,
+                    type(exc).__name__,
+                )
 
         self._data_connectors.clear()
         self._data_connectors_started.clear()
 
+        if failures:
+            raise failures[0]
         logger.info("Stopped all connectors")
 
     # =========================================================================
@@ -2216,6 +2424,11 @@ class UnifiedConnectorService:
         """
         self.require_capability(connector_name, ConnectorFeature.LIVE_ORDER_BOOK)
         connector = self.get_best_connector_for_market(connector_name, account_name)
+        owner_account = account_name or "__data__"
+        owner_key = self._owner_key(owner_account, connector_name, "restart")
+        self._ensure_connector_cleanup_state()
+        if not await self._drain_owner_tasks(owner_key):
+            return {"success": False, "error": "tracker_cleanup_pending"}
 
         if not connector:
             return {"success": False, "error": f"No connector found for {connector_name}"}
@@ -2225,6 +2438,7 @@ class UnifiedConnectorService:
             return {"success": False, "error": f"Connector {connector_name} doesn't have order book tracker (AMM/Gateway)"}
 
         tracker = connector.order_book_tracker
+        self._connector_cleanup_owners[owner_key] = tracker
         trading_pairs = list(tracker._trading_pairs)
 
         if not trading_pairs:
@@ -2258,12 +2472,9 @@ class UnifiedConnectorService:
                     tracker_tasks, timeout=_TASK_DRAIN_TIMEOUT
                 )
                 if pending:
-                    residual_index = getattr(
-                        self, "_connector_residual_tasks", None
-                    )
-                    if residual_index is None:
-                        residual_index = self._connector_residual_tasks = {}
-                    residual_index.setdefault(id(connector), set()).update(pending)
+                    self._connector_residual_tasks.setdefault(
+                        owner_key, set()
+                    ).update(pending)
                     return {
                         "success": False,
                         "error": "tracker_cleanup_pending",
@@ -2286,6 +2497,8 @@ class UnifiedConnectorService:
 
             # Wait for WebSocket to be ready
             await self._wait_for_websocket_ready(connector, timeout=10.0)
+
+            self._connector_cleanup_owners.pop(owner_key, None)
 
             return {
                 "success": True,

@@ -4,12 +4,14 @@ This service enables running Hummingbot executors directly via API
 without Docker containers or full strategy setup.
 """
 import asyncio
+import copy
 import json
 import logging
 import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
+from collections.abc import Mapping
 from typing import Any, Dict, List, Optional, Type
 
 from fastapi import HTTPException
@@ -43,6 +45,7 @@ from database import (
 )
 from models.executors import PositionHold
 from services.gateway_client import get_native_gas_token
+from services.connector_capabilities import ConnectorFeature
 from services.trading_service import AccountTradingInterface, TradingService
 from utils.executor_log_capture import ExecutorLogCapture, current_executor_id
 from utils.trading_pair import InvalidTradingPair, split_trading_pair
@@ -761,6 +764,52 @@ class ExecutorService:
             self._trading_interfaces[account_name] = self._trading_service.get_trading_interface(account_name)
         return self._trading_interfaces[account_name]
 
+    @classmethod
+    def _extract_executor_markets(cls, value: Any) -> List[tuple[str, Optional[str]]]:
+        """Recursively extract top-level and nested connector/pair configs."""
+        if hasattr(value, "model_dump"):
+            value = value.model_dump()
+        found: List[tuple[str, Optional[str]]] = []
+        if isinstance(value, Mapping):
+            connector_name = value.get("connector_name")
+            trading_pair = value.get("trading_pair")
+            if isinstance(connector_name, str) and connector_name:
+                found.append(
+                    (
+                        connector_name,
+                        trading_pair if isinstance(trading_pair, str) else None,
+                    )
+                )
+            for nested in value.values():
+                found.extend(cls._extract_executor_markets(nested))
+        elif isinstance(value, (list, tuple)):
+            for nested in value:
+                found.extend(cls._extract_executor_markets(nested))
+        return list(dict.fromkeys(found))
+
+    def _require_executor_market_capabilities(
+        self, markets: List[tuple[str, Optional[str]]]
+    ) -> None:
+        """Validate every market before interface/config/timestamp state is touched."""
+        connector_service = self._trading_service.connector_service
+        for connector_name, trading_pair in markets:
+            if trading_pair is not None:
+                connector_service.require_capability(
+                    connector_name,
+                    ConnectorFeature.DYNAMIC_SUBSCRIPTION,
+                    trading_pair,
+                )
+                connector_service.require_capability(
+                    connector_name,
+                    ConnectorFeature.LIVE_ORDER_BOOK,
+                    trading_pair,
+                )
+            connector_service.require_capability(
+                connector_name,
+                ConnectorFeature.ORDER_SUBMISSION,
+                trading_pair,
+            )
+
     def _validate_executor_config(
         self,
         executor_config: Dict[str, Any],
@@ -881,18 +930,24 @@ class ExecutorService:
             Dictionary with executor_id and initial status
         """
         account = account_name or self.default_account
+        markets = self._extract_executor_markets(executor_config)
+        self._require_executor_market_capabilities(markets)
+
+        # Validation adds a default timestamp. Keep caller-owned request data exact.
+        config_data = copy.deepcopy(executor_config)
         trading_interface = self._get_trading_interface(account)
 
         # Validate executor type and build the typed config
         executor_class, _config_class, typed_config = self._validate_executor_config(
-            executor_config, default_timestamp=trading_interface.current_timestamp
+            config_data, default_timestamp=trading_interface.current_timestamp
         )
-        executor_type = executor_config["type"]
+        executor_type = config_data["type"]
 
         # Ensure connector and market are ready
-        connector_name = executor_config.get("connector_name")
-        trading_pair = executor_config.get("trading_pair")
-        await self._prepare_market(account, connector_name, trading_pair)
+        connector_name = config_data.get("connector_name")
+        trading_pair = config_data.get("trading_pair")
+        for market_connector, market_pair in markets:
+            await self._prepare_market(account, market_connector, market_pair)
 
         # Instantiate the executor, register it in memory and start it
         controller_id = controller_id or getattr(typed_config, "controller_id", "main") or "main"
@@ -903,7 +958,7 @@ class ExecutorService:
             "executor_type": executor_type,
             "controller_id": controller_id,
             "created_at": datetime.now(timezone.utc),
-            "config": executor_config
+            "config": config_data
         }
         executor_id, executor = self._instantiate_and_register(executor_class, typed_config, trading_interface, metadata)
 

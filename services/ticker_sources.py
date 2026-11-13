@@ -749,8 +749,16 @@ async def fetch_tickers(
             raise TickerFetchError(f"Ticker fetch timed out for '{connector_name}'")
         logger.warning(f"Ticker fetch timed out for '{connector_name}'")
         return {}
-    except Exception as e:  # noqa: BLE001 - one exchange failing must not break the cycle
+    except Exception as exc:  # noqa: BLE001 - one exchange failing must not break the cycle
         if raise_on_error:
-            raise e if isinstance(e, TickerFetchError) else TickerFetchError(str(e)) from e
-        logger.warning(f"Failed to fetch tickers for '{connector_name}': {e}")
+            if isinstance(exc, TickerFetchError):
+                raise exc
+            raise TickerFetchError(
+                f"Ticker fetch failed for '{connector_name}'"
+            ) from exc
+        logger.warning(
+            "Failed to fetch tickers for '%s' (%s)",
+            connector_name,
+            type(exc).__name__,
+        )
         return {}

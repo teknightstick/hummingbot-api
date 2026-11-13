@@ -237,6 +237,7 @@ class AccountsService:
         Combines the connector state refresh and token info retrieval into a
         single awaitable so both can run in parallel across all connectors.
         """
+        self.require_capability(connector_name, ConnectorFeature.LAST_TRADE)
         try:
             await self._connector_service.refresh_connector_state(connector, connector_name, account_name)
         except Exception as e:
@@ -261,9 +262,15 @@ class AccountsService:
                 gateway_meta = []  # (account_name, connector_name) of Gateway connectors
 
                 for account_name, connectors in all_connectors.items():
-                    if account_name not in self.accounts_state:
-                        self.accounts_state[account_name] = {}
                     for connector_name, connector in connectors.items():
+                        try:
+                            self.require_capability(
+                                connector_name, ConnectorFeature.LAST_TRADE
+                            )
+                        except ConnectorCapabilityError:
+                            continue
+                        if account_name not in self.accounts_state:
+                            self.accounts_state[account_name] = {}
                         # Gateway connectors only track the tokens of their trading pairs; the
                         # full wallet balance is fetched by _update_gateway_balances below.
                         if self._connector_service.is_gateway_connector(connector):
@@ -421,6 +428,18 @@ class AccountsService:
         """
         all_connectors = self._connector_service.get_all_trading_connectors()
 
+        # Validate the complete selected set before allocating account state or
+        # constructing any balance/network coroutine.
+        for account_name, connectors in all_connectors.items():
+            if account_names and account_name not in account_names:
+                continue
+            for connector_name in connectors:
+                if connector_names and connector_name not in connector_names:
+                    continue
+                self.require_capability(
+                    connector_name, ConnectorFeature.LAST_TRADE
+                )
+
         # Prepare parallel tasks
         tasks = []
         task_meta = []  # (account_name, connector_name)
@@ -431,16 +450,13 @@ class AccountsService:
             if account_names and account_name not in account_names:
                 continue
 
-            if account_name not in self.accounts_state:
-                self.accounts_state[account_name] = {}
             for connector_name, connector in connectors.items():
                 # Filter by connector_names if specified
                 if connector_names and connector_name not in connector_names:
                     continue
 
-                # Valuation may fall back to actual last trades. Reject before
-                # constructing any balance-refresh or network task.
-                self.require_capability(connector_name, ConnectorFeature.LAST_TRADE)
+                if account_name not in self.accounts_state:
+                    self.accounts_state[account_name] = {}
 
                 # Gateway connectors only track the tokens of their trading pairs; the full
                 # wallet balance is fetched by _update_gateway_balances below. Running both

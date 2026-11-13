@@ -2598,8 +2598,17 @@ async def test_closure_b5_connector_scope_residual_cannot_erase_another_pair():
         "master",
     )
     CHECK.assertIn(("generic", "A-USD"), peer.cleanup_residuals)
-    await interface.add_market("generic", "B-USD")
+
+    # A connector-owned residual blocks every pair and every interface sharing
+    # this account/connector authority. It must reject before initializing B.
+    with pytest.raises(ConnectorCapabilityError):
+        await peer.add_market("generic", "B-USD")
+    CHECK.assertNotIn("B-USD", tracker.order_books)
+
+    # Once the retained cleanup can complete, a peer retry may consume A's
+    # connector residual and then publish B without leaving stale ownership.
     connector_service.cleanup_succeeds = True
+    await peer.add_market("generic", "B-USD")
     await interface.add_market("generic", "A-USD")
 
     CHECK.assertEqual({"A-USD", "B-USD"}, set(connector._trading_pairs))
@@ -2884,14 +2893,590 @@ async def test_closure_b11_stop_serializes_with_same_key_creation():
     stopping = asyncio.create_task(service.stop_trading_connector("master", "generic"))
     try:
         await asyncio.wait({stopping}, timeout=0.1)
-        CHECK.assertTrue(stopping.done())
-        CHECK.assertIs(True, stopping.result())
+        CHECK.assertFalse(stopping.done())
     finally:
         creation_release.set()
-        await asyncio.gather(creation, stopping, return_exceptions=True)
+        await asyncio.gather(creation, stopping)
     CHECK.assertIs(connector, creation.result())
+    CHECK.assertIs(True, stopping.result())
 
     CHECK.assertEqual({}, service._trading_connectors)
     CHECK.assertEqual({}, service._orders_recorders)
     CHECK.assertEqual({}, service._funding_recorders)
     CHECK.assertEqual({}, service._metrics_collectors)
+
+
+@pytest.mark.asyncio
+async def test_residual_b2_connector_lock_queued_cancellation_propagates_and_prunes():
+    module, _ = _load_unified_service_module()
+    service = object.__new__(module.UnifiedConnectorService)
+    service._connector_locks = {}
+    service._connector_lock_users = {}
+    service._connector_locks_guard = asyncio.Lock()
+    entered = asyncio.Event()
+    leave_body = asyncio.Event()
+
+    async def transaction():
+        async with service._connector_creation_lock(("master", "generic")):
+            entered.set()
+            await leave_body.wait()
+
+    task = asyncio.create_task(transaction())
+    await entered.wait()
+    await service._connector_locks_guard.acquire()
+    leave_body.set()
+    await asyncio.sleep(0)
+    task.cancel()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    service._connector_locks_guard.release()
+
+    CHECK.assertEqual({}, service._connector_lock_users)
+    CHECK.assertEqual({}, service._connector_locks)
+
+
+@pytest.mark.asyncio
+async def test_residual_b3_owner_tasks_are_consumed_before_public_clear():
+    module, registry_type = _load_unified_service_module()
+    release = asyncio.Event()
+
+    class ResistantIndex:
+        def __init__(self):
+            self.calls = 0
+
+        async def stop(self):
+            self.calls += 1
+            if self.calls > 1:
+                return None
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await release.wait()
+
+    service = object.__new__(module.UnifiedConnectorService)
+    service._trading_connectors = {}
+    service._orders_recorders = {"master:generic": ResistantIndex()}
+    service._funding_recorders = {}
+    service._metrics_collectors = {}
+    service._connector_cleanup_indices = {}
+    service._connector_cleanup_owners = {}
+    service._connector_creation_residuals = {}
+    service._connector_residual_tasks = {}
+    service._capability_registry = registry_type()
+
+    first = await service._finalize_stop_trading_connector("master", "generic")
+    CHECK.assertIsNotNone(first)
+    CHECK.assertTrue(service._connector_residual_tasks)
+
+    second = await service._finalize_stop_trading_connector("master", "generic")
+    CHECK.assertIsNotNone(second)
+    CHECK.assertTrue(service._connector_creation_residuals)
+    CHECK.assertTrue(service._connector_residual_tasks)
+
+    pending = {
+        task
+        for tasks in service._connector_residual_tasks.values()
+        for task in tasks
+    }
+    release.set()
+    await asyncio.gather(*pending, return_exceptions=True)
+
+    third = await service._finalize_stop_trading_connector("master", "generic")
+    CHECK.assertIsNone(third)
+    CHECK.assertEqual({}, service._orders_recorders)
+    CHECK.assertEqual({}, service._connector_creation_residuals)
+    CHECK.assertEqual({}, service._connector_residual_tasks)
+
+
+@pytest.mark.asyncio
+async def test_residual_b3_pair_task_retry_does_not_recancel_retained_owner():
+    from services.trading_service import AccountTradingInterface
+
+    release = asyncio.Event()
+    cancelled_once = asyncio.Event()
+
+    async def resistant():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled_once.set()
+            await release.wait()
+
+    connector_service = types.SimpleNamespace(
+        get_account_connectors=lambda account: {}
+    )
+    interface = AccountTradingInterface(
+        connector_service, types.SimpleNamespace(), "master"
+    )
+    task = asyncio.create_task(resistant())
+    await asyncio.sleep(0)
+    key = ("master", "generic", "pair_tasks", "BTC-USD")
+
+    CHECK.assertIs(False, await interface._drain_tasks(key, {task}))
+    await cancelled_once.wait()
+    CHECK.assertIs(False, await interface._drain_tasks(key, set()))
+    CHECK.assertFalse(task.done())
+
+    release.set()
+    await task
+    CHECK.assertIs(True, await interface._drain_tasks(key, set()))
+    CHECK.assertEqual({}, interface._residual_tasks)
+
+
+@pytest.mark.asyncio
+async def test_residual_b4_account_cleanup_is_exact_and_interface_locks_are_shared():
+    module, registry_type = _load_unified_service_module()
+    from services.trading_service import AccountTradingInterface
+
+    calls = []
+
+    class Connector:
+        async def remove_trading_pair(self, trading_pair):
+            calls.append(trading_pair)
+            return True
+
+    service = object.__new__(module.UnifiedConnectorService)
+    service._capability_registry = registry_type()
+    service._trading_connectors = {
+        "account-a": {},
+        "account-b": {"generic": Connector()},
+    }
+
+    def forbidden_fallback(*args, **kwargs):
+        raise AssertionError("account cleanup used cross-account fallback")
+
+    service.get_best_connector_for_market = forbidden_fallback
+    removed = await service.remove_trading_pair(
+        "generic", "BTC-USD", account_name="account-a"
+    )
+    CHECK.assertIs(False, removed)
+    CHECK.assertEqual([], calls)
+
+    service.get_account_connectors = lambda account: {}
+    market_data = types.SimpleNamespace()
+    first = AccountTradingInterface(service, market_data, "account-a")
+    second = AccountTradingInterface(service, market_data, "account-a")
+    other_account = AccountTradingInterface(service, market_data, "account-b")
+    CHECK.assertIs(first._market_locks, second._market_locks)
+    CHECK.assertIs(first._market_locks_guard, second._market_locks_guard)
+    CHECK.assertIs(first._market_locks, other_account._market_locks)
+
+
+def _load_executor_service_module():
+    strategy_v2 = _module("hummingbot.strategy_v2")
+    strategy_v2.__path__ = []
+    executors = _module("hummingbot.strategy_v2.executors")
+    executors.__path__ = []
+
+    class ExecutorBase:
+        pass
+
+    class ExecutorConfigBase(BaseModel):
+        pass
+
+    executor_base = _module("hummingbot.strategy_v2.executors.executor_base")
+    executor_base.ExecutorBase = ExecutorBase
+    executor_types = _module("hummingbot.strategy_v2.executors.data_types")
+    executor_types.ExecutorConfigBase = ExecutorConfigBase
+
+    registrations = (
+        ("arbitrage_executor", "ArbitrageExecutor", "ArbitrageExecutorConfig"),
+        ("dca_executor", "DCAExecutor", "DCAExecutorConfig"),
+        ("grid_executor", "GridExecutor", "GridExecutorConfig"),
+        ("lp_executor", "LPExecutor", "LPExecutorConfig"),
+        ("order_executor", "OrderExecutor", "OrderExecutorConfig"),
+        ("position_executor", "PositionExecutor", "PositionExecutorConfig"),
+        ("twap_executor", "TWAPExecutor", "TWAPExecutorConfig"),
+        ("xemm_executor", "XEMMExecutor", "XEMMExecutorConfig"),
+    )
+    for package, executor_name, config_name in registrations:
+        package_module = _module(f"hummingbot.strategy_v2.executors.{package}")
+        package_module.__path__ = []
+        implementation = _module(
+            f"hummingbot.strategy_v2.executors.{package}.{package}"
+        )
+        setattr(implementation, executor_name, type(executor_name, (ExecutorBase,), {}))
+        data_types = _module(
+            f"hummingbot.strategy_v2.executors.{package}.data_types"
+        )
+        setattr(data_types, config_name, type(config_name, (ExecutorConfigBase,), {}))
+
+    executor_models = _module("hummingbot.strategy_v2.models")
+    executor_models.__path__ = []
+    executor_model_types = _module("hummingbot.strategy_v2.models.executors")
+    executor_model_types.CloseType = Enum("CloseType", "COMPLETED")
+    executor_model_types.TrackedOrder = type("TrackedOrder", (), {})
+
+    database = _module("database")
+    for name in (
+        "AsyncDatabaseManager",
+        "ExecutorPerformanceRepository",
+        "ExecutorRepository",
+        "GatewayCLMMRepository",
+        "GatewaySwapRepository",
+    ):
+        setattr(database, name, type(name, (), {}))
+
+    executor_models_module = _module("models.executors")
+    executor_models_module.PositionHold = type("PositionHold", (), {})
+    gateway_client = _module("services.gateway_client")
+    gateway_client.get_native_gas_token = lambda *args, **kwargs: "ETH"
+
+    log_capture = _module("utils.executor_log_capture")
+    log_capture.ExecutorLogCapture = type("ExecutorLogCapture", (), {})
+
+    class Context:
+        def set(self, value):
+            return value
+
+        def reset(self, token):
+            return None
+
+    log_capture.current_executor_id = Context()
+
+    module_name = "issue222_residual_executor_service_under_test"
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        Path(__file__).resolve().parents[1] / "services" / "executor_service.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_websocket_manager_module():
+    event_package = _module("hummingbot.core.event")
+    event_package.__path__ = []
+    event_forwarder = _module("hummingbot.core.event.event_forwarder")
+    event_forwarder.SourceInfoEventForwarder = type(
+        "SourceInfoEventForwarder", (), {}
+    )
+    events = _module("hummingbot.core.event.events")
+    events.OrderBookEvent = Enum("OrderBookEvent", "TradeEvent")
+    events.OrderBookTradeEvent = type("OrderBookTradeEvent", (), {})
+
+    config = _module("config")
+    config.settings = types.SimpleNamespace(
+        market_data=types.SimpleNamespace(
+            candles_ready_timeout=1.0,
+            ws_min_update_interval=0.1,
+            ws_max_update_interval=5.0,
+        )
+    )
+
+    module_name = "issue222_residual_websocket_manager_under_test"
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        Path(__file__).resolve().parents[1] / "services" / "websocket_manager.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.asyncio
+async def test_residual_b5_stop_all_retries_unpublished_owner_union():
+    module, registry_type = _load_unified_service_module()
+
+    class Connector:
+        order_book_tracker = None
+
+        def __init__(self):
+            self.stop_calls = 0
+
+        async def stop_network(self):
+            self.stop_calls += 1
+            return None
+
+    connector = Connector()
+    market_connector = Connector()
+    service = object.__new__(module.UnifiedConnectorService)
+    service._trading_connectors = {}
+    service._data_connectors = {}
+    service._data_connectors_started = {}
+    service._connector_locks = {}
+    service._connector_lock_users = {}
+    service._connector_locks_guard = asyncio.Lock()
+    service._orders_recorders = {}
+    service._funding_recorders = {}
+    service._metrics_collectors = {}
+    service._connector_creation_residuals = {
+        ("master", "generic"): {
+            "code": "connector_creation_cleanup_residual",
+            "message": "cleanup incomplete",
+            "connector": "generic",
+            "feature": "connector_creation",
+            "reason": "cleanup_incomplete",
+            "cleanup_scope": "connector",
+            "cleanup_code": "connector_cleanup_incomplete",
+        }
+    }
+    service._connector_cleanup_owners = {
+        ("master", "generic", "network"): connector
+    }
+    service._connector_cleanup_indices = {}
+    service._connector_residual_tasks = {}
+    service._market_cleanup_residuals = {}
+    service._market_cleanup_owners = {
+        ("secondary", "orphan", "connector"): {
+            "connector": market_connector,
+            "connector_preexisting": False,
+        }
+    }
+    service._market_residual_tasks = {}
+    service._market_pair_owners = {}
+    service._capability_registry = registry_type()
+
+    await service.stop_all()
+
+    CHECK.assertEqual(1, connector.stop_calls)
+    CHECK.assertEqual(1, market_connector.stop_calls)
+    CHECK.assertEqual({}, service._connector_creation_residuals)
+    CHECK.assertEqual({}, service._connector_cleanup_owners)
+    CHECK.assertEqual({}, service._market_cleanup_owners)
+
+
+@pytest.mark.asyncio
+async def test_residual_b6_ticker_truth_rejects_before_local_or_connector_work():
+    from services.connector_capabilities import (
+        ConnectorCapabilityError,
+        ConnectorCapabilityRegistry,
+        ConnectorFeature,
+    )
+    from services.market_data_service import MarketDataService
+
+    calls = []
+
+    class ConnectorService:
+        registry = ConnectorCapabilityRegistry()
+
+        def require_capability(self, connector_name, feature, trading_pair=None):
+            self.registry.require(connector_name, feature, trading_pair)
+
+        def is_known_connector(self, connector_name):
+            calls.append("known")
+            return True
+
+        def get_best_connector_for_market(self, connector_name):
+            calls.append("resolve")
+            return object()
+
+    service = MarketDataService(ConnectorService())
+    capabilities = ConnectorCapabilityRegistry().get("manzana")
+    CHECK.assertNotIn(ConnectorFeature.TICKERS.value, capabilities.features)
+    CHECK.assertEqual("best_bid_ask", ConnectorFeature.BEST_BID_ASK.value)
+
+    with pytest.raises(ConnectorCapabilityError) as captured:
+        await service.fetch_connector_tickers("manzana", force=True)
+
+    CHECK.assertEqual(ConnectorFeature.TICKERS.value, captured.value.detail["feature"])
+    CHECK.assertEqual([], calls)
+    CHECK.assertNotIn("manzana", service._ticker_requests)
+    CHECK.assertNotIn("manzana", service._ticker_locks)
+
+
+@pytest.mark.asyncio
+async def test_residual_b7_account_refresh_rejects_before_all_state_and_network_work():
+    from services.connector_capabilities import (
+        ConnectorCapabilityError,
+        ConnectorCapabilityRegistry,
+    )
+
+    module = _load_accounts_service_module()
+    calls = []
+
+    class ConnectorService:
+        registry = ConnectorCapabilityRegistry()
+
+        def get_all_trading_connectors(self):
+            return {"master": {"manzana": object()}}
+
+        def is_gateway_connector(self, connector):
+            return False
+
+        def require_capability(self, connector_name, feature, trading_pair=None):
+            self.registry.require(connector_name, feature, trading_pair)
+
+        async def refresh_connector_state(self, *args):
+            calls.append("refresh")
+
+    accounts = object.__new__(module.AccountsService)
+    accounts._connector_service = ConnectorService()
+    accounts.accounts_state = {}
+    accounts._update_gateway_balances = lambda **kwargs: asyncio.sleep(0)
+
+    with pytest.raises(ConnectorCapabilityError):
+        await accounts.update_account_state(skip_gateway=True)
+    CHECK.assertEqual({}, accounts.accounts_state)
+
+    with pytest.raises(ConnectorCapabilityError):
+        await accounts._refresh_and_get_tokens_info(
+            object(), "manzana", "master"
+        )
+    CHECK.assertEqual([], calls)
+
+
+@pytest.mark.asyncio
+async def test_residual_b7_nested_executor_configs_reject_before_interface_or_config_mutation():
+    from services.connector_capabilities import (
+        ConnectorCapabilityError,
+        ConnectorCapabilityRegistry,
+    )
+
+    module = _load_executor_service_module()
+    calls = []
+
+    class ConnectorService:
+        registry = ConnectorCapabilityRegistry()
+
+        def require_capability(self, connector_name, feature, trading_pair=None):
+            self.registry.require(connector_name, feature, trading_pair)
+
+    class TradingService:
+        connector_service = ConnectorService()
+
+        def get_trading_interface(self, account):
+            calls.append(("interface", account))
+            return types.SimpleNamespace(current_timestamp=123.0)
+
+    service = object.__new__(module.ExecutorService)
+    service._trading_service = TradingService()
+    service.default_account = "master"
+    service._trading_interfaces = {}
+
+    def forbidden_validation(*args, **kwargs):
+        calls.append(("validate", None))
+        raise AssertionError("config validation preceded capability rejection")
+
+    service._validate_executor_config = forbidden_validation
+    cases = (
+        {
+            "type": "arbitrage_executor",
+            "buying_market": {
+                "connector_name": "manzana",
+                "trading_pair": "BTC-USD",
+            },
+            "selling_market": {
+                "connector_name": "generic",
+                "trading_pair": "BTC-USD",
+            },
+        },
+        {
+            "type": "xemm_executor",
+            "maker_market": {
+                "connector_name": "generic",
+                "trading_pair": "BTC-USD",
+            },
+            "taker_market": {
+                "connector_name": "manzana",
+                "trading_pair": "BTC-USD",
+            },
+        },
+    )
+    for config in cases:
+        original = json.loads(json.dumps(config))
+        with pytest.raises(ConnectorCapabilityError):
+            await service.create_executor(config, account_name="master")
+        CHECK.assertEqual(original, config)
+    CHECK.assertEqual([], calls)
+    CHECK.assertEqual({}, service._trading_interfaces)
+
+
+@pytest.mark.asyncio
+async def test_residual_b7_websocket_rejection_preserves_existing_subscription():
+    from services.connector_capabilities import (
+        ConnectorCapabilityRegistry,
+    )
+
+    module = _load_websocket_manager_module()
+    calls = []
+
+    class Task:
+        cancelled = False
+
+        def done(self):
+            return False
+
+        def cancel(self):
+            self.cancelled = True
+
+    old_task = Task()
+    old = module.Subscription(
+        subscription_id="order_book_manzana_BTC-USD",
+        sub_type="order_book",
+        connector="generic",
+        trading_pair="BTC-USD",
+        update_interval=1.0,
+        task=old_task,
+    )
+
+    class MarketData:
+        registry = ConnectorCapabilityRegistry()
+
+        def require_capability(self, connector_name, feature, trading_pair=None):
+            self.registry.require(connector_name, feature, trading_pair)
+
+        async def initialize_order_book(self, connector_name, trading_pair):
+            calls.append("initialize")
+            self.require_capability(connector_name, feature=None, trading_pair=trading_pair)
+
+    class WebSocket:
+        async def send_json(self, payload):
+            calls.append(payload)
+
+    manager = module.WebSocketManager(MarketData())
+    manager._connections = {"connection": {old.subscription_id: old}}
+    await manager.handle_subscribe(
+        "connection",
+        WebSocket(),
+        {
+            "type": "order_book",
+            "connector": "manzana",
+            "trading_pair": "BTC-USD",
+        },
+    )
+
+    CHECK.assertIs(
+        old, manager._connections["connection"][old.subscription_id]
+    )
+    CHECK.assertFalse(old_task.cancelled)
+    CHECK.assertNotIn("initialize", calls)
+
+
+@pytest.mark.asyncio
+async def test_residual_b8_public_capability_details_never_publish_exception_text():
+    from services.connector_capabilities import ConnectorCapabilityError
+    from routers import market_data as market_data_router
+
+    secret = "transport-token=credential-value"
+
+    class Service:
+        def require_capability(self, *args, **kwargs):
+            return None
+
+        async def get_candles_feed(self, config):
+            raise ValueError(secret)
+
+    request = types.SimpleNamespace(
+        app=types.SimpleNamespace(
+            state=types.SimpleNamespace(market_data_service=Service())
+        )
+    )
+    config = market_data_router.CandlesConfigRequest(
+        connector_name="generic",
+        trading_pair="BTC-USD",
+        interval="1m",
+        max_records=10,
+    )
+    market_data_router.CandlesFactory._candles_map["generic"] = object()
+    try:
+        with pytest.raises(ConnectorCapabilityError) as captured:
+            await market_data_router.get_candles(request, config)
+    finally:
+        market_data_router.CandlesFactory._candles_map.pop("generic", None)
+
+    serialized = json.dumps(captured.value.detail)
+    CHECK.assertNotIn(secret, serialized)
+    CHECK.assertNotIn("ValueError", serialized)
+    CHECK.assertEqual("candle_request_rejected", captured.value.detail["reason"])

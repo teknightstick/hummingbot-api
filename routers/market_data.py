@@ -61,7 +61,10 @@ def _unsupported_detail(
     """Build the exact detail shape advertised for capability-related HTTP 400s."""
     return CapabilityErrorDetail(
         code=code,
-        message=reason,
+        message=(
+            f"Connector '{connector_name}' rejected the requested "
+            f"'{feature.value}' operation"
+        ),
         connector=connector_name,
         feature=feature.value,
         trading_pair=trading_pair,
@@ -137,7 +140,7 @@ async def get_candles(request: Request, candles_config: CandlesConfigRequest):
                 _unsupported_detail(
                     candles_config.connector_name,
                     ConnectorFeature.CANDLES,
-                    str(e),
+                    "candle_request_rejected",
                     candles_config.trading_pair,
                     code="unsupported_candle_request",
                 )
@@ -169,19 +172,24 @@ async def get_candles(request: Request, candles_config: CandlesConfigRequest):
 
     except HTTPException:
         raise
-    except UnsupportedConnectorException as e:
+    except UnsupportedConnectorException as exc:
+        logger.info(
+            "Candle connector rejected %s (%s)",
+            candles_config.connector_name,
+            type(exc).__name__,
+        )
         raise ConnectorCapabilityError(
             _unsupported_detail(
                 candles_config.connector_name,
                 ConnectorFeature.CANDLES,
-                str(e),
+                "candle_connector_unavailable",
                 candles_config.trading_pair,
                 code="unsupported_candle_connector",
             )
         )
-    except Exception as e:
-        logger.error(f"Unexpected error fetching candles: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Internal error fetching candles: {str(e)}")
+    except Exception as exc:
+        logger.error("Unexpected candle error (%s)", type(exc).__name__)
+        raise HTTPException(status_code=500, detail="Internal candle error")
 
 
 @router.post("/historical-candles", responses=CAPABILITY_ERROR_RESPONSES)
@@ -249,7 +257,7 @@ async def get_historical_candles(request: Request, config: HistoricalCandlesConf
                 _unsupported_detail(
                     config.connector_name,
                     ConnectorFeature.CANDLES,
-                    str(e),
+                    "candle_request_rejected",
                     config.trading_pair,
                     code="unsupported_candle_request",
                 )
@@ -276,30 +284,44 @@ async def get_historical_candles(request: Request, config: HistoricalCandlesConf
                    f"{settings.market_data.candles_ready_timeout}s. "
                    f"The trading pair may not exist or the time range may be too large."
         )
-    except UnsupportedConnectorException as e:
+    except UnsupportedConnectorException as exc:
+        logger.info(
+            "Historical candle connector rejected %s (%s)",
+            config.connector_name,
+            type(exc).__name__,
+        )
         raise ConnectorCapabilityError(
             _unsupported_detail(
                 config.connector_name,
                 ConnectorFeature.CANDLES,
-                str(e),
+                "candle_connector_unavailable",
                 config.trading_pair,
                 code="unsupported_candle_connector",
             )
         )
-    except ValueError as e:
-        reason = f"Invalid parameters: {str(e)}"
+    except ValueError as exc:
+        logger.info(
+            "Historical candle request rejected for %s (%s)",
+            config.connector_name,
+            type(exc).__name__,
+        )
         raise ConnectorCapabilityError(
             _unsupported_detail(
                 config.connector_name,
                 ConnectorFeature.CANDLES,
-                reason,
+                "candle_request_rejected",
                 config.trading_pair,
                 code="unsupported_candle_request",
             )
         )
-    except Exception as e:
-        logger.error(f"Unexpected error fetching historical candles: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Internal error fetching historical candles: {str(e)}")
+    except Exception as exc:
+        logger.error(
+            "Unexpected historical candle error (%s)",
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=500, detail="Internal historical candle error"
+        )
 
 
 @router.get("/active-feeds")

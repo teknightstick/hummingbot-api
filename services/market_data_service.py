@@ -578,10 +578,14 @@ class MarketDataService:
                 )
         except ValueError:
             raise
-        except Exception as e:
-            raise ValueError(
-                f"Trading pair '{trading_pair}' appears to be invalid on '{connector_name}': {e}"
+        except Exception as exc:
+            logger.warning(
+                "Candle pair validation failed for %s/%s (%s)",
+                connector_name,
+                trading_pair,
+                type(exc).__name__,
             )
+            raise ValueError("candle_pair_validation_failed") from exc
 
     async def get_candles_feed(self, config: CandlesConfig):
         """
@@ -674,7 +678,7 @@ class MarketDataService:
                 del self._candle_feeds[feed_key]
                 self._discard_candle_feed_lock(feed_key)
                 logger.info(f"Stopped candle feed: {feed_key}")
-            except Exception as e:
+            except Exception as exc:
                 logger.error(f"Error stopping candle feed {feed_key}: {e}")
 
     # ==================== Prices ====================
@@ -844,10 +848,14 @@ class MarketDataService:
                 # Building a keyless connector can fail before any request is made: an optional
                 # dependency is missing (dydx_v4 needs v4_proto, vertex needs eip712_structs) or
                 # the connector demands credentials in its constructor. Retrying never helps.
+                logger.info(
+                    "Public ticker connector construction rejected for %s (%s)",
+                    connector_name,
+                    type(exc).__name__,
+                )
                 raise TickerUnsupportedError(
-                    f"'{connector_name}' cannot be instantiated for public market data: "
-                    f"{type(e).__name__}: {e}"
-                ) from e
+                    f"'{connector_name}' cannot be instantiated for public market data"
+                ) from exc
             if connector is None:
                 raise TickerFetchError(f"No connector available for '{connector_name}'")
 

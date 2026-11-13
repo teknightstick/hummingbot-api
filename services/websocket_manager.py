@@ -12,6 +12,10 @@ from hummingbot.core.event.events import OrderBookEvent, OrderBookTradeEvent
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 
 from config import settings
+from services.connector_capabilities import (
+    ConnectorCapabilityError,
+    ConnectorFeature,
+)
 from services.market_data_service import MarketDataService
 
 logger = logging.getLogger(__name__)
@@ -59,6 +63,26 @@ class WebSocketManager:
             return
         if not connector or not trading_pair:
             await self._send_error(websocket, "connector and trading_pair are required")
+            return
+
+        # Reject before replacing a same-ID subscription or allocating connection
+        # state. Feed constructors may perform connector and network work.
+        try:
+            if sub_type == "candles":
+                self._market_data_service.require_capability(
+                    connector, ConnectorFeature.CANDLES, trading_pair
+                )
+            else:
+                self._market_data_service.require_capability(
+                    connector, ConnectorFeature.DYNAMIC_SUBSCRIPTION, trading_pair
+                )
+                self._market_data_service.require_capability(
+                    connector, ConnectorFeature.LIVE_ORDER_BOOK, trading_pair
+                )
+        except ConnectorCapabilityError as exc:
+            await self._send_json(
+                websocket, {"type": "error", "detail": dict(exc.detail)}
+            )
             return
 
         if sub_type == "candles":
@@ -115,11 +139,18 @@ class WebSocketManager:
             else:
                 # Both order_book and trades need the order book initialized
                 await self._market_data_service.initialize_order_book(connector, trading_pair)
-        except ValueError as e:
-            await self._send_error(websocket, str(e))
+        except ValueError as exc:
+            logger.info(
+                "WebSocket feed request rejected (%s)", type(exc).__name__
+            )
+            await self._send_error(websocket, "invalid_feed_request")
             return
-        except Exception as e:
-            await self._send_error(websocket, f"Failed to start feed: {e}")
+        except Exception as exc:
+            logger.error(
+                "WebSocket feed start failed (%s)",
+                type(exc).__name__,
+            )
+            await self._send_error(websocket, "feed_start_failed")
             return
 
         # Spawn push loop / listener
