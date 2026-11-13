@@ -132,7 +132,12 @@ class WebSocketManager:
                 await self._market_data_service.get_candles_feed(config)
             else:
                 # Both order_book and trades need the order book initialized
-                await self._market_data_service.initialize_order_book(connector, trading_pair)
+                initialized = await self._market_data_service.initialize_order_book(
+                    connector, trading_pair
+                )
+                if initialized is not True:
+                    await self._send_error(websocket, "feed_validation_failed")
+                    return
         except ValueError as exc:
             logger.info(
                 "WebSocket feed request rejected (%s)", type(exc).__name__

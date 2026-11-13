@@ -38,6 +38,7 @@ from models import (
     VWAPForVolumeRequest,
 )
 from models.market_data import CandlesConfigRequest
+from models.connectors import PublicErrorDetail, PublicErrorResponse
 from services.connector_capabilities import ConnectorCapabilityError, ConnectorFeature
 from services.market_data_service import MarketDataService
 from services.ticker_sources import TickerFetchError, TickerUnsupportedError
@@ -49,6 +50,33 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Market Data"], prefix="/market-data")
 
 CAPABILITY_ERROR_RESPONSES = {400: {"model": CapabilityErrorResponse}}
+PUBLIC_ERROR_RESPONSES = {500: {"model": PublicErrorResponse}}
+ORDER_BOOK_ERROR_RESPONSES = {
+    **CAPABILITY_ERROR_RESPONSES,
+    **PUBLIC_ERROR_RESPONSES,
+}
+
+_PUBLIC_ERROR_MESSAGES = {
+    "active_feeds_unavailable": "Active feed diagnostics are unavailable",
+    "connector_not_found": "The requested connector is not available",
+    "order_book_not_found": "The requested order book is not available",
+    "order_book_fetch_failed": "Order book data could not be fetched",
+    "order_book_query_failed": "Order book query failed",
+    "order_book_diagnostics_failed": "Order book diagnostics are unavailable",
+}
+
+
+def _public_error_detail(
+    value,
+    default_code: str,
+    default_message: str,
+) -> dict:
+    """Accept only allowlisted stable codes; never forward service text."""
+    code = value.get("code") if isinstance(value, dict) else None
+    if code not in _PUBLIC_ERROR_MESSAGES:
+        code = default_code
+    message = _PUBLIC_ERROR_MESSAGES.get(code, default_message)
+    return PublicErrorDetail(code=code, message=message).model_dump()
 
 
 def _unsupported_detail(
@@ -83,7 +111,7 @@ def _sanitized_http_error(
     logger.error("%s (%s)", code, type(exc).__name__)
     return HTTPException(
         status_code=status_code,
-        detail={"code": code, "message": message},
+        detail=PublicErrorDetail(code=code, message=message).model_dump(),
     )
 
 
@@ -339,7 +367,7 @@ async def get_historical_candles(request: Request, config: HistoricalCandlesConf
         )
 
 
-@router.get("/active-feeds")
+@router.get("/active-feeds", responses=PUBLIC_ERROR_RESPONSES)
 async def get_active_feeds(request: Request):
     """
     Get information about currently active market data feeds.
@@ -353,8 +381,12 @@ async def get_active_feeds(request: Request):
     try:
         market_data_service: MarketDataService = request.app.state.market_data_service
         return market_data_service.get_active_feeds_info()
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception as exc:
+        raise _sanitized_http_error(
+            "active_feeds_unavailable",
+            "Active feed diagnostics are unavailable",
+            exc,
+        )
 
 
 @router.get("/settings")
@@ -763,7 +795,11 @@ async def get_funding_info(
         )
 
 
-@router.post("/order-book", response_model=OrderBookResponse, responses=CAPABILITY_ERROR_RESPONSES)
+@router.post(
+    "/order-book",
+    response_model=OrderBookResponse,
+    responses=ORDER_BOOK_ERROR_RESPONSES,
+)
 async def get_order_book(
         request: OrderBookRequest,
         market_data_manager: MarketDataService = Depends(get_market_data_service)
@@ -789,7 +825,14 @@ async def get_order_book(
         )
 
         if "error" in order_book_data:
-            raise HTTPException(status_code=500, detail=order_book_data["error"])
+            raise HTTPException(
+                status_code=500,
+                detail=_public_error_detail(
+                    order_book_data["error"],
+                    "order_book_fetch_failed",
+                    "Order book data could not be fetched",
+                ),
+            )
 
         # Convert to response format - data comes as [price, amount] lists
         bids = [OrderBookLevel(price=bid[0], amount=bid[1]) for bid in order_book_data["bids"]]
@@ -816,7 +859,7 @@ async def get_order_book(
 @router.post(
     "/order-book/price-for-volume",
     response_model=OrderBookQueryResult,
-    responses=CAPABILITY_ERROR_RESPONSES,
+    responses=ORDER_BOOK_ERROR_RESPONSES,
 )
 async def get_price_for_volume(
         request: PriceForVolumeRequest,
@@ -841,7 +884,14 @@ async def get_price_for_volume(
         )
 
         if "error" in result:
-            raise HTTPException(status_code=500, detail=result["error"])
+            raise HTTPException(
+                status_code=500,
+                detail=_public_error_detail(
+                    result["error"],
+                    "order_book_query_failed",
+                    "Order book query failed",
+                ),
+            )
 
         return OrderBookQueryResult(**result)
     except HTTPException:
@@ -855,7 +905,7 @@ async def get_price_for_volume(
 @router.post(
     "/order-book/volume-for-price",
     response_model=OrderBookQueryResult,
-    responses=CAPABILITY_ERROR_RESPONSES,
+    responses=ORDER_BOOK_ERROR_RESPONSES,
 )
 async def get_volume_for_price(
         request: VolumeForPriceRequest,
@@ -880,7 +930,14 @@ async def get_volume_for_price(
         )
 
         if "error" in result:
-            raise HTTPException(status_code=500, detail=result["error"])
+            raise HTTPException(
+                status_code=500,
+                detail=_public_error_detail(
+                    result["error"],
+                    "order_book_query_failed",
+                    "Order book query failed",
+                ),
+            )
 
         return OrderBookQueryResult(**result)
     except HTTPException:
@@ -894,7 +951,7 @@ async def get_volume_for_price(
 @router.post(
     "/order-book/price-for-quote-volume",
     response_model=OrderBookQueryResult,
-    responses=CAPABILITY_ERROR_RESPONSES,
+    responses=ORDER_BOOK_ERROR_RESPONSES,
 )
 async def get_price_for_quote_volume(
         request: PriceForQuoteVolumeRequest,
@@ -919,7 +976,14 @@ async def get_price_for_quote_volume(
         )
 
         if "error" in result:
-            raise HTTPException(status_code=500, detail=result["error"])
+            raise HTTPException(
+                status_code=500,
+                detail=_public_error_detail(
+                    result["error"],
+                    "order_book_query_failed",
+                    "Order book query failed",
+                ),
+            )
 
         return OrderBookQueryResult(**result)
     except HTTPException:
@@ -933,7 +997,7 @@ async def get_price_for_quote_volume(
 @router.post(
     "/order-book/quote-volume-for-price",
     response_model=OrderBookQueryResult,
-    responses=CAPABILITY_ERROR_RESPONSES,
+    responses=ORDER_BOOK_ERROR_RESPONSES,
 )
 async def get_quote_volume_for_price(
         request: QuoteVolumeForPriceRequest,
@@ -958,7 +1022,14 @@ async def get_quote_volume_for_price(
         )
 
         if "error" in result:
-            raise HTTPException(status_code=500, detail=result["error"])
+            raise HTTPException(
+                status_code=500,
+                detail=_public_error_detail(
+                    result["error"],
+                    "order_book_query_failed",
+                    "Order book query failed",
+                ),
+            )
 
         return OrderBookQueryResult(**result)
     except HTTPException:
@@ -972,7 +1043,7 @@ async def get_quote_volume_for_price(
 @router.post(
     "/order-book/vwap-for-volume",
     response_model=OrderBookQueryResult,
-    responses=CAPABILITY_ERROR_RESPONSES,
+    responses=ORDER_BOOK_ERROR_RESPONSES,
 )
 async def get_vwap_for_volume(
         request: VWAPForVolumeRequest,
@@ -997,7 +1068,14 @@ async def get_vwap_for_volume(
         )
 
         if "error" in result:
-            raise HTTPException(status_code=500, detail=result["error"])
+            raise HTTPException(
+                status_code=500,
+                detail=_public_error_detail(
+                    result["error"],
+                    "order_book_query_failed",
+                    "Order book query failed",
+                ),
+            )
 
         return OrderBookQueryResult(**result)
     except HTTPException:
@@ -1135,7 +1213,11 @@ async def remove_trading_pair(
 
 @router.get(
     "/order-book/diagnostics/{connector_name}",
-    responses=CAPABILITY_ERROR_RESPONSES,
+    responses={
+        **CAPABILITY_ERROR_RESPONSES,
+        404: {"model": PublicErrorResponse},
+        **PUBLIC_ERROR_RESPONSES,
+    },
 )
 async def get_order_book_diagnostics(
         connector_name: str,
@@ -1166,6 +1248,15 @@ async def get_order_book_diagnostics(
             connector_name=connector_name,
             account_name=account_name
         )
+        if "error" in diagnostics:
+            raise HTTPException(
+                status_code=404,
+                detail=_public_error_detail(
+                    diagnostics["error"],
+                    "connector_not_found",
+                    "The requested connector is not available",
+                ),
+            )
         return diagnostics
     except HTTPException:
         raise

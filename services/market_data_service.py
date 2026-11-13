@@ -324,8 +324,10 @@ class MarketDataService:
         if order_book:
             try:
                 return order_book.snapshot
-            except Exception as e:
-                logger.error(f"Error getting order book snapshot: {e}")
+            except Exception as exc:
+                logger.error(
+                    "Error getting order book snapshot (%s)", type(exc).__name__
+                )
         return None
 
     async def get_order_book_data(
@@ -354,7 +356,12 @@ class MarketDataService:
             )
 
             if not connector:
-                return {"error": f"No connector available for {connector_name}"}
+                return {
+                    "error": {
+                        "code": "connector_not_found",
+                        "message": "The requested connector is not available",
+                    }
+                }
 
             # Try to get from existing order book tracker
             if hasattr(connector, 'order_book_tracker') and connector.order_book_tracker:
@@ -383,7 +390,12 @@ class MarketDataService:
                     "timestamp": time.time()
                 }
 
-            return {"error": f"Order book not available for {connector_name}/{trading_pair}"}
+            return {
+                "error": {
+                    "code": "order_book_not_found",
+                    "message": "The requested order book is not available",
+                }
+            }
 
         except Exception as exc:
             logger.error(
@@ -454,7 +466,12 @@ class MarketDataService:
                 connector_name, account_name
             )
             if not connector:
-                return {"error": f"No connector available for {connector_name}"}
+                return {
+                    "error": {
+                        "code": "connector_not_found",
+                        "message": "The requested connector is not available",
+                    }
+                }
 
             order_book = None
             if hasattr(connector, "order_book_tracker") and connector.order_book_tracker:
@@ -464,7 +481,12 @@ class MarketDataService:
             if not order_book and hasattr(connector, "_orderbook_ds") and connector._orderbook_ds:
                 order_book = await connector._orderbook_ds.get_new_order_book(trading_pair)
             if not order_book:
-                return {"error": f"No order book available for {connector_name}/{trading_pair}"}
+                return {
+                    "error": {
+                        "code": "order_book_not_found",
+                        "message": "The requested order book is not available",
+                    }
+                }
 
             if query_key == "volume":
                 result = order_book.get_price_for_volume(is_buy, query_value)
@@ -1122,7 +1144,12 @@ class MarketDataService:
             )
 
             if not connector:
-                return {"error": f"No connector available for {connector_name}"}
+                return {
+                    "error": {
+                        "code": "connector_not_found",
+                        "message": "Trading-rule connector is not available",
+                    }
+                }
 
             # Ensure trading rules are loaded
             if not connector.trading_rules or len(connector.trading_rules) == 0:

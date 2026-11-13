@@ -2807,7 +2807,7 @@ async def test_closure_b9_real_tracker_task_names_are_drained_or_retained():
 
 
 @pytest.mark.asyncio
-async def test_closure_b10_failed_creation_cleanup_can_be_retried():
+async def test_closure_b10_failed_creation_cleanup_false_is_not_repeated():
     module, registry_type = _load_unified_service_module()
 
     class Connector:
@@ -2854,11 +2854,11 @@ async def test_closure_b10_failed_creation_cleanup_can_be_retried():
         await service.get_trading_connector("master", "generic")
     connector.clean = True
 
-    CHECK.assertIs(
-        True, await service.stop_trading_connector("master", "generic")
-    )
-    CHECK.assertEqual(2, connector.stop_calls)
-    CHECK.assertEqual({}, service.connector_creation_residuals)
+    with pytest.raises(module.ConnectorCapabilityError) as retry:
+        await service.stop_trading_connector("master", "generic")
+    CHECK.assertEqual("connector_cleanup_residual", retry.value.detail["code"])
+    CHECK.assertEqual(1, connector.stop_calls)
+    CHECK.assertIn("master:generic", service.connector_creation_residuals)
 
 
 @pytest.mark.asyncio
@@ -3699,7 +3699,9 @@ async def test_adjacent_b3_restart_retry_does_not_recancel_retained_task():
     tracker = Tracker()
     connector = types.SimpleNamespace(order_book_tracker=tracker)
     service.get_best_connector_for_market = lambda name, account=None: connector
-    service._wait_for_websocket_ready = lambda *args, **kwargs: asyncio.sleep(0)
+    service._wait_for_websocket_ready = lambda *args, **kwargs: asyncio.sleep(
+        0, result=True
+    )
     owner_key = ("master", "generic", "restart")
 
     first = await service.restart_order_book_tracker("generic", "master")
@@ -3951,6 +3953,7 @@ async def test_adjacent_b7_duplicate_websocket_failure_preserves_old_subscriptio
         async def initialize_order_book(self, connector, trading_pair):
             if self.fail:
                 raise ValueError("invalid pair")
+            return True
 
     class WebSocket:
         async def send_json(self, payload):
@@ -4141,3 +4144,475 @@ async def test_adjacent_b8_price_and_funding_routes_never_publish_exception_valu
     CHECK.assertNotIn(marker, serialized)
     CHECK.assertEqual("price_fetch_failed", price_error.value.detail["code"])
     CHECK.assertEqual("funding_fetch_failed", funding_error.value.detail["code"])
+
+
+@pytest.mark.asyncio
+async def test_final_adjacent_b2_index_stop_terminal_retry_is_consumed_once():
+    module, registry_type = _load_unified_service_module()
+    service = _adjacent_unified_service(module, registry_type)
+    release = asyncio.Event()
+
+    class Index:
+        def __init__(self):
+            self.stop_calls = 0
+
+        async def stop(self):
+            self.stop_calls += 1
+            if self.stop_calls == 1:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    await release.wait()
+
+    index = Index()
+    with pytest.raises(RuntimeError):
+        await service._stop_owned_index("master", "generic", "orders", index)
+    release.set()
+    await asyncio.sleep(0)
+
+    await service._stop_owned_index("master", "generic", "orders", index)
+
+    CHECK.assertEqual(1, index.stop_calls)
+    CHECK.assertNotIn(
+        ("master", "generic", "orders"), service._connector_cleanup_owners
+    )
+
+
+@pytest.mark.asyncio
+async def test_final_adjacent_b2_network_tracker_terminal_retry_is_consumed_once():
+    module, registry_type = _load_unified_service_module()
+    service = _adjacent_unified_service(module, registry_type)
+    release = asyncio.Event()
+
+    class Tracker:
+        order_books = {}
+        _tracking_tasks = {}
+
+        def __init__(self):
+            self.stop_calls = 0
+
+        async def stop(self):
+            self.stop_calls += 1
+            if self.stop_calls == 1:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    await release.wait()
+
+    tracker = Tracker()
+    connector = types.SimpleNamespace(order_book_tracker=tracker)
+    with pytest.raises(RuntimeError):
+        await service._stop_connector_network(connector, "master", "generic")
+    release.set()
+    await asyncio.sleep(0)
+
+    await service._stop_connector_network(connector, "master", "generic")
+
+    CHECK.assertEqual(1, tracker.stop_calls)
+    CHECK.assertNotIn(
+        ("master", "generic", "network"), service._connector_cleanup_owners
+    )
+
+
+@pytest.mark.asyncio
+async def test_final_adjacent_b2_restart_stop_terminal_retry_is_consumed_once():
+    module, registry_type = _load_unified_service_module()
+    service = _adjacent_unified_service(module, registry_type)
+    release = asyncio.Event()
+
+    class Tracker:
+        _trading_pairs = ["BTC-USD"]
+        _tracking_tasks = {}
+        order_books = {}
+
+        def __init__(self):
+            self.stop_calls = 0
+
+        async def stop(self):
+            self.stop_calls += 1
+            if self.stop_calls == 1:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    await release.wait()
+
+        def start(self):
+            return None
+
+        async def wait_ready(self):
+            return None
+
+    tracker = Tracker()
+    connector = types.SimpleNamespace(order_book_tracker=tracker)
+    service.get_best_connector_for_market = lambda name, account=None: connector
+    service._wait_for_websocket_ready = lambda *args, **kwargs: asyncio.sleep(
+        0, result=True
+    )
+
+    first = await service.restart_order_book_tracker("generic", "master")
+    CHECK.assertEqual("tracker_cleanup_pending", first["error"])
+    release.set()
+    await asyncio.sleep(0)
+    second = await service.restart_order_book_tracker("generic", "master")
+
+    CHECK.assertIs(True, second["success"])
+    CHECK.assertEqual(1, tracker.stop_calls)
+
+
+@pytest.mark.asyncio
+async def test_final_adjacent_b2_cancelled_restart_retains_exact_stop_task():
+    module, registry_type = _load_unified_service_module()
+    service = _adjacent_unified_service(module, registry_type)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    stop_tasks = []
+
+    class Tracker:
+        _trading_pairs = ["BTC-USD"]
+        _tracking_tasks = {}
+        order_books = {}
+
+        def __init__(self):
+            self.stop_calls = 0
+
+        async def stop(self):
+            self.stop_calls += 1
+            stop_tasks.append(asyncio.current_task())
+            entered.set()
+            await release.wait()
+
+        def start(self):
+            return None
+
+        async def wait_ready(self):
+            return None
+
+    tracker = Tracker()
+    connector = types.SimpleNamespace(order_book_tracker=tracker)
+    service.get_best_connector_for_market = lambda name, account=None: connector
+    owner_key = ("master", "generic", "restart")
+    caller = asyncio.create_task(
+        service.restart_order_book_tracker("generic", "master")
+    )
+    await entered.wait()
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+
+    retained_exact_task = stop_tasks[0] in service._connector_residual_tasks.get(
+        owner_key, set()
+    )
+    retry = await service.restart_order_book_tracker("generic", "master")
+    calls_before_release = tracker.stop_calls
+    release.set()
+    await asyncio.gather(*stop_tasks, return_exceptions=True)
+
+    CHECK.assertEqual("tracker_cleanup_pending", retry["error"])
+    CHECK.assertTrue(retained_exact_task)
+    CHECK.assertEqual(1, calls_before_release)
+
+
+@pytest.mark.asyncio
+async def test_final_adjacent_b2_restart_requires_remote_readiness():
+    module, registry_type = _load_unified_service_module()
+    service = _adjacent_unified_service(module, registry_type)
+
+    class Tracker:
+        _trading_pairs = ["BTC-USD"]
+        _tracking_tasks = {}
+        order_books = {}
+
+        def stop(self):
+            return None
+
+        def start(self):
+            return None
+
+        async def wait_ready(self):
+            return None
+
+    tracker = Tracker()
+    connector = types.SimpleNamespace(order_book_tracker=tracker)
+    service.get_best_connector_for_market = lambda name, account=None: connector
+    service._wait_for_websocket_ready = lambda *args, **kwargs: asyncio.sleep(
+        0, result=False
+    )
+    owner_key = ("master", "generic", "restart")
+
+    result = await service.restart_order_book_tracker("generic", "master")
+
+    CHECK.assertIs(False, result["success"])
+    CHECK.assertEqual("tracker_websocket_not_ready", result["error"])
+    CHECK.assertIn(owner_key, service._connector_cleanup_owners)
+
+
+@pytest.mark.asyncio
+async def test_final_adjacent_b2_stop_all_cleans_private_restart_owner():
+    module, registry_type = _load_unified_service_module()
+    service = _adjacent_unified_service(module, registry_type)
+
+    class Tracker:
+        _tracking_tasks = {}
+        order_books = {}
+
+        def __init__(self):
+            self.stop_calls = 0
+
+        def stop(self):
+            self.stop_calls += 1
+            return None
+
+    tracker = Tracker()
+    owner_key = ("master", "generic", "restart")
+    service._connector_cleanup_owners[owner_key] = tracker
+
+    await service.stop_all()
+
+    CHECK.assertEqual(1, tracker.stop_calls)
+    CHECK.assertNotIn(owner_key, service._connector_cleanup_owners)
+
+
+@pytest.mark.asyncio
+async def test_final_adjacent_b6_false_websocket_validation_preserves_old_subscription():
+    from services.connector_capabilities import ConnectorCapabilityRegistry
+
+    module = _load_websocket_manager_module()
+
+    class Task:
+        cancelled = False
+
+        def done(self):
+            return False
+
+        def cancel(self):
+            self.cancelled = True
+
+    old_task = Task()
+    sub_id = "order_book_generic_BTC-USD"
+    old = module.Subscription(
+        subscription_id=sub_id,
+        sub_type="order_book",
+        connector="generic",
+        trading_pair="BTC-USD",
+        update_interval=1.0,
+        task=old_task,
+    )
+
+    class MarketData:
+        registry = ConnectorCapabilityRegistry()
+
+        def require_capability(self, connector, feature, trading_pair=None):
+            self.registry.require(connector, feature, trading_pair)
+
+        async def initialize_order_book(self, connector, trading_pair):
+            return False
+
+    class WebSocket:
+        def __init__(self):
+            self.payloads = []
+
+        async def send_json(self, payload):
+            self.payloads.append(payload)
+
+    websocket = WebSocket()
+    manager = module.WebSocketManager(MarketData())
+    manager._connections = {"connection": {sub_id: old}}
+    await manager.handle_subscribe(
+        "connection",
+        websocket,
+        {
+            "type": "order_book",
+            "connector": "generic",
+            "trading_pair": "BTC-USD",
+        },
+    )
+
+    CHECK.assertIs(old, manager._connections["connection"][sub_id])
+    CHECK.assertFalse(old_task.cancelled)
+    CHECK.assertEqual("feed_validation_failed", websocket.payloads[-1]["message"])
+    manager.shutdown()
+
+
+def test_final_adjacent_b8_diagnostics_task_errors_are_sanitized():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from routers import market_data as market_data_router
+    from services.market_data_service import MarketDataService
+
+    module, registry_type = _load_unified_service_module()
+    service = _adjacent_unified_service(module, registry_type)
+    marker = "api_key=INDEPENDENT-REVIEW-CREDENTIAL"
+
+    class FailedTask:
+        def done(self):
+            return True
+
+        def cancelled(self):
+            return False
+
+        def exception(self):
+            return RuntimeError(marker)
+
+    tracker = types.SimpleNamespace(
+        ready=False,
+        _trading_pairs=["BTC-USD"],
+        order_books={},
+        _order_book_stream_listener_task=FailedTask(),
+    )
+    connector = types.SimpleNamespace(order_book_tracker=tracker)
+    service.get_best_connector_for_market = lambda name, account=None: connector
+    market_data = MarketDataService(service)
+    app = FastAPI()
+    app.include_router(market_data_router.router)
+    app.dependency_overrides[market_data_router.get_market_data_service] = (
+        lambda: market_data
+    )
+
+    response = TestClient(app).get(
+        "/market-data/order-book/diagnostics/generic"
+    )
+    body = response.json()
+    serialized = json.dumps(body)
+
+    CHECK.assertEqual(200, response.status_code, response.text)
+    CHECK.assertNotIn(marker, serialized)
+    CHECK.assertEqual(
+        "task_failed",
+        body["tasks"]["_order_book_stream_listener_task"]["error"]["code"],
+    )
+
+
+def test_final_adjacent_b8_trading_rules_failures_are_typed_and_declared():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from routers import connectors as connectors_router
+
+    marker = "api_key=INDEPENDENT-REVIEW-CREDENTIAL"
+
+    class Service:
+        def __init__(self):
+            self.raise_failure = False
+
+        async def get_trading_rules(self, connector_name, trading_pairs):
+            if self.raise_failure:
+                raise RuntimeError(marker)
+            return {
+                "error": {
+                    "code": "trading_rules_fetch_failed",
+                    "message": marker,
+                }
+            }
+
+    service = Service()
+    app = FastAPI()
+    app.include_router(connectors_router.router)
+    app.state.market_data_service = service
+    client = TestClient(app)
+    returned_failure = client.get("/connectors/generic/trading-rules")
+    service.raise_failure = True
+    raised_failure = client.get("/connectors/generic/trading-rules")
+    responses = app.openapi()["paths"][
+        "/connectors/{connector_name}/trading-rules"
+    ]["get"]["responses"]
+
+    for response in (returned_failure, raised_failure):
+        CHECK.assertEqual(500, response.status_code, response.text)
+        CHECK.assertEqual("trading_rules_fetch_failed", response.json()["detail"]["code"])
+        CHECK.assertNotIn(marker, response.text)
+    CHECK.assertEqual(
+        "#/components/schemas/PublicErrorResponse",
+        responses["500"]["content"]["application/json"]["schema"]["$ref"],
+    )
+
+
+def test_final_adjacent_b8_order_book_missing_paths_are_typed_and_declared():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from routers import market_data as market_data_router
+    from services.market_data_service import MarketDataService
+
+    class ConnectorService:
+        def require_capability(self, *args, **kwargs):
+            return None
+
+        def get_best_connector_for_market(self, connector, account=None):
+            return None
+
+    market_data = MarketDataService(ConnectorService())
+    app = FastAPI()
+    app.include_router(market_data_router.router)
+    app.dependency_overrides[market_data_router.get_market_data_service] = (
+        lambda: market_data
+    )
+    client = TestClient(app)
+    base = {
+        "connector_name": "generic",
+        "trading_pair": "BTC-USD",
+        "is_buy": True,
+    }
+    requests = (
+        ("/market-data/order-book", {"connector_name": "generic", "trading_pair": "BTC-USD"}),
+        ("/market-data/order-book/price-for-volume", {**base, "volume": 1}),
+        ("/market-data/order-book/volume-for-price", {**base, "price": 1}),
+        ("/market-data/order-book/price-for-quote-volume", {**base, "quote_volume": 1}),
+        ("/market-data/order-book/quote-volume-for-price", {**base, "price": 1}),
+        ("/market-data/order-book/vwap-for-volume", {**base, "volume": 1}),
+    )
+    responses = [client.post(path, json=body) for path, body in requests]
+
+    for response in responses:
+        CHECK.assertEqual(500, response.status_code, response.text)
+        CHECK.assertEqual("connector_not_found", response.json()["detail"]["code"])
+
+    paths = app.openapi()["paths"]
+    for path, _ in requests:
+        CHECK.assertEqual(
+            "#/components/schemas/PublicErrorResponse",
+            paths[path]["post"]["responses"]["500"]["content"]["application/json"]["schema"]["$ref"],
+        )
+
+    connector = types.SimpleNamespace(
+        order_book_tracker=types.SimpleNamespace(order_books={}),
+        _orderbook_ds=None,
+    )
+    market_data._connector_service.get_best_connector_for_market = (
+        lambda name, account=None: connector
+    )
+    missing_book = asyncio.run(
+        market_data.get_order_book_query_result(
+            "generic", "BTC-USD", True, volume=1
+        )
+    )
+    CHECK.assertEqual("order_book_not_found", missing_book["error"]["code"])
+
+
+def test_final_adjacent_b8_active_feed_failures_are_non_2xx_typed_and_declared():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from routers import market_data as market_data_router
+
+    marker = "api_key=INDEPENDENT-REVIEW-CREDENTIAL"
+
+    class Service:
+        def get_active_feeds_info(self):
+            raise RuntimeError(marker)
+
+    app = FastAPI()
+    app.include_router(market_data_router.router)
+    app.state.market_data_service = Service()
+    response = TestClient(app).get("/market-data/active-feeds")
+    responses = app.openapi()["paths"]["/market-data/active-feeds"]["get"][
+        "responses"
+    ]
+
+    CHECK.assertEqual(500, response.status_code, response.text)
+    CHECK.assertEqual("active_feeds_unavailable", response.json()["detail"]["code"])
+    CHECK.assertNotIn(marker, response.text)
+    CHECK.assertEqual(
+        "#/components/schemas/PublicErrorResponse",
+        responses["500"]["content"]["application/json"]["schema"]["$ref"],
+    )

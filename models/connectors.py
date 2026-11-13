@@ -76,6 +76,19 @@ class CapabilityErrorResponse(BaseModel):
     detail: CapabilityErrorDetail
 
 
+class PublicErrorDetail(BaseModel):
+    """Stable sanitized detail for non-capability public failures."""
+
+    code: str
+    message: str
+
+
+class PublicErrorResponse(BaseModel):
+    """FastAPI envelope for stable sanitized public failures."""
+
+    detail: PublicErrorDetail
+
+
 class TradingRuleError(BaseModel):
     """One requested pair whose rule was unavailable."""
 

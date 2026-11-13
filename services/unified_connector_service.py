@@ -95,6 +95,9 @@ class UnifiedConnectorService:
         self._connector_residual_tasks: Dict[
             Tuple[str, str, str], Set[asyncio.Task]
         ] = {}
+        self._connector_cleanup_phases: Dict[
+            Tuple[str, str, str], Dict[str, Dict[str, Any]]
+        ] = {}
 
         # Connector settings cache
         self._conn_settings = AllConnectorSettings.get_connector_settings()
@@ -202,6 +205,7 @@ class UnifiedConnectorService:
             ("_connector_cleanup_owners", {}),
             ("_connector_cleanup_indices", {}),
             ("_connector_residual_tasks", {}),
+            ("_connector_cleanup_phases", {}),
         )
         for name, value in defaults:
             if not hasattr(self, name):
@@ -959,6 +963,108 @@ class UnifiedConnectorService:
                     pass
         return True
 
+    async def _run_owner_operation(
+        self,
+        owner_key: Tuple[str, str, str],
+        phase_name: str,
+        operation,
+        *,
+        timeout: float = _CONNECTOR_CLEANUP_TIMEOUT,
+    ):
+        """Run one non-repeatable cleanup phase and retain its exact task/result."""
+        self._ensure_connector_cleanup_state()
+        owner_phases = self._connector_cleanup_phases.setdefault(owner_key, {})
+        phase = owner_phases.setdefault(
+            phase_name,
+            {
+                "task": None,
+                "complete": False,
+                "result": None,
+                "error_code": None,
+                "cancel_requested": False,
+            },
+        )
+        if phase["complete"]:
+            if phase["error_code"] is not None:
+                raise RuntimeError(phase["error_code"])
+            return phase["result"]
+
+        task = phase["task"]
+        if task is None:
+            try:
+                result = operation()
+            except BaseException as exc:
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                phase["complete"] = True
+                phase["error_code"] = f"{phase_name}_raised"
+                logger.error(
+                    "Cleanup phase %s failed for %s/%s (%s)",
+                    phase_name,
+                    owner_key[0],
+                    owner_key[1],
+                    type(exc).__name__,
+                )
+                raise RuntimeError(phase["error_code"]) from None
+            if not inspect.isawaitable(result):
+                phase["complete"] = True
+                phase["result"] = result
+                if result is False:
+                    phase["error_code"] = f"{phase_name}_returned_false"
+                    raise RuntimeError(phase["error_code"])
+                return result
+            task = asyncio.ensure_future(result)
+            phase["task"] = task
+            self._connector_residual_tasks.setdefault(owner_key, set()).add(task)
+
+        if not task.done():
+            try:
+                _, pending = await asyncio.wait({task}, timeout=timeout)
+            except asyncio.CancelledError:
+                self._connector_residual_tasks.setdefault(owner_key, set()).add(task)
+                raise
+            if pending:
+                if not phase["cancel_requested"] and task.cancelling() == 0:
+                    task.cancel()
+                    phase["cancel_requested"] = True
+                self._connector_residual_tasks.setdefault(owner_key, set()).add(task)
+                raise RuntimeError(f"{phase_name}_pending")
+
+        retained = self._connector_residual_tasks.get(owner_key)
+        if retained is not None:
+            retained.discard(task)
+            if not retained:
+                self._connector_residual_tasks.pop(owner_key, None)
+        try:
+            result = task.result()
+        except asyncio.CancelledError:
+            phase["complete"] = True
+            phase["error_code"] = f"{phase_name}_cancelled"
+            raise RuntimeError(phase["error_code"]) from None
+        except Exception as exc:
+            phase["complete"] = True
+            phase["error_code"] = f"{phase_name}_raised"
+            logger.error(
+                "Cleanup phase %s failed for %s/%s (%s)",
+                phase_name,
+                owner_key[0],
+                owner_key[1],
+                type(exc).__name__,
+            )
+            raise RuntimeError(phase["error_code"]) from None
+        phase["complete"] = True
+        phase["result"] = result
+        if result is False:
+            phase["error_code"] = f"{phase_name}_returned_false"
+            raise RuntimeError(phase["error_code"])
+        return result
+
+    def _finish_owner_cleanup(self, owner_key: Tuple[str, str, str]) -> None:
+        """Discard phase truth only after the complete owner transaction succeeds."""
+        self._connector_cleanup_phases.pop(owner_key, None)
+        self._connector_residual_tasks.pop(owner_key, None)
+        self._connector_cleanup_owners.pop(owner_key, None)
+
     async def _stop_owned_index(
         self,
         account_name: str,
@@ -973,26 +1079,12 @@ class UnifiedConnectorService:
             raise RuntimeError("index_cleanup_pending")
         stop = getattr(value, "stop", None)
         if stop is None:
-            self._connector_cleanup_owners.pop(owner_key, None)
+            self._finish_owner_cleanup(owner_key)
             return
-        result = stop()
-        if inspect.isawaitable(result):
-            stop_task = asyncio.ensure_future(result)
-            done, pending = await asyncio.wait(
-                {stop_task}, timeout=_CONNECTOR_CLEANUP_TIMEOUT
-            )
-            if pending:
-                stop_task.cancel()
-                self._connector_residual_tasks.setdefault(owner_key, set()).add(
-                    stop_task
-                )
-                raise RuntimeError("index_cleanup_pending")
-            result = stop_task.result()
-        if result is False:
-            raise RuntimeError("index_cleanup_returned_false")
+        await self._run_owner_operation(owner_key, "index_stop", stop)
         if not await self._drain_owner_tasks(owner_key):
             raise RuntimeError("index_cleanup_pending")
-        self._connector_cleanup_owners.pop(owner_key, None)
+        self._finish_owner_cleanup(owner_key)
 
     async def _finalize_failed_connector_creation(
         self,
@@ -1381,42 +1473,48 @@ class UnifiedConnectorService:
         # Stop the order book tracker (if connector has one - AMM/Gateway connectors don't)
         if hasattr(connector, 'order_book_tracker') and connector.order_book_tracker:
             try:
-                result = connector.order_book_tracker.stop()
-                if inspect.isawaitable(result):
-                    stop_task = asyncio.ensure_future(result)
-                    done, pending = await asyncio.wait(
-                        {stop_task}, timeout=_CONNECTOR_CLEANUP_TIMEOUT
-                    )
-                    if pending:
-                        tasks.add(stop_task)
-                        result = None
-                        cleanup_codes.append("tracker_stop_pending")
-                    else:
-                        result = stop_task.result()
-                if result is False:
-                    cleanup_codes.append("tracker_stop_returned_false")
-            except BaseException:
-                cleanup_codes.append("tracker_stop_raised")
+                await self._run_owner_operation(
+                    owner_key,
+                    "tracker_stop",
+                    connector.order_book_tracker.stop,
+                )
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:
+                code = exc.args[0] if isinstance(exc, RuntimeError) and exc.args else None
+                cleanup_codes.append(
+                    code
+                    if code in {
+                        "tracker_stop_pending",
+                        "tracker_stop_cancelled",
+                        "tracker_stop_raised",
+                        "tracker_stop_returned_false",
+                    }
+                    else "tracker_stop_failed"
+                )
 
         # For gateway connectors, call stop_network()
         if hasattr(connector, 'stop_network'):
             try:
-                result = connector.stop_network()
-                if inspect.isawaitable(result):
-                    stop_task = asyncio.ensure_future(result)
-                    done, pending = await asyncio.wait(
-                        {stop_task}, timeout=_CONNECTOR_CLEANUP_TIMEOUT
-                    )
-                    if pending:
-                        tasks.add(stop_task)
-                        result = None
-                        cleanup_codes.append("connector_stop_pending")
-                    else:
-                        result = stop_task.result()
-                if result is False:
-                    cleanup_codes.append("connector_stop_returned_false")
-            except BaseException:
-                cleanup_codes.append("connector_stop_raised")
+                await self._run_owner_operation(
+                    owner_key,
+                    "connector_stop",
+                    connector.stop_network,
+                )
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:
+                code = exc.args[0] if isinstance(exc, RuntimeError) and exc.args else None
+                cleanup_codes.append(
+                    code
+                    if code in {
+                        "connector_stop_pending",
+                        "connector_stop_cancelled",
+                        "connector_stop_raised",
+                        "connector_stop_returned_false",
+                    }
+                    else "connector_stop_failed"
+                )
 
         tasks.update(self._collect_connector_tasks(connector))
         if not await self._drain_owner_tasks(owner_key, tasks):
@@ -1445,7 +1543,7 @@ class UnifiedConnectorService:
             raise RuntimeError(cleanup_codes[0])
         if not await self._drain_owner_tasks(owner_key):
             raise RuntimeError("task_cleanup_pending")
-        self._connector_cleanup_owners.pop(owner_key, None)
+        self._finish_owner_cleanup(owner_key)
 
     async def refresh_connector_state(
         self,
@@ -1488,6 +1586,42 @@ class UnifiedConnectorService:
 
         except Exception as e:
             logger.error(f"Error updating connector state: {e}")
+
+    async def _cleanup_restart_owner(
+        self, owner_key: Tuple[str, str, str]
+    ) -> bool:
+        """Consume or execute the private tracker cleanup owned by a restart."""
+        self._ensure_connector_cleanup_state()
+        owner = self._connector_cleanup_owners.get(owner_key)
+        if owner is None:
+            self._finish_owner_cleanup(owner_key)
+            return True
+        tracker = owner.get("tracker") if isinstance(owner, dict) else owner
+        if tracker is None:
+            return False
+        if not await self._drain_owner_tasks(owner_key):
+            return False
+
+        phases = self._connector_cleanup_phases.get(owner_key, {})
+        if isinstance(owner, dict) and owner.get("tracker_started", False):
+            phase_name = "restart_cleanup_stop"
+        elif "restart_stop" in phases:
+            phase_name = "restart_stop"
+        else:
+            phase_name = "restart_cleanup_stop"
+
+        tracker_tasks = self._collect_tracker_tasks(tracker)
+        try:
+            await self._run_owner_operation(owner_key, phase_name, tracker.stop)
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            return False
+        tracker_tasks.update(self._collect_tracker_tasks(tracker))
+        if not await self._drain_owner_tasks(owner_key, tracker_tasks):
+            return False
+        self._finish_owner_cleanup(owner_key)
+        return True
 
     async def update_all_trading_connector_states(self):
         """Update state for all trading connectors in parallel."""
@@ -2143,18 +2277,26 @@ class UnifiedConnectorService:
             market_owners.pop(market_key, None)
             market_residuals.pop(market_key, None)
 
-        # Restart and future owner kinds retain task handles under the same
-        # account/connector identity. Explicit stop consumes every such handle.
+        # A restart owner can be the only reference to an unpublished tracker.
+        # Actively execute or consume its authoritative cleanup phase.
+        for owner_key in list(self._connector_cleanup_owners):
+            if owner_key[:2] != connector_key or owner_key[2] != "restart":
+                continue
+            if not await self._cleanup_restart_owner(owner_key):
+                cleanup_codes.append("restart_cleanup_incomplete")
+
+        # Future owner kinds retain task handles under the same identity.
         for owner_key in list(self._connector_residual_tasks):
             if owner_key[:2] != connector_key:
+                continue
+            if owner_key[2] == "restart":
+                if not await self._cleanup_restart_owner(owner_key):
+                    cleanup_codes.append("restart_cleanup_incomplete")
                 continue
             if not await self._drain_owner_tasks(owner_key):
                 cleanup_codes.append(f"{owner_key[2]}_cleanup_incomplete")
             elif owner_key[2] not in {"orders", "funding", "metrics", "network"}:
-                self._connector_cleanup_owners.pop(owner_key, None)
-        for owner_key in list(self._connector_cleanup_owners):
-            if owner_key[:2] == connector_key and owner_key[2] == "restart":
-                self._connector_cleanup_owners.pop(owner_key, None)
+                self._finish_owner_cleanup(owner_key)
 
         market_tasks = getattr(self, "_market_residual_tasks", {})
         for owner_key in list(market_tasks):
@@ -2182,6 +2324,7 @@ class UnifiedConnectorService:
             for registry in (
                 self._connector_cleanup_owners,
                 self._connector_residual_tasks,
+                self._connector_cleanup_phases,
                 market_owners,
                 market_tasks,
             )
@@ -2232,6 +2375,7 @@ class UnifiedConnectorService:
             self._connector_cleanup_owners,
             self._connector_cleanup_indices,
             self._connector_residual_tasks,
+            self._connector_cleanup_phases,
             getattr(self, "_market_cleanup_residuals", {}),
             getattr(self, "_market_cleanup_owners", {}),
             getattr(self, "_market_pair_owners", {}),
@@ -2302,7 +2446,12 @@ class UnifiedConnectorService:
         connector = self.get_best_connector_for_market(connector_name, account_name)
 
         if not connector:
-            return {"error": f"No connector found for {connector_name}"}
+            return {
+                "error": {
+                    "code": "connector_not_found",
+                    "message": "The requested connector is not available",
+                }
+            }
 
         diagnostics = {
             "connector_type": type(connector).__name__,
@@ -2342,12 +2491,28 @@ class UnifiedConnectorService:
         for task_name in task_names:
             task = getattr(tracker, task_name, None)
             if task is not None:
-                diagnostics["tasks"][task_name] = {
+                task_status = {
                     "exists": True,
                     "done": task.done(),
                     "cancelled": task.cancelled(),
-                    "exception": str(task.exception()) if task.done() and not task.cancelled() and task.exception() else None,
                 }
+                if task.done() and not task.cancelled():
+                    try:
+                        task_error = task.exception()
+                    except (asyncio.CancelledError, Exception) as exc:
+                        task_error = exc
+                    if task_error is not None:
+                        logger.error(
+                            "Order book tracker task %s failed for %s (%s)",
+                            task_name,
+                            connector_name,
+                            type(task_error).__name__,
+                        )
+                        task_status["error"] = {
+                            "code": "task_failed",
+                            "message": "Order book tracker task failed",
+                        }
+                diagnostics["tasks"][task_name] = task_status
             else:
                 diagnostics["tasks"][task_name] = {"exists": False}
 
@@ -2412,103 +2577,163 @@ class UnifiedConnectorService:
         connector_name: str,
         account_name: Optional[str] = None
     ) -> Dict:
-        """Restart the order book tracker for a connector.
-
-        This method:
-        1. Stops the existing order book tracker
-        2. Restarts it with the same trading pairs
-
-        Args:
-            connector_name: The connector to restart
-            account_name: Optional account for trading connector
-
-        Returns:
-            Dictionary with restart status
-        """
+        """Restart one tracker as a durable owner-scoped transaction."""
         self.require_capability(connector_name, ConnectorFeature.LIVE_ORDER_BOOK)
-        connector = self.get_best_connector_for_market(connector_name, account_name)
         owner_account = account_name if account_name is not None else "__data__"
         owner_key = self._owner_key(owner_account, connector_name, "restart")
         self._ensure_connector_cleanup_state()
+        async with self._connector_creation_lock((owner_account, connector_name)):
+            return await self._restart_order_book_tracker_locked(
+                connector_name, account_name, owner_key
+            )
+
+    async def _restart_order_book_tracker_locked(
+        self,
+        connector_name: str,
+        account_name: Optional[str],
+        owner_key: Tuple[str, str, str],
+    ) -> Dict:
+        owner = self._connector_cleanup_owners.get(owner_key)
+        connector = self.get_best_connector_for_market(connector_name, account_name)
+        if isinstance(owner, dict):
+            connector = owner.get("connector") or connector
+            tracker = owner.get("tracker")
+        elif owner is not None:
+            tracker = owner
+            owner = {
+                "account_name": owner_key[0],
+                "connector_name": connector_name,
+                "connector": connector,
+                "tracker": tracker,
+                "trading_pairs": list(getattr(tracker, "_trading_pairs", ())),
+                "tracker_started": False,
+            }
+            self._connector_cleanup_owners[owner_key] = owner
+        else:
+            tracker = getattr(connector, "order_book_tracker", None)
+
         if not await self._drain_owner_tasks(owner_key):
             return {"success": False, "error": "tracker_cleanup_pending"}
 
         if not connector:
-            self._connector_cleanup_owners.pop(owner_key, None)
+            if owner is None:
+                self._finish_owner_cleanup(owner_key)
             return {"success": False, "error": "connector_not_found"}
 
-        # Gateway/AMM connectors don't have order book trackers
-        if not hasattr(connector, 'order_book_tracker') or connector.order_book_tracker is None:
-            self._connector_cleanup_owners.pop(owner_key, None)
+        if tracker is None:
+            if owner is None:
+                self._finish_owner_cleanup(owner_key)
             return {"success": False, "error": "order_book_tracker_unavailable"}
 
-        tracker = connector.order_book_tracker
-        trading_pairs = list(getattr(tracker, "_trading_pairs", ()))
+        trading_pairs = (
+            list(owner.get("trading_pairs", ()))
+            if isinstance(owner, dict)
+            else list(getattr(tracker, "_trading_pairs", ()))
+        )
 
         if not trading_pairs:
-            self._connector_cleanup_owners.pop(owner_key, None)
+            if owner is None:
+                self._finish_owner_cleanup(owner_key)
             return {"success": False, "error": "no_trading_pairs_to_restart"}
 
-        self._connector_cleanup_owners[owner_key] = tracker
+        if owner is None:
+            owner = {
+                "account_name": owner_key[0],
+                "connector_name": connector_name,
+                "connector": connector,
+                "tracker": tracker,
+                "trading_pairs": trading_pairs,
+                "tracker_started": False,
+                "old_tasks": self._collect_tracker_tasks(tracker),
+            }
+            self._connector_cleanup_owners[owner_key] = owner
+        else:
+            owner.setdefault("connector", connector)
+            owner.setdefault("tracker", tracker)
+            owner.setdefault("trading_pairs", trading_pairs)
+            owner.setdefault("tracker_started", False)
+            owner.setdefault("old_tasks", self._collect_tracker_tasks(tracker))
 
         try:
-            # Stop the tracker
-            logger.info(f"Stopping order book tracker for {connector_name}...")
-            tracker_tasks = self._collect_tracker_tasks(tracker)
-            tracker_stop_timed_out = False
-            result = tracker.stop()
-            if inspect.isawaitable(result):
-                stop_task = asyncio.ensure_future(result)
-                done, pending = await asyncio.wait(
-                    {stop_task}, timeout=_CONNECTOR_CLEANUP_TIMEOUT
+            if not owner.get("old_tasks_drained", False):
+                logger.info("Stopping order book tracker for %s", connector_name)
+                await self._run_owner_operation(
+                    owner_key, "restart_stop", tracker.stop
                 )
-                if pending:
-                    tracker_tasks.add(stop_task)
-                    tracker_stop_timed_out = True
-                else:
-                    stop_task.result()
-            tracker_tasks.update(self._collect_tracker_tasks(tracker))
-            if (
-                not await self._drain_owner_tasks(owner_key, tracker_tasks)
-                or tracker_stop_timed_out
-            ):
-                return {
-                    "success": False,
-                    "error": "tracker_cleanup_pending",
-                }
+                owner["old_tasks"].update(self._collect_tracker_tasks(tracker))
+                if not await self._drain_owner_tasks(
+                    owner_key, set(owner["old_tasks"])
+                ):
+                    return {"success": False, "error": "tracker_cleanup_pending"}
+                owner["old_tasks_drained"] = True
+        except asyncio.CancelledError:
+            raise
+        except RuntimeError as exc:
+            code = exc.args[0] if exc.args else None
+            if code is not None and code.endswith("_pending"):
+                return {"success": False, "error": "tracker_cleanup_pending"}
+            logger.error(
+                "Order book tracker stop failed for %s (%s)",
+                connector_name,
+                type(exc).__name__,
+            )
+            return {"success": False, "error": "tracker_stop_failed"}
 
-            # Re-add trading pairs to tracker before restarting
-            tracker._trading_pairs.clear()
-            for tp in trading_pairs:
-                tracker._trading_pairs.append(tp)
-
-            # Restart the tracker
-            logger.info(f"Restarting order book tracker for {connector_name} with pairs: {trading_pairs}")
-            tracker.start()
-
-            # Wait for initialization
+        if not owner.get("tracker_started", False):
             try:
-                await asyncio.wait_for(tracker.wait_ready(), timeout=30.0)
-            except asyncio.TimeoutError:
-                logger.warning("Timeout waiting for tracker to be ready, continuing anyway...")
+                tracker._trading_pairs.clear()
+                for trading_pair in trading_pairs:
+                    tracker._trading_pairs.append(trading_pair)
+                await self._run_owner_operation(
+                    owner_key, "restart_start", tracker.start
+                )
+                owner["tracker_started"] = True
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "Order book tracker start failed for %s (%s)",
+                    connector_name,
+                    type(exc).__name__,
+                )
+                return {"success": False, "error": "tracker_start_failed"}
 
-            # Wait for WebSocket to be ready
-            await self._wait_for_websocket_ready(connector, timeout=10.0)
+        try:
+            local_ready = await asyncio.wait_for(tracker.wait_ready(), timeout=30.0)
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "tracker_readiness_timeout"}
+        except Exception as exc:
+            logger.error(
+                "Order book tracker readiness failed for %s (%s)",
+                connector_name,
+                type(exc).__name__,
+            )
+            return {"success": False, "error": "tracker_readiness_failed"}
+        if local_ready is False:
+            return {"success": False, "error": "tracker_not_ready"}
 
-            self._connector_cleanup_owners.pop(owner_key, None)
-
-            return {
-                "success": True,
-                "message": f"Order book tracker restarted for {connector_name}",
-                "trading_pairs": trading_pairs,
-            }
-
+        try:
+            websocket_ready = await self._wait_for_websocket_ready(
+                connector, timeout=10.0
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.error(
-                "Error restarting order book tracker for %s (%s)",
+                "Order book tracker websocket readiness failed for %s (%s)",
                 connector_name,
                 type(exc).__name__,
             )
-            return {"success": False, "error": "tracker_restart_failed"}
+            return {"success": False, "error": "tracker_websocket_failed"}
+        if websocket_ready is not True:
+            return {"success": False, "error": "tracker_websocket_not_ready"}
+
+        self._finish_owner_cleanup(owner_key)
+
+        return {
+            "success": True,
+            "message": f"Order book tracker restarted for {connector_name}",
+            "trading_pairs": trading_pairs,
+        }

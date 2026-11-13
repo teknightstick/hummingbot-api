@@ -1,3 +1,4 @@
+import logging
 from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -9,6 +10,8 @@ from models.connectors import (
     CapabilityErrorDetail,
     CapabilityErrorResponse,
     ConnectorCapabilities,
+    PublicErrorDetail,
+    PublicErrorResponse,
     TradingRuleError,
     TradingRulesNotFoundDetail,
     TradingRulesNotFoundResponse,
@@ -17,6 +20,8 @@ from models.connectors import (
 from services.accounts_service import AccountsService
 from services.connector_capabilities import ConnectorFeature
 from services.market_data_service import MarketDataService
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Connectors"], prefix="/connectors")
 
@@ -83,6 +88,7 @@ async def get_connector_capabilities(request: Request, connector_name: str):
         207: {"model": TradingRulesPartialResponse},
         400: {"model": CapabilityErrorResponse},
         404: {"model": TradingRulesNotFoundResponse},
+        500: {"model": PublicErrorResponse},
     },
 )
 async def get_trading_rules(
@@ -114,9 +120,29 @@ async def get_trading_rules(
         rules = await market_data_service.get_trading_rules(connector_name, trading_pairs)
 
         if "error" in rules:
+            service_error = rules["error"]
+            service_code = (
+                service_error.get("code")
+                if isinstance(service_error, dict)
+                else None
+            )
+            if service_code == "trading_rules_fetch_failed":
+                raise HTTPException(
+                    status_code=500,
+                    detail=PublicErrorDetail(
+                        code="trading_rules_fetch_failed",
+                        message="Trading rules could not be fetched",
+                    ).model_dump(),
+                )
+            stable_code = (
+                "connector_not_found"
+                if service_code == "connector_not_found"
+                else "trading_rules_not_found"
+            )
             raise HTTPException(
                 status_code=404,
                 detail=TradingRulesNotFoundDetail(
+                    code=stable_code,
                     message="Trading rules are not available for this connector",
                     connector=connector_name,
                     trading_pairs=trading_pairs or [],
@@ -157,8 +183,19 @@ async def get_trading_rules(
 
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error retrieving trading rules: {str(e)}")
+    except Exception as exc:
+        logger.error(
+            "Trading-rules request failed for %s (%s)",
+            connector_name,
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=PublicErrorDetail(
+                code="trading_rules_fetch_failed",
+                message="Trading rules could not be fetched",
+            ).model_dump(),
+        )
 
 
 @router.get(
