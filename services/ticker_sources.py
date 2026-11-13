@@ -415,10 +415,15 @@ async def _load_symbol_map(connector, connector_name: str) -> Dict[str, str]:
         ) from e
     except TickerFetchError:
         raise
-    except Exception as e:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Failed to load the trading pair symbol map for '%s' (%s)",
+            connector_name,
+            type(exc).__name__,
+        )
         raise TickerFetchError(
-            f"'{connector_name}': failed to load the trading pair symbol map: {e}"
-        ) from e
+            f"'{connector_name}': failed to load the trading pair symbol map"
+        ) from exc
 
     if not mapping:
         # An empty map is the only signal that the exchange-info request failed, since

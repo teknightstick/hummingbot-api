@@ -10,6 +10,7 @@ import time
 from contextlib import asynccontextmanager
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
+from weakref import WeakKeyDictionary
 
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.data_type.common import OrderType, PositionAction
@@ -29,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 _TASK_CLEANUP_TIMEOUT = 0.01
 _REMOTE_CLEANUP_TIMEOUT = 0.05
+_CONNECTOR_MARKET_PAIR_OWNERS = WeakKeyDictionary()
 
 
 class AccountTradingInterface:
@@ -150,25 +152,100 @@ class AccountTradingInterface:
         self, connector_name: str, trading_pair: str
     ) -> None:
         key = self._pair_owner_key(connector_name, trading_pair)
-        self._market_pair_owners.setdefault(key, set()).add(self._market_owner_token)
+        owners = self._market_owner_set(connector_name, trading_pair, create=True)
+        owners.add(self._market_owner_token)
+
+    def _market_owner_set(
+        self,
+        connector_name: str,
+        trading_pair: str,
+        *,
+        create: bool = False,
+    ) -> Set[object]:
+        """Resolve the token set from the shared connector, with a UCS mirror."""
+        key = self._pair_owner_key(connector_name, trading_pair)
+        connector = self.connectors.get(connector_name)
+        if connector is not None:
+            try:
+                ledger = _CONNECTOR_MARKET_PAIR_OWNERS.get(connector)
+                if ledger is None and create:
+                    ledger = {}
+                    _CONNECTOR_MARKET_PAIR_OWNERS[connector] = ledger
+            except TypeError:
+                # Some compiled connector classes are not weak-referenceable. Their
+                # interfaces still share the UCS-owned mirror used below.
+                ledger = None
+            if ledger is not None:
+                owners = ledger.get(key)
+                if owners is None and create:
+                    owners = ledger.setdefault(key, set())
+                if owners is not None:
+                    self._market_pair_owners[key] = owners
+                    return owners
+        if create:
+            return self._market_pair_owners.setdefault(key, set())
+        return self._market_pair_owners.get(key, set())
 
     def _unregister_market_owner(
         self, connector_name: str, trading_pair: str
     ) -> None:
         key = self._pair_owner_key(connector_name, trading_pair)
-        owners = self._market_pair_owners.get(key)
-        if owners is None:
+        owners = self._market_owner_set(connector_name, trading_pair)
+        if not owners:
             return
         owners.discard(self._market_owner_token)
         if not owners:
             self._market_pair_owners.pop(key, None)
+            connector = self.connectors.get(connector_name)
+            if connector is not None:
+                try:
+                    ledger = _CONNECTOR_MARKET_PAIR_OWNERS.get(connector)
+                    if ledger is not None:
+                        ledger.pop(key, None)
+                        if not ledger:
+                            _CONNECTOR_MARKET_PAIR_OWNERS.pop(connector, None)
+                except TypeError:
+                    pass
+
+    def _owns_market_pair(self, connector_name: str, trading_pair: str) -> bool:
+        """Return whether this interface owns the exact account/connector/pair token."""
+        owners = self._market_owner_set(connector_name, trading_pair)
+        return self._market_owner_token in owners
+
+    def _has_other_market_owners(
+        self, connector_name: str, trading_pair: str
+    ) -> bool:
+        owners = self._market_owner_set(connector_name, trading_pair)
+        return bool(owners - {self._market_owner_token})
+
+    def _remove_local_market_ownership(
+        self, connector_name: str, trading_pair: str
+    ) -> None:
+        pairs = self._markets.get(connector_name)
+        if pairs is not None:
+            pairs.discard(trading_pair)
+            if not pairs:
+                self._markets.pop(connector_name, None)
+        self._unregister_market_owner(connector_name, trading_pair)
 
     def _other_owned_pairs(
         self, connector_name: str, trading_pair: str
     ) -> Set[str]:
+        connector = self.connectors.get(connector_name)
+        try:
+            ledger = (
+                _CONNECTOR_MARKET_PAIR_OWNERS.get(connector)
+                if connector is not None else None
+            )
+        except TypeError:
+            ledger = None
+        owner_items = (
+            ledger.items() if isinstance(ledger, dict)
+            else self._market_pair_owners.items()
+        )
         return {
             pair
-            for (account, connector, pair), owners in self._market_pair_owners.items()
+            for (account, connector, pair), owners in owner_items
             if account == self._account_name
             and connector == connector_name
             and pair != trading_pair
@@ -420,7 +497,8 @@ class AccountTradingInterface:
         # terminal state without a second cancellation that could hide a
         # cancellation-suppressing cleanup owner.
         for task in pending_tasks & new_tasks:
-            task.cancel()
+            if task.cancelling() == 0:
+                task.cancel()
         if not pending_tasks:
             return True
         done, pending = await asyncio.wait(
@@ -442,12 +520,7 @@ class AccountTradingInterface:
         trading_pair: str,
         connector,
     ) -> bool:
-        pairs = self._markets.get(connector_name)
-        if pairs is not None:
-            pairs.discard(trading_pair)
-            if not pairs:
-                self._markets.pop(connector_name, None)
-        self._unregister_market_owner(connector_name, trading_pair)
+        self._remove_local_market_ownership(connector_name, trading_pair)
 
         task_key = (
             self._account_name,
@@ -455,6 +528,12 @@ class AccountTradingInterface:
             "pair_tasks",
             trading_pair,
         )
+
+        # Pair state belongs to every token for this exact account/connector/pair.
+        # A failed transaction or released interface may consume only its own local
+        # view while another interface still owns the shared connector/tracker book.
+        if self._market_owner_set(connector_name, trading_pair):
+            return await self._drain_tasks(task_key, set())
 
         if connector is None:
             return await self._drain_tasks(task_key, set())
@@ -581,11 +660,18 @@ class AccountTradingInterface:
             local_ok = False
 
         scope = residual.get("cleanup_scope", "pair")
+        same_pair_owned = bool(
+            self._market_owner_set(connector_name, residual_pair)
+        )
         other_pairs = self._other_owned_pairs(connector_name, residual_pair)
         if not tasks_ok:
             reason = "task_cleanup_pending"
         elif not local_ok:
             reason = "task_cleanup_pending"
+        elif same_pair_owned:
+            # Shared state now belongs to a live peer token. Consuming this
+            # transaction's residue must not unsubscribe or erase that peer.
+            reason = None
         elif scope == "connector" and other_pairs:
             # A later pair now has independent ownership. Never stop its connector
             # while retrying the earlier transaction's residue.
@@ -596,9 +682,15 @@ class AccountTradingInterface:
                 residual_pair,
                 scope == "pair",
             )
-        stale_local = self._pair_exists_in_connector_state(
-            connector, getattr(connector, "order_book_tracker", None), residual_pair
-        ) if connector is not None else False
+        stale_local = (
+            self._pair_exists_in_connector_state(
+                connector,
+                getattr(connector, "order_book_tracker", None),
+                residual_pair,
+            )
+            if connector is not None and not same_pair_owned
+            else False
+        )
         if reason is None and tasks_ok and local_ok and not stale_local:
             self._cleanup_residuals.pop(key, None)
             self._cleanup_owners.pop(key, None)
@@ -617,8 +709,15 @@ class AccountTradingInterface:
         connector_preexisting: bool,
     ) -> Optional[CapabilityErrorDetail]:
         """Run bounded public cleanup, then remove only transaction-owned pair state."""
-        reason = await self._remote_cleanup_reason(
-            connector_name, trading_pair, connector_preexisting
+        same_pair_owned = self._has_other_market_owners(
+            connector_name, trading_pair
+        )
+        reason = (
+            None
+            if same_pair_owned
+            else await self._remote_cleanup_reason(
+                connector_name, trading_pair, connector_preexisting
+            )
         )
         local_ok = False
         try:
@@ -628,9 +727,15 @@ class AccountTradingInterface:
         except BaseException:
             local_ok = False
 
-        stale_local = self._pair_exists_in_connector_state(
-            connector, getattr(connector, "order_book_tracker", None), trading_pair
-        ) if connector is not None else False
+        stale_local = (
+            self._pair_exists_in_connector_state(
+                connector,
+                getattr(connector, "order_book_tracker", None),
+                trading_pair,
+            )
+            if connector is not None and not same_pair_owned
+            else False
+        )
 
         key = self._residual_key(
             connector_name,
@@ -713,7 +818,33 @@ class AccountTradingInterface:
             # preserving membership so callers can surface it without ambiguity.
             return CapabilityErrorDetail.model_validate(exc.detail)
         async with self._market_transaction(connector_name):
-            if connector_name not in self._markets:
+            if (
+                trading_pair not in self._markets.get(connector_name, set())
+                or not self._owns_market_pair(connector_name, trading_pair)
+            ):
+                raise ConnectorCapabilityError(
+                    CapabilityErrorDetail(
+                        code="market_ownership_required",
+                        message=(
+                            f"This interface does not own "
+                            f"'{connector_name}/{trading_pair}'"
+                        ),
+                        connector=connector_name,
+                        feature=ConnectorFeature.DYNAMIC_SUBSCRIPTION.value,
+                        trading_pair=trading_pair,
+                        reason="pair ownership is scoped to the creating interface",
+                    )
+                )
+
+            # Releasing one of several reference tokens is purely local. The final
+            # token owns the remote unsubscribe and shared connector/tracker cleanup.
+            if self._has_other_market_owners(connector_name, trading_pair):
+                self._remove_local_market_ownership(connector_name, trading_pair)
+                logger.info(
+                    "Released local market ownership for %s/%s; peer ownership remains",
+                    connector_name,
+                    trading_pair,
+                )
                 return
 
             # Remote cleanup must succeed before local membership is committed.
@@ -737,10 +868,7 @@ class AccountTradingInterface:
                         )
                     )
 
-            self._markets[connector_name].discard(trading_pair)
-            self._unregister_market_owner(connector_name, trading_pair)
-            if not self._markets[connector_name]:
-                del self._markets[connector_name]
+            self._remove_local_market_ownership(connector_name, trading_pair)
 
         logger.info(f"Removed market {connector_name}/{trading_pair}")
 

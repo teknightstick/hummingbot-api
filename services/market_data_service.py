@@ -385,9 +385,22 @@ class MarketDataService:
 
             return {"error": f"Order book not available for {connector_name}/{trading_pair}"}
 
-        except Exception as e:
-            logger.error(f"Error getting order book data for {connector_name}/{trading_pair}: {e}")
-            return {"error": str(e)}
+        except Exception as exc:
+            logger.error(
+                "Error getting order book data for %s/%s (%s)",
+                connector_name,
+                trading_pair,
+                type(exc).__name__,
+            )
+            return {
+                "error": {
+                    "code": "order_book_fetch_failed",
+                    "message": (
+                        f"Order book data could not be fetched for "
+                        f"'{connector_name}/{trading_pair}'"
+                    ),
+                }
+            }
 
     async def get_order_book_query_result(
             self,
@@ -482,9 +495,22 @@ class MarketDataService:
             }
         except ConnectorCapabilityError:
             raise
-        except Exception as e:
-            logger.error(f"Error in order book query for {connector_name}/{trading_pair}: {e}")
-            return {"error": str(e)}
+        except Exception as exc:
+            logger.error(
+                "Order book query failed for %s/%s (%s)",
+                connector_name,
+                trading_pair,
+                type(exc).__name__,
+            )
+            return {
+                "error": {
+                    "code": "order_book_query_failed",
+                    "message": (
+                        f"Order book query failed for "
+                        f"'{connector_name}/{trading_pair}'"
+                    ),
+                }
+            }
 
     @staticmethod
     def _raise_order_book_query_error(
@@ -679,7 +705,11 @@ class MarketDataService:
                 self._discard_candle_feed_lock(feed_key)
                 logger.info(f"Stopped candle feed: {feed_key}")
             except Exception as exc:
-                logger.error(f"Error stopping candle feed {feed_key}: {e}")
+                logger.error(
+                    "Error stopping candle feed %s (%s)",
+                    feed_key,
+                    type(exc).__name__,
+                )
 
     # ==================== Prices ====================
 
@@ -688,7 +718,7 @@ class MarketDataService:
             connector_name: str,
             trading_pairs: List[str],
             account_name: Optional[str] = None
-    ) -> Dict[str, float]:
+    ) -> Dict[str, Any]:
         """
         Get current prices for trading pairs.
 
@@ -710,14 +740,28 @@ class MarketDataService:
             )
 
             if not connector:
-                return {"error": f"No connector available for {connector_name}"}
+                return {
+                    "error": {
+                        "code": "connector_not_available",
+                        "message": f"No connector is available for '{connector_name}'",
+                    }
+                }
 
             prices = await connector.get_last_traded_prices(trading_pairs)
             return {pair: float(price) for pair, price in prices.items()}
 
-        except Exception as e:
-            logger.error(f"Error getting prices for {connector_name}: {e}")
-            return {"error": str(e)}
+        except Exception as exc:
+            logger.error(
+                "Error getting prices for %s (%s)",
+                connector_name,
+                type(exc).__name__,
+            )
+            return {
+                "error": {
+                    "code": "price_fetch_failed",
+                    "message": f"Prices could not be fetched for '{connector_name}'",
+                }
+            }
 
     def get_rate(self, base: str, quote: Optional[str] = None) -> Optional[Decimal]:
         """
@@ -844,7 +888,7 @@ class MarketDataService:
                 connector = self._connector_service.get_best_connector_for_market(connector_name)
             except UnknownConnectorError:
                 raise
-            except Exception as e:
+            except Exception as exc:
                 # Building a keyless connector can fail before any request is made: an optional
                 # dependency is missing (dydx_v4 needs v4_proto, vertex needs eip712_structs) or
                 # the connector demands credentials in its constructor. Retrying never helps.
@@ -885,7 +929,21 @@ class MarketDataService:
             UnknownConnectorError: if any requested name is not a known connector. Unlike a
                 fetch failure this is a caller mistake, so it fails fast before any request.
         """
-        unknown = [n for n in connector_names if not self._connector_service.is_known_connector(n)]
+        errors: Dict[str, BaseException] = {}
+        eligible = []
+        for name in connector_names:
+            try:
+                self._require_capability(name, ConnectorFeature.TICKERS)
+            except ConnectorCapabilityError as exc:
+                errors[name] = exc
+            else:
+                eligible.append(name)
+
+        unknown = [
+            name
+            for name in eligible
+            if not self._connector_service.is_known_connector(name)
+        ]
         if unknown:
             raise UnknownConnectorError(f"Connectors not found: {', '.join(sorted(unknown))}")
 
@@ -893,14 +951,22 @@ class MarketDataService:
             return name, await self.fetch_connector_tickers(name, max_age=max_age, force=force)
 
         results = await asyncio.gather(
-            *[_fetch(name) for name in connector_names], return_exceptions=True
+            *[_fetch(name) for name in eligible], return_exceptions=True
         )
 
         tickers: Dict[str, Dict[str, Ticker]] = {}
-        errors: Dict[str, BaseException] = {}
-        for name, result in zip(connector_names, results):
+        for name, result in zip(eligible, results):
             if isinstance(result, BaseException):
-                errors[name] = result
+                if isinstance(result, ConnectorCapabilityError):
+                    errors[name] = result
+                elif isinstance(result, TickerUnsupportedError):
+                    errors[name] = TickerUnsupportedError(
+                        f"Public ticker data is unsupported for '{name}'"
+                    )
+                else:
+                    errors[name] = TickerFetchError(
+                        f"Ticker data could not be fetched for '{name}'"
+                    )
             else:
                 tickers[name] = result[1]
         return tickers, errors
@@ -1087,9 +1153,18 @@ class MarketDataService:
 
             return result
 
-        except Exception as e:
-            logger.error(f"Error getting trading rules for {connector_name}: {e}")
-            return {"error": str(e)}
+        except Exception as exc:
+            logger.error(
+                "Error getting trading rules for %s (%s)",
+                connector_name,
+                type(exc).__name__,
+            )
+            return {
+                "error": {
+                    "code": "trading_rules_fetch_failed",
+                    "message": f"Trading rules could not be fetched for '{connector_name}'",
+                }
+            }
 
     # ==================== Funding Info ====================
 
@@ -1137,9 +1212,22 @@ class MarketDataService:
             else:
                 return {"error": f"Funding info not supported for {connector_name}"}
 
-        except Exception as e:
-            logger.error(f"Error getting funding info for {connector_name}/{trading_pair}: {e}")
-            return {"error": str(e)}
+        except Exception as exc:
+            logger.error(
+                "Error getting funding info for %s/%s (%s)",
+                connector_name,
+                trading_pair,
+                type(exc).__name__,
+            )
+            return {
+                "error": {
+                    "code": "funding_fetch_failed",
+                    "message": (
+                        f"Funding information could not be fetched for "
+                        f"'{connector_name}/{trading_pair}'"
+                    ),
+                }
+            }
 
     # ==================== Feed Management ====================
 

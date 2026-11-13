@@ -223,6 +223,12 @@ class TickerInfo(BaseModel):
     timestamp: float = Field(description="Collection timestamp")
 
 
+class TickerErrorInfo(BaseModel):
+    """Stable public ticker failure without transport or credential text."""
+    code: str = Field(description="Stable machine-readable ticker error code")
+    message: str = Field(description="Sanitized public explanation")
+
+
 class TickersResponse(BaseModel):
     """Tickers grouped by connector."""
     tickers: Dict[str, Dict[str, TickerInfo]] = Field(
@@ -235,9 +241,9 @@ class TickersResponse(BaseModel):
         default_factory=dict,
         description="Unix timestamp of the last successful fetch, per connector"
     )
-    errors: Dict[str, str] = Field(
+    errors: Dict[str, TickerErrorInfo] = Field(
         default_factory=dict,
-        description="Connectors that could not be fetched, with the reason. Present only when "
+        description="Connectors that could not be fetched, with stable sanitized details. Present only when "
                     "some requested connectors succeeded and others failed"
     )
 

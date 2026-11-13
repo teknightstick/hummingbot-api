@@ -453,29 +453,30 @@ class UnifiedConnectorService:
         connector. It prefers trading connectors because they already have
         order_book_tracker running with WebSocket connections.
 
-        Priority:
-        1. Specific account's trading connector (if account_name provided)
-        2. Any trading connector for this connector_name
-        3. Data connector (creates new if needed)
+        Resolution:
+        1. If an account is supplied, only that account's trading connector
+        2. Otherwise, any trading connector for this connector_name
+        3. Otherwise, the shared data connector
 
         Args:
             connector_name: The connector name
-            account_name: Optional account to prefer
+            account_name: Optional strict account boundary
 
         Returns:
             Best available connector for market operations
         """
-        # 1. Try specific account's trading connector
-        if account_name:
+        # An explicit account is an authority boundary, not a preference. Falling
+        # through here can read or mutate another account's connector and tracker.
+        if account_name is not None:
             trading = self._trading_connectors.get(account_name, {}).get(connector_name)
             if trading:
                 logger.debug(
                     f"Using trading connector for {connector_name} "
                     f"(account: {account_name})"
                 )
-                return trading
+            return trading
 
-        # 2. Try ANY trading connector for this connector_name
+        # Unscoped callers may use any already-running trading connector.
         for acc_name, acc_connectors in self._trading_connectors.items():
             if connector_name in acc_connectors:
                 logger.debug(
@@ -936,7 +937,8 @@ class UnifiedConnectorService:
         # terminal state without using repeated cancellation as a false-success
         # mechanism against cancellation-suppressing cleanup code.
         for task in pending & new_tasks:
-            task.cancel()
+            if task.cancelling() == 0:
+                task.cancel()
         if pending:
             done, pending = await asyncio.wait(
                 pending, timeout=_TASK_DRAIN_TIMEOUT
@@ -1374,7 +1376,6 @@ class UnifiedConnectorService:
         for task_name in task_names:
             task = getattr(connector, task_name, None)
             if isinstance(task, asyncio.Task):
-                task.cancel()
                 setattr(connector, task_name, None)
 
         # Stop the order book tracker (if connector has one - AMM/Gateway connectors don't)
@@ -1387,7 +1388,6 @@ class UnifiedConnectorService:
                         {stop_task}, timeout=_CONNECTOR_CLEANUP_TIMEOUT
                     )
                     if pending:
-                        stop_task.cancel()
                         tasks.add(stop_task)
                         result = None
                         cleanup_codes.append("tracker_stop_pending")
@@ -1408,7 +1408,6 @@ class UnifiedConnectorService:
                         {stop_task}, timeout=_CONNECTOR_CLEANUP_TIMEOUT
                     )
                     if pending:
-                        stop_task.cancel()
                         tasks.add(stop_task)
                         result = None
                         cleanup_codes.append("connector_stop_pending")
@@ -1420,25 +1419,8 @@ class UnifiedConnectorService:
                 cleanup_codes.append("connector_stop_raised")
 
         tasks.update(self._collect_connector_tasks(connector))
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        if tasks:
-            await asyncio.sleep(0)
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            done, pending = await asyncio.wait(
-                tasks, timeout=_TASK_DRAIN_TIMEOUT
-            )
-            for task in done:
-                try:
-                    task.exception()
-                except (asyncio.CancelledError, Exception):
-                    pass
-            if pending:
-                self._connector_residual_tasks[owner_key] = set(pending)
-                cleanup_codes.append("task_cleanup_pending")
+        if not await self._drain_owner_tasks(owner_key, tasks):
+            cleanup_codes.append("task_cleanup_pending")
 
         tracker = getattr(connector, "order_book_tracker", None)
         for task_name in task_names:
@@ -2384,15 +2366,36 @@ class UnifiedConnectorService:
                         "snapshot_uid": order_book.snapshot_uid if hasattr(order_book, 'snapshot_uid') else None,
                         "last_diff_uid": order_book.last_diff_uid if hasattr(order_book, 'last_diff_uid') else None,
                     }
-                except Exception as e:
-                    diagnostics["order_books"][trading_pair] = {"error": str(e)}
+                except Exception as exc:
+                    logger.error(
+                        "Order book diagnostics failed for %s/%s (%s)",
+                        connector_name,
+                        trading_pair,
+                        type(exc).__name__,
+                    )
+                    diagnostics["order_books"][trading_pair] = {
+                        "error": {
+                            "code": "order_book_diagnostics_failed",
+                            "message": "Order book diagnostics are unavailable",
+                        }
+                    }
 
         # Get metrics if available
         if hasattr(tracker, 'metrics'):
             try:
                 diagnostics["metrics"] = tracker.metrics.to_dict()
-            except Exception as e:
-                diagnostics["metrics"] = {"error": str(e)}
+            except Exception as exc:
+                logger.error(
+                    "Order book metrics diagnostics failed for %s (%s)",
+                    connector_name,
+                    type(exc).__name__,
+                )
+                diagnostics["metrics"] = {
+                    "error": {
+                        "code": "order_book_metrics_unavailable",
+                        "message": "Order book metrics are unavailable",
+                    }
+                }
 
         # Check WebSocket status
         if hasattr(connector, '_orderbook_ds') and connector._orderbook_ds:
@@ -2424,30 +2427,35 @@ class UnifiedConnectorService:
         """
         self.require_capability(connector_name, ConnectorFeature.LIVE_ORDER_BOOK)
         connector = self.get_best_connector_for_market(connector_name, account_name)
-        owner_account = account_name or "__data__"
+        owner_account = account_name if account_name is not None else "__data__"
         owner_key = self._owner_key(owner_account, connector_name, "restart")
         self._ensure_connector_cleanup_state()
         if not await self._drain_owner_tasks(owner_key):
             return {"success": False, "error": "tracker_cleanup_pending"}
 
         if not connector:
-            return {"success": False, "error": f"No connector found for {connector_name}"}
+            self._connector_cleanup_owners.pop(owner_key, None)
+            return {"success": False, "error": "connector_not_found"}
 
         # Gateway/AMM connectors don't have order book trackers
         if not hasattr(connector, 'order_book_tracker') or connector.order_book_tracker is None:
-            return {"success": False, "error": f"Connector {connector_name} doesn't have order book tracker (AMM/Gateway)"}
+            self._connector_cleanup_owners.pop(owner_key, None)
+            return {"success": False, "error": "order_book_tracker_unavailable"}
 
         tracker = connector.order_book_tracker
-        self._connector_cleanup_owners[owner_key] = tracker
-        trading_pairs = list(tracker._trading_pairs)
+        trading_pairs = list(getattr(tracker, "_trading_pairs", ()))
 
         if not trading_pairs:
-            return {"success": False, "error": "No trading pairs to restart"}
+            self._connector_cleanup_owners.pop(owner_key, None)
+            return {"success": False, "error": "no_trading_pairs_to_restart"}
+
+        self._connector_cleanup_owners[owner_key] = tracker
 
         try:
             # Stop the tracker
             logger.info(f"Stopping order book tracker for {connector_name}...")
             tracker_tasks = self._collect_tracker_tasks(tracker)
+            tracker_stop_timed_out = False
             result = tracker.stop()
             if inspect.isawaitable(result):
                 stop_task = asyncio.ensure_future(result)
@@ -2455,30 +2463,19 @@ class UnifiedConnectorService:
                     {stop_task}, timeout=_CONNECTOR_CLEANUP_TIMEOUT
                 )
                 if pending:
-                    stop_task.cancel()
                     tracker_tasks.add(stop_task)
+                    tracker_stop_timed_out = True
                 else:
                     stop_task.result()
             tracker_tasks.update(self._collect_tracker_tasks(tracker))
-            for task in tracker_tasks:
-                if not task.done():
-                    task.cancel()
-            if tracker_tasks:
-                await asyncio.sleep(0)
-                for task in tracker_tasks:
-                    if not task.done():
-                        task.cancel()
-                _, pending = await asyncio.wait(
-                    tracker_tasks, timeout=_TASK_DRAIN_TIMEOUT
-                )
-                if pending:
-                    self._connector_residual_tasks.setdefault(
-                        owner_key, set()
-                    ).update(pending)
-                    return {
-                        "success": False,
-                        "error": "tracker_cleanup_pending",
-                    }
+            if (
+                not await self._drain_owner_tasks(owner_key, tracker_tasks)
+                or tracker_stop_timed_out
+            ):
+                return {
+                    "success": False,
+                    "error": "tracker_cleanup_pending",
+                }
 
             # Re-add trading pairs to tracker before restarting
             tracker._trading_pairs.clear()
@@ -2506,6 +2503,12 @@ class UnifiedConnectorService:
                 "trading_pairs": trading_pairs,
             }
 
-        except Exception as e:
-            logger.error(f"Error restarting order book tracker: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "Error restarting order book tracker for %s (%s)",
+                connector_name,
+                type(exc).__name__,
+            )
+            return {"success": False, "error": "tracker_restart_failed"}

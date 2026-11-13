@@ -19,6 +19,7 @@ from services.portfolio_analytics_service import PortfolioAnalyticsService
 from models.connectors import CapabilityErrorDetail
 from services.connector_capabilities import (
     ConnectorCapabilityError,
+    ConnectorCapabilityRegistry,
     ConnectorFeature,
 )
 from utils.file_system import fs_util
@@ -145,7 +146,11 @@ class AccountsService:
 
     def require_capability(self, connector_name, feature, trading_pair=None) -> None:
         """Expose the shared pre-authentication capability gate to trading routes."""
-        self._connector_service.require_capability(connector_name, feature, trading_pair)
+        require = getattr(self._connector_service, "require_capability", None)
+        if require is not None:
+            require(connector_name, feature, trading_pair)
+            return
+        ConnectorCapabilityRegistry().require(connector_name, feature, trading_pair)
 
     def _market_components(self, token: str, connector_name: str) -> tuple[str, str]:
         """Resolve the (base, quote) used to price a token on a connector.
@@ -405,12 +410,29 @@ class AccountsService:
         # Initialize missing connectors
         for connector_name in self._connector_service.list_available_credentials(account_name):
             try:
+                # Account-state refresh needs a last-trade price. Gate credential
+                # names before connector lookup can authenticate, construct, start,
+                # or publish an unsupported connector such as Manzana.
+                self.require_capability(
+                    connector_name, ConnectorFeature.LAST_TRADE
+                )
                 # Only initialize if connector doesn't exist
                 if not self._connector_service.is_trading_connector_initialized(account_name, connector_name):
                     # Get connector will now handle all initialization
                     await self._connector_service.get_trading_connector(account_name, connector_name)
-            except Exception as e:
-                logger.error(f"Error initializing connector {connector_name} for account {account_name}: {e}")
+            except ConnectorCapabilityError:
+                logger.info(
+                    "Skipping unsupported account-state connector %s for %s",
+                    connector_name,
+                    account_name,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Error initializing connector %s for account %s (%s)",
+                    connector_name,
+                    account_name,
+                    type(exc).__name__,
+                )
 
     async def update_account_state(
         self,

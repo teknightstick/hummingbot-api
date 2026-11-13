@@ -119,12 +119,6 @@ class WebSocketManager:
                 update_interval=update_interval,
             )
 
-        subs = self._connections.setdefault(conn_id, {})
-
-        # Cancel existing subscription with same id
-        if sub_id in subs:
-            self._cleanup_subscription(subs.pop(sub_id))
-
         # Start the feed / ensure it exists. For candles, creating the feed also validates
         # the trading pair on first use (cache hit afterwards); an invalid pair raises ValueError.
         try:
@@ -153,16 +147,31 @@ class WebSocketManager:
             await self._send_error(websocket, "feed_start_failed")
             return
 
-        # Spawn push loop / listener
-        if sub_type == "candles":
-            sub.task = asyncio.create_task(self._candles_push_loop(websocket, sub))
-        elif sub_type == "order_book":
-            sub.task = asyncio.create_task(self._order_book_push_loop(websocket, sub))
-        else:  # trades
-            self._attach_trade_listener(sub)
-            sub.task = asyncio.create_task(self._trades_push_loop(websocket, sub))
+        # Prepare the push loop / listener without touching the connection map.
+        try:
+            if sub_type == "candles":
+                sub.task = asyncio.create_task(self._candles_push_loop(websocket, sub))
+            elif sub_type == "order_book":
+                sub.task = asyncio.create_task(self._order_book_push_loop(websocket, sub))
+            else:  # trades
+                self._attach_trade_listener(sub)
+                sub.task = asyncio.create_task(self._trades_push_loop(websocket, sub))
+        except Exception as exc:
+            self._cleanup_subscription(sub)
+            logger.error(
+                "WebSocket subscription setup failed (%s)",
+                type(exc).__name__,
+            )
+            await self._send_error(websocket, "subscription_setup_failed")
+            return
 
+        # Commit only after the replacement feed and task are valid. Every earlier
+        # failure leaves the existing subscription and connection map untouched.
+        subs = self._connections.setdefault(conn_id, {})
+        previous = subs.get(sub_id)
         subs[sub_id] = sub
+        if previous is not None:
+            self._cleanup_subscription(previous)
 
         await self._send_json(websocket, {
             "type": "subscribed",

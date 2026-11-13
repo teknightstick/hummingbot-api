@@ -72,6 +72,21 @@ def _unsupported_detail(
     )
 
 
+def _sanitized_http_error(
+    code: str,
+    message: str,
+    exc: BaseException,
+    *,
+    status_code: int = 500,
+) -> HTTPException:
+    """Create a stable public error while logging only the exception class."""
+    logger.error("%s (%s)", code, type(exc).__name__)
+    return HTTPException(
+        status_code=status_code,
+        detail={"code": code, "message": message},
+    )
+
+
 @router.post("/candles", responses=CAPABILITY_ERROR_RESPONSES)
 async def get_candles(request: Request, candles_config: CandlesConfigRequest):
     """
@@ -396,7 +411,13 @@ async def get_prices(
         )
 
         if "error" in prices:
-            raise HTTPException(status_code=500, detail=prices["error"])
+            detail = prices["error"]
+            if not isinstance(detail, dict):
+                detail = {
+                    "code": "price_fetch_failed",
+                    "message": "Prices could not be fetched",
+                }
+            raise HTTPException(status_code=500, detail=detail)
 
         return PricesResponse(
             connector=request.connector_name,
@@ -405,8 +426,15 @@ async def get_prices(
         )
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching prices: {str(e)}")
+    except Exception as exc:
+        logger.error("Price request failed (%s)", type(exc).__name__)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "price_fetch_failed",
+                "message": "Prices could not be fetched",
+            },
+        )
 
 
 # ==================== Tickers & cross-rates ====================
@@ -424,6 +452,27 @@ def _requested_connectors(connectors: Optional[List[str]]) -> List[str]:
     return list(dict.fromkeys(n for n in names if n))  # de-duplicated, order preserved
 
 
+def _ticker_public_error(connector_name: str, exc: BaseException) -> dict:
+    """Map internal ticker failures to stable public code/message pairs."""
+    if isinstance(exc, ConnectorCapabilityError):
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        return {
+            "code": detail.get("code", "unsupported_connector_feature"),
+            "message": detail.get(
+                "message", f"Ticker data is unsupported for '{connector_name}'"
+            ),
+        }
+    if isinstance(exc, TickerUnsupportedError):
+        return {
+            "code": "ticker_unsupported",
+            "message": f"Public ticker data is unsupported for '{connector_name}'",
+        }
+    return {
+        "code": "ticker_fetch_failed",
+        "message": f"Ticker data could not be fetched for '{connector_name}'",
+    }
+
+
 def _build_tickers_response(
         tickers_by_connector: dict,
         errors: dict,
@@ -436,11 +485,18 @@ def _build_tickers_response(
         updated_at={
             name: market_data_manager.ticker_updated_at(name) for name in grouped
         },
-        errors={name: str(exc) for name, exc in errors.items()},
+        errors={
+            name: _ticker_public_error(name, exc)
+            for name, exc in sorted(errors.items())
+        },
     )
 
 
-@router.get("/tickers", response_model=TickersResponse)
+@router.get(
+    "/tickers",
+    response_model=TickersResponse,
+    responses=CAPABILITY_ERROR_RESPONSES,
+)
 async def get_tickers(
         connectors: Optional[List[str]] = Query(
             None,
@@ -479,19 +535,57 @@ async def get_tickers(
         tickers, errors = await market_data_manager.fetch_tickers_for(
             targets, max_age=max_age, force=refresh
         )
-    except UnknownConnectorError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+    except UnknownConnectorError:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "unknown_connector",
+                "message": "A requested ticker connector was not found",
+            },
+        )
 
     # Everything requested failed, so report why instead of an empty, seemingly-fine 200.
     if errors and not tickers:
-        detail = "; ".join(f"{name}: {exc}" for name, exc in sorted(errors.items()))
+        if len(errors) == 1:
+            only_error = next(iter(errors.values()))
+            if isinstance(only_error, ConnectorCapabilityError):
+                raise only_error
+        public_errors = {
+            name: _ticker_public_error(name, exc)
+            for name, exc in sorted(errors.items())
+        }
         if all(isinstance(exc, TickerUnsupportedError) for exc in errors.values()):
             # Known connectors that can never serve public tickers; retrying will not help.
-            raise HTTPException(status_code=400, detail=detail)
+            first_name = sorted(errors)[0]
+            raise ConnectorCapabilityError(
+                CapabilityErrorDetail(
+                    code="ticker_unsupported",
+                    message=public_errors[first_name]["message"],
+                    connector=first_name,
+                    feature=ConnectorFeature.TICKERS.value,
+                )
+            )
         if all(isinstance(exc, TickerFetchError) for exc in errors.values()):
-            raise HTTPException(status_code=502, detail=f"Failed to fetch tickers: {detail}")
-        logger.error(f"Unexpected error fetching tickers for {targets}: {detail}")
-        raise HTTPException(status_code=500, detail=detail)
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "ticker_fetch_failed",
+                    "message": "Ticker data could not be fetched",
+                    "errors": public_errors,
+                },
+            )
+        logger.error(
+            "Unexpected ticker errors for %s (%s)",
+            targets,
+            ",".join(sorted(type(exc).__name__ for exc in errors.values())),
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "ticker_fetch_failed",
+                "message": "Ticker data could not be fetched",
+            },
+        )
 
     return _build_tickers_response(tickers, errors, market_data_manager)
 
@@ -638,23 +732,35 @@ async def get_funding_info(
         )
 
         if "error" in funding_info:
-            if "not supported" in funding_info["error"]:
+            error = funding_info["error"]
+            if isinstance(error, str) and "not supported" in error:
                 raise ConnectorCapabilityError(
                     _unsupported_detail(
                         request.connector_name,
                         ConnectorFeature.PERPETUAL,
-                        funding_info["error"],
+                        error,
                         request.trading_pair,
                     )
                 )
             else:
-                raise HTTPException(status_code=500, detail=funding_info["error"])
+                detail = error if isinstance(error, dict) else {
+                    "code": "funding_fetch_failed",
+                    "message": "Funding information could not be fetched",
+                }
+                raise HTTPException(status_code=500, detail=detail)
 
         return FundingInfoResponse(**funding_info)
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching funding info: {str(e)}")
+    except Exception as exc:
+        logger.error("Funding request failed (%s)", type(exc).__name__)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "funding_fetch_failed",
+                "message": "Funding information could not be fetched",
+            },
+        )
 
 
 @router.post("/order-book", response_model=OrderBookResponse, responses=CAPABILITY_ERROR_RESPONSES)
@@ -697,8 +803,12 @@ async def get_order_book(
         )
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching order book: {str(e)}")
+    except Exception as exc:
+        raise _sanitized_http_error(
+            "order_book_fetch_failed",
+            "Order book data could not be fetched",
+            exc,
+        )
 
 
 # Order Book Query Endpoints
@@ -736,8 +846,10 @@ async def get_price_for_volume(
         return OrderBookQueryResult(**result)
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error in order book query: {str(e)}")
+    except Exception as exc:
+        raise _sanitized_http_error(
+            "order_book_query_failed", "Order book query failed", exc
+        )
 
 
 @router.post(
@@ -773,8 +885,10 @@ async def get_volume_for_price(
         return OrderBookQueryResult(**result)
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error in order book query: {str(e)}")
+    except Exception as exc:
+        raise _sanitized_http_error(
+            "order_book_query_failed", "Order book query failed", exc
+        )
 
 
 @router.post(
@@ -810,8 +924,10 @@ async def get_price_for_quote_volume(
         return OrderBookQueryResult(**result)
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error in order book query: {str(e)}")
+    except Exception as exc:
+        raise _sanitized_http_error(
+            "order_book_query_failed", "Order book query failed", exc
+        )
 
 
 @router.post(
@@ -847,8 +963,10 @@ async def get_quote_volume_for_price(
         return OrderBookQueryResult(**result)
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error in order book query: {str(e)}")
+    except Exception as exc:
+        raise _sanitized_http_error(
+            "order_book_query_failed", "Order book query failed", exc
+        )
 
 
 @router.post(
@@ -884,8 +1002,10 @@ async def get_vwap_for_volume(
         return OrderBookQueryResult(**result)
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error in order book query: {str(e)}")
+    except Exception as exc:
+        raise _sanitized_http_error(
+            "order_book_query_failed", "Order book query failed", exc
+        )
 
 
 # Trading Pair Management Endpoints
@@ -942,10 +1062,11 @@ async def add_trading_pair(
 
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error initializing order book: {str(e)}"
+    except Exception as exc:
+        raise _sanitized_http_error(
+            "order_book_initialization_failed",
+            "Order book initialization failed",
+            exc,
         )
 
 
@@ -1002,10 +1123,11 @@ async def remove_trading_pair(
 
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error removing trading pair: {str(e)}"
+    except Exception as exc:
+        raise _sanitized_http_error(
+            "trading_pair_removal_failed",
+            "Trading pair removal failed",
+            exc,
         )
 
 
@@ -1047,10 +1169,11 @@ async def get_order_book_diagnostics(
         return diagnostics
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error getting diagnostics: {str(e)}"
+    except Exception as exc:
+        raise _sanitized_http_error(
+            "order_book_diagnostics_failed",
+            "Order book diagnostics are unavailable",
+            exc,
         )
 
 
@@ -1090,8 +1213,9 @@ async def restart_order_book_tracker(
         return result
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error restarting order book tracker: {str(e)}"
+    except Exception as exc:
+        raise _sanitized_http_error(
+            "order_book_restart_failed",
+            "Order book tracker restart failed",
+            exc,
         )
