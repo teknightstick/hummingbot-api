@@ -31,6 +31,29 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Trading"], prefix="/trading")
 
 
+def _typed_order_validation_error(exc: HTTPException, trade_request: TradeRequest) -> None:
+    """Keep every advertised order 400 compatible with CapabilityErrorResponse."""
+    if exc.status_code != status.HTTP_400_BAD_REQUEST:
+        raise exc
+    if isinstance(exc.detail, dict):
+        try:
+            detail = CapabilityErrorDetail.model_validate(exc.detail)
+        except Exception:
+            detail = None
+        if detail is not None:
+            raise ConnectorCapabilityError(detail) from exc
+    raise ConnectorCapabilityError(
+        CapabilityErrorDetail(
+            code="invalid_order_request",
+            message="The order request failed connector validation",
+            connector=trade_request.connector_name,
+            feature=ConnectorFeature.ORDER_SUBMISSION.value,
+            trading_pair=trade_request.trading_pair,
+            reason="order_validation_failed",
+        )
+    ) from exc
+
+
 def _raise_nonperpetual_capability(connector_name: str) -> None:
     raise ConnectorCapabilityError(
         CapabilityErrorDetail(
@@ -160,8 +183,8 @@ async def place_trade(
             price=trade_request.price,
             status="submitted",
         )
-    except HTTPException:
-        raise
+    except HTTPException as exc:
+        _typed_order_validation_error(exc, trade_request)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Unexpected error placing trade: {str(e)}")
 

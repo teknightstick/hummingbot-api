@@ -4,7 +4,7 @@ Pydantic models for the connectors router.
 These models define the request/response schemas for connector-related endpoints.
 """
 
-from typing import Any, Dict, FrozenSet, List, Optional
+from typing import Any, Dict, FrozenSet, List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_serializer
 
@@ -60,6 +60,14 @@ class CapabilityErrorDetail(BaseModel):
     trading_pair: Optional[str] = None
     supported_pairs: Optional[List[str]] = None
     reason: Optional[str] = None
+    cleanup_scope: Optional[Literal["pair", "connector"]] = Field(
+        default=None,
+        description="Stable ownership scope for an incomplete cleanup",
+    )
+    cleanup_code: Optional[str] = Field(
+        default=None,
+        description="Sanitized stable cleanup outcome code",
+    )
 
 
 class CapabilityErrorResponse(BaseModel):

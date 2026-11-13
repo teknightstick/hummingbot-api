@@ -698,14 +698,26 @@ async def _generic(connector, connector_name: str, symbol_map: Mapping[str, str]
 
 async def _fetch(connector, connector_name: str) -> Dict[str, Ticker]:
     """Load the symbol map, then dispatch to the adapter, spec or generic path."""
-    symbol_map = await _load_symbol_map(connector, connector_name)
     name = _canonical(connector_name)
 
     adapter = TICKER_ADAPTERS.get(name)
+    spec = TICKER_SPECS.get(name)
+    if adapter is None and spec is None:
+        # The generic fallback may call get_last_traded_prices. Require the
+        # semantic before even loading a symbol map, which may perform I/O.
+        from services.connector_capabilities import (
+            ConnectorCapabilityRegistry,
+            ConnectorFeature,
+        )
+
+        ConnectorCapabilityRegistry().require(
+            connector_name, ConnectorFeature.LAST_TRADE, connector=connector
+        )
+
+    symbol_map = await _load_symbol_map(connector, connector_name)
     if adapter is not None:
         return await adapter(connector, symbol_map)
 
-    spec = TICKER_SPECS.get(name)
     if spec is not None:
         rows = await _request(connector, spec)
         return _normalize(symbol_map, rows, _spec_extract(spec), connector_name)

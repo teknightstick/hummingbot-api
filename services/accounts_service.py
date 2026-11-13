@@ -16,7 +16,11 @@ from services.gateway_transaction_poller import GatewayTransactionPoller
 from services.gateway_wallet_service import GatewayWalletService, balance_entry
 from services.perpetual_trading_service import PerpetualTradingService
 from services.portfolio_analytics_service import PortfolioAnalyticsService
-from services.connector_capabilities import ConnectorFeature
+from models.connectors import CapabilityErrorDetail
+from services.connector_capabilities import (
+    ConnectorCapabilityError,
+    ConnectorFeature,
+)
 from utils.file_system import fs_util
 from utils.gateway_certs import build_client_ssl_context
 
@@ -434,6 +438,10 @@ class AccountsService:
                 if connector_names and connector_name not in connector_names:
                     continue
 
+                # Valuation may fall back to actual last trades. Reject before
+                # constructing any balance-refresh or network task.
+                self.require_capability(connector_name, ConnectorFeature.LAST_TRADE)
+
                 # Gateway connectors only track the tokens of their trading pairs; the full
                 # wallet balance is fetched by _update_gateway_balances below. Running both
                 # would overwrite the complete wallet state with the narrower connector view.
@@ -497,6 +505,10 @@ class AccountsService:
             connector_name: Name of the connector
             skip_balance_refresh: If True, skip fetching fresh balances (use when caller already refreshed)
         """
+        # This path can fall back to connector last-trade endpoints. Reject a
+        # connector that does not declare that semantic before balances/network work.
+        self.require_capability(connector_name, ConnectorFeature.LAST_TRADE)
+
         # Fetch fresh balances from the exchange unless caller already did
         if not skip_balance_refresh and hasattr(connector, '_update_balances'):
             try:
@@ -540,7 +552,9 @@ class AccountsService:
 
         # Batch-fetch only the missing prices from the exchange
         if missing_pairs:
-            fallback_prices = await self._safe_get_last_traded_prices(connector, missing_pairs)
+            fallback_prices = await self._safe_get_last_traded_prices(
+                connector, connector_name, missing_pairs
+            )
             for pair_idx, info_idx in enumerate(missing_indices):
                 market = missing_pairs[pair_idx]
                 price = Decimal(str(fallback_prices.get(market, 0)))
@@ -549,9 +563,13 @@ class AccountsService:
 
         return tokens_info
     
-    async def _safe_get_last_traded_prices(self, connector, trading_pairs, timeout=10):
+    async def _safe_get_last_traded_prices(
+        self, connector, connector_name, trading_pairs, timeout=10
+    ):
         """Safely get last traded prices with timeout and error handling.
         Fetches each pair individually via gather so one bad pair doesn't kill the rest."""
+
+        self.require_capability(connector_name, ConnectorFeature.LAST_TRADE)
 
         async def _fetch_single(pair):
             return pair, await connector._get_last_traded_price(trading_pair=pair)
@@ -912,7 +930,16 @@ class AccountsService:
 
         # Validate price for limit orders
         if order_type in [OrderType.LIMIT, OrderType.LIMIT_MAKER] and price is None:
-            raise HTTPException(status_code=400, detail="Price is required for LIMIT and LIMIT_MAKER orders")
+            raise ConnectorCapabilityError(
+                CapabilityErrorDetail(
+                    code="order_price_required",
+                    message="Price is required for limit orders",
+                    connector=connector_name,
+                    feature=ConnectorFeature.ORDER_SUBMISSION.value,
+                    trading_pair=trading_pair,
+                    reason="missing_limit_price",
+                )
+            )
         
         # Check if trading rules are loaded
         if not connector.trading_rules:
@@ -923,29 +950,47 @@ class AccountsService:
         
         # Validate trading pair and get trading rule
         if trading_pair not in connector.trading_rules:
-            available_pairs = list(connector.trading_rules.keys())[:10]  # Show first 10
-            more_text = f" (and {len(connector.trading_rules) - 10} more)" if len(connector.trading_rules) > 10 else ""
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Trading pair '{trading_pair}' not supported on {connector_name}. "
-                       f"Available pairs: {available_pairs}{more_text}"
+            raise ConnectorCapabilityError(
+                CapabilityErrorDetail(
+                    code="unsupported_trading_pair",
+                    message=f"Trading pair '{trading_pair}' is not supported",
+                    connector=connector_name,
+                    feature=ConnectorFeature.ORDER_SUBMISSION.value,
+                    trading_pair=trading_pair,
+                    supported_pairs=sorted(connector.trading_rules),
+                    reason="trading_rule_unavailable",
+                )
             )
         
         trading_rule = connector.trading_rules[trading_pair]
         
         # Validate order type is supported
         if order_type not in connector.supported_order_types():
-            supported_types = [ot.name for ot in connector.supported_order_types()]
-            raise HTTPException(status_code=400, detail=f"Order type '{order_type.name}' not supported. Supported types: {supported_types}")
+            raise ConnectorCapabilityError(
+                CapabilityErrorDetail(
+                    code="unsupported_order_type",
+                    message=f"Order type '{order_type.name}' is not supported",
+                    connector=connector_name,
+                    feature=ConnectorFeature.ORDER_SUBMISSION.value,
+                    trading_pair=trading_pair,
+                    reason="order_type_unsupported",
+                )
+            )
         
         # Quantize amount according to trading rules
         quantized_amount = connector.quantize_order_amount(trading_pair, amount)
         
         # Validate minimum order size
         if quantized_amount < trading_rule.min_order_size:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Order amount {quantized_amount} is below minimum order size {trading_rule.min_order_size} for {trading_pair}"
+            raise ConnectorCapabilityError(
+                CapabilityErrorDetail(
+                    code="order_amount_below_minimum",
+                    message="Order amount is below the connector minimum",
+                    connector=connector_name,
+                    feature=ConnectorFeature.ORDER_SUBMISSION.value,
+                    trading_pair=trading_pair,
+                    reason="minimum_order_size",
+                )
             )
         
         # Calculate and validate notional size
@@ -963,10 +1008,15 @@ class AccountsService:
             notional_size = price * quantized_amount if price else Decimal("0")
             
         if notional_size < trading_rule.min_notional_size:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Order notional value {notional_size} is below minimum notional size {trading_rule.min_notional_size} for {trading_pair}. "
-                       f"Increase the amount or price to meet the minimum requirement."
+            raise ConnectorCapabilityError(
+                CapabilityErrorDetail(
+                    code="order_notional_below_minimum",
+                    message="Order notional is below the connector minimum",
+                    connector=connector_name,
+                    feature=ConnectorFeature.ORDER_SUBMISSION.value,
+                    trading_pair=trading_pair,
+                    reason="minimum_notional_size",
+                )
             )
         
 
@@ -1031,6 +1081,7 @@ class AccountsService:
         Returns:
             Dictionary of active orders
         """
+        self.require_capability(connector_name, ConnectorFeature.ORDER_SUBMISSION)
         connector = await self.get_connector_instance(account_name, connector_name)
         return {order_id: order.to_json() for order_id, order in connector.in_flight_orders.items()}
     

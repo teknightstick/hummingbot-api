@@ -11,6 +11,7 @@ from hummingbot.core.event.event_forwarder import SourceInfoEventForwarder
 from hummingbot.core.event.events import BuyOrderCreatedEvent, MarketEvent, OrderFilledEvent, SellOrderCreatedEvent, TradeType
 
 from database import AsyncDatabaseManager, OrderRepository, TradeRepository
+from services.connector_capabilities import ConnectorCapabilityRegistry, ConnectorFeature
 from utils.trading_pair import split_trading_pair
 
 # Initialize logger
@@ -28,6 +29,7 @@ class OrdersRecorder:
         self.account_name = account_name
         self.connector_name = connector_name
         self._connector: Optional[ConnectorBase] = None
+        self._capability_registry = ConnectorCapabilityRegistry()
 
         # Strong references to in-flight event handler tasks so they are not garbage-collected before completing
         self._pending_tasks: set[asyncio.Task] = set()
@@ -350,6 +352,11 @@ class OrdersRecorder:
         Tries direct pair first, then inverse pair."""
         if not self._connector:
             return None
+        self._capability_registry.require(
+            self.connector_name,
+            ConnectorFeature.LAST_TRADE,
+            connector=self._connector,
+        )
         try:
             direct_pair = f"{from_token}-{to_token}"
             price = await asyncio.wait_for(

@@ -186,6 +186,10 @@ class MarketDataService:
         require = getattr(self._connector_service, "require_capability", None)
         if require is not None:
             require(connector_name, feature, trading_pair)
+            return
+        from services.connector_capabilities import ConnectorCapabilityRegistry
+
+        ConnectorCapabilityRegistry().require(connector_name, feature, trading_pair)
 
     def require_capability(
             self,
@@ -218,6 +222,11 @@ class MarketDataService:
         Returns:
             True if order book is ready, False otherwise
         """
+        # A live initialization mutates subscriptions, so dynamic support must be
+        # declared before connector resolution or any local feed bookkeeping.
+        self._require_capability(
+            connector_name, ConnectorFeature.DYNAMIC_SUBSCRIPTION, trading_pair
+        )
         # Snapshot reads and authenticated live readiness are deliberately distinct.
         # Static adapters can expose ORDER_BOOK while leaving LIVE_ORDER_BOOK absent
         # until an accepted connector/core integration declares that pending seam.
@@ -1252,6 +1261,7 @@ class MarketDataService:
         Returns:
             Dictionary with diagnostic information
         """
+        self._require_capability(connector_name, ConnectorFeature.LIVE_ORDER_BOOK)
         return self._connector_service.get_order_book_tracker_diagnostics(
             connector_name=connector_name,
             account_name=account_name
@@ -1272,6 +1282,7 @@ class MarketDataService:
         Returns:
             Dictionary with restart status
         """
+        self._require_capability(connector_name, ConnectorFeature.LIVE_ORDER_BOOK)
         return await self._connector_service.restart_order_book_tracker(
             connector_name=connector_name,
             account_name=account_name

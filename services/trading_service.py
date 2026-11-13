@@ -16,6 +16,7 @@ from hummingbot.core.data_type.common import OrderType, PositionAction
 from models.connectors import CapabilityErrorDetail
 from services.connector_capabilities import (
     ConnectorCapabilityError,
+    ConnectorCapabilityRegistry,
     ConnectorFeature,
 )
 
@@ -25,6 +26,9 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+_TASK_CLEANUP_TIMEOUT = 0.01
+_REMOTE_CLEANUP_TIMEOUT = 0.05
 
 
 class AccountTradingInterface:
@@ -70,7 +74,18 @@ class AccountTradingInterface:
         self._market_locks: Dict[str, asyncio.Lock] = {}
         self._market_lock_users: Dict[str, int] = {}
         self._market_locks_guard = asyncio.Lock()
-        self._cleanup_residuals: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        # Cleanup ownership is service-scoped so a second trading-interface
+        # instance cannot forget a residual created by the first one.
+        if not hasattr(connector_service, "_market_cleanup_residuals"):
+            connector_service._market_cleanup_residuals = {}
+        if not hasattr(connector_service, "_market_cleanup_owners"):
+            connector_service._market_cleanup_owners = {}
+        if not hasattr(connector_service, "_market_residual_tasks"):
+            connector_service._market_residual_tasks = {}
+        self._cleanup_residuals = connector_service._market_cleanup_residuals
+        self._cleanup_owners = connector_service._market_cleanup_owners
+        self._residual_tasks = connector_service._market_residual_tasks
+        self._capability_registry = ConnectorCapabilityRegistry()
 
         # Timestamp tracking
         self._current_timestamp: float = time.time()
@@ -99,7 +114,23 @@ class AccountTradingInterface:
     @property
     def cleanup_residuals(self) -> Dict[Tuple[str, str], Dict[str, Any]]:
         """Return observable cleanup failures without exposing mutable ledger state."""
-        return {key: dict(value) for key, value in self._cleanup_residuals.items()}
+        return {
+            (value["connector"], value.get("trading_pair")): dict(value)
+            for value in self._cleanup_residuals.values()
+        }
+
+    def _residual_key(
+        self, connector_name: str, trading_pair: str, cleanup_scope: str
+    ) -> Tuple[str, ...]:
+        """Keep connector-owned failures under connector identity, never pair identity."""
+        if cleanup_scope == "connector":
+            return (self._account_name, connector_name, "connector")
+        return (self._account_name, connector_name, "pair", trading_pair)
+
+    def _clear_pair_residual(self, connector_name: str, trading_pair: str) -> None:
+        key = self._residual_key(connector_name, trading_pair, "pair")
+        self._cleanup_residuals.pop(key, None)
+        self._cleanup_owners.pop(key, None)
 
     @property
     def current_timestamp(self) -> float:
@@ -109,6 +140,21 @@ class AccountTradingInterface:
     def update_timestamp(self):
         """Update the current timestamp. Called by ExecutorService control loop."""
         self._current_timestamp = time.time()
+
+    def _require_capability(
+        self,
+        connector_name: str,
+        feature: ConnectorFeature,
+        trading_pair: Optional[str] = None,
+    ) -> None:
+        """Use the shared declaration seam before connector access or mutation."""
+        require = getattr(self._connector_service, "require_capability", None)
+        if require is None:
+            require = getattr(self._market_data_service, "require_capability", None)
+        if require is not None:
+            require(connector_name, feature, trading_pair)
+            return
+        self._capability_registry.require(connector_name, feature, trading_pair)
 
     async def ensure_connector(self, connector_name: str) -> ConnectorBase:
         """
@@ -120,9 +166,7 @@ class AccountTradingInterface:
         Returns:
             The connector instance
         """
-        require = getattr(self._market_data_service, "require_capability", None)
-        if require is not None:
-            require(connector_name, ConnectorFeature.ORDER_SUBMISSION)
+        self._require_capability(connector_name, ConnectorFeature.ORDER_SUBMISSION)
         return await self._connector_service.get_trading_connector(
             self._account_name,
             connector_name
@@ -147,12 +191,17 @@ class AccountTradingInterface:
             trading_pair: Trading pair to add
             order_book_timeout: Timeout in seconds to wait for order book data
         """
-        require = getattr(self._market_data_service, "require_capability", None)
-        if require is not None:
-            # Both checks are local declarations. They must run before ensure_connector(),
-            # which can authenticate, create a connector, and start network tasks.
-            require(connector_name, ConnectorFeature.LIVE_ORDER_BOOK, trading_pair)
-            require(connector_name, ConnectorFeature.ORDER_SUBMISSION, trading_pair)
+        # All checks are local declarations. They must run before ensure_connector(),
+        # which can authenticate, create a connector, and start network tasks.
+        self._require_capability(
+            connector_name, ConnectorFeature.DYNAMIC_SUBSCRIPTION, trading_pair
+        )
+        self._require_capability(
+            connector_name, ConnectorFeature.LIVE_ORDER_BOOK, trading_pair
+        )
+        self._require_capability(
+            connector_name, ConnectorFeature.ORDER_SUBMISSION, trading_pair
+        )
 
         async with self._market_transaction(connector_name):
             await self._retry_market_cleanup_residual(connector_name, trading_pair)
@@ -172,7 +221,7 @@ class AccountTradingInterface:
                 if self._pair_exists_in_connector_state(connector, tracker, trading_pair):
                     if self._order_book_is_ready(tracker, trading_pair):
                         self._markets.setdefault(connector_name, set()).add(trading_pair)
-                        self._cleanup_residuals.pop((connector_name, trading_pair), None)
+                        self._clear_pair_residual(connector_name, trading_pair)
                         return
                     self._raise_ambiguous_market_state(connector_name, trading_pair)
 
@@ -187,7 +236,7 @@ class AccountTradingInterface:
                 if self._pair_exists_in_connector_state(connector, tracker, trading_pair):
                     if self._order_book_is_ready(tracker, trading_pair):
                         self._markets.setdefault(connector_name, set()).add(trading_pair)
-                        self._cleanup_residuals.pop((connector_name, trading_pair), None)
+                        self._clear_pair_residual(connector_name, trading_pair)
                         return
                     self._raise_ambiguous_market_state(connector_name, trading_pair)
 
@@ -208,7 +257,7 @@ class AccountTradingInterface:
                     await connector._update_balances()
 
                 self._markets.setdefault(connector_name, set()).add(trading_pair)
-                self._cleanup_residuals.pop((connector_name, trading_pair), None)
+                self._clear_pair_residual(connector_name, trading_pair)
                 logger.info(f"Market {connector_name}/{trading_pair} added to trading interface")
             except BaseException as primary_error:
                 residual = await self._complete_market_cleanup(
@@ -237,8 +286,13 @@ class AccountTradingInterface:
         finally:
             if acquired:
                 lock.release()
-            async with self._market_locks_guard:
-                users = self._market_lock_users[connector_name] - 1
+            try:
+                # Preserve cancellation delivered while another user holds the
+                # guard, but perform the actual pruning synchronously below.
+                if self._market_locks_guard.locked():
+                    await asyncio.sleep(0)
+            finally:
+                users = self._market_lock_users.get(connector_name, 1) - 1
                 if users:
                     self._market_lock_users[connector_name] = users
                 else:
@@ -302,12 +356,36 @@ class AccountTradingInterface:
             tasks.update(item for item in value if isinstance(item, asyncio.Task))
         return tasks
 
+    async def _drain_tasks(
+        self,
+        key: Tuple[str, str],
+        tasks: Set[asyncio.Task],
+    ) -> bool:
+        """Cancel tasks with a real deadline and retain cancellation suppressors."""
+        current = asyncio.current_task()
+        tasks.update(self._residual_tasks.pop(key, set()))
+        tasks = {task for task in tasks if task is not current and not task.done()}
+        for task in tasks:
+            task.cancel()
+        if not tasks:
+            return True
+        done, pending = await asyncio.wait(tasks, timeout=_TASK_CLEANUP_TIMEOUT)
+        for task in done:
+            try:
+                task.exception()
+            except (asyncio.CancelledError, Exception):
+                pass
+        if pending:
+            self._residual_tasks[key] = set(pending)
+            return False
+        return True
+
     async def _remove_owned_pair_state(
         self,
         connector_name: str,
         trading_pair: str,
         connector,
-    ) -> None:
+    ) -> bool:
         pairs = self._markets.get(connector_name)
         if pairs is not None:
             pairs.discard(trading_pair)
@@ -315,7 +393,7 @@ class AccountTradingInterface:
                 self._markets.pop(connector_name, None)
 
         if connector is None:
-            return
+            return await self._drain_tasks((connector_name, trading_pair), set())
         tracker = getattr(connector, "order_book_tracker", None)
         tasks: Set[asyncio.Task] = set()
         for owner in (connector, tracker):
@@ -339,11 +417,7 @@ class AccountTradingInterface:
                 mapping = getattr(tracker, attr, None)
                 if isinstance(mapping, dict):
                     tasks.update(self._tasks_in_value(mapping.pop(trading_pair, None)))
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        return await self._drain_tasks((connector_name, trading_pair), tasks)
 
     async def _remote_cleanup_reason(
         self,
@@ -351,53 +425,99 @@ class AccountTradingInterface:
         trading_pair: str,
         connector_preexisting: bool,
     ) -> Optional[str]:
+        key = (connector_name, trading_pair)
         try:
             if connector_preexisting:
                 cleanup = getattr(self._market_data_service, "remove_trading_pair", None)
                 if cleanup is None:
-                    return "public pair cleanup is unavailable"
-                result = await asyncio.wait_for(
-                    cleanup(
-                        connector_name=connector_name,
-                        trading_pair=trading_pair,
-                        account_name=self._account_name,
-                    ),
-                    timeout=5.0,
+                    return "pair_cleanup_unavailable"
+                awaitable = cleanup(
+                    connector_name=connector_name,
+                    trading_pair=trading_pair,
+                    account_name=self._account_name,
                 )
             else:
                 cleanup = getattr(self._connector_service, "stop_trading_connector", None)
                 if cleanup is None:
-                    return "public connector cleanup is unavailable"
-                result = await asyncio.wait_for(
-                    cleanup(self._account_name, connector_name), timeout=5.0
-                )
+                    return "connector_cleanup_unavailable"
+                awaitable = cleanup(self._account_name, connector_name)
+            cleanup_task = asyncio.ensure_future(awaitable)
+            done, pending = await asyncio.wait(
+                {cleanup_task}, timeout=_REMOTE_CLEANUP_TIMEOUT
+            )
+            if pending:
+                cleanup_task.cancel()
+                self._residual_tasks.setdefault(key, set()).add(cleanup_task)
+                return "cleanup_deadline_exceeded"
+            try:
+                result = cleanup_task.result()
+            except asyncio.CancelledError:
+                return "cleanup_cancelled"
             if result is False:
-                return "public cleanup returned false"
+                return "cleanup_returned_false"
             return None
-        except asyncio.TimeoutError:
-            return "public cleanup timed out"
         except asyncio.CancelledError:
-            return "public cleanup was cancelled"
-        except BaseException as cleanup_error:
-            return f"public cleanup raised {type(cleanup_error).__name__}: {cleanup_error}"
+            raise
+        except BaseException:
+            return "cleanup_raised"
 
     async def _retry_market_cleanup_residual(
         self, connector_name: str, trading_pair: str
     ) -> None:
         """Retry known residual cleanup before permitting any new remote mutation."""
-        key = (connector_name, trading_pair)
-        residual = self._cleanup_residuals.get(key)
+        pair_key = self._residual_key(connector_name, trading_pair, "pair")
+        connector_key = self._residual_key(
+            connector_name, trading_pair, "connector"
+        )
+        key = pair_key
+        residual = self._cleanup_residuals.get(pair_key)
+        connector_residual = self._cleanup_residuals.get(connector_key)
+        if (
+            residual is None
+            and connector_residual is not None
+            and connector_residual.get("trading_pair") == trading_pair
+        ):
+            key = connector_key
+            residual = connector_residual
         if residual is None:
             return
-        reason = await self._remote_cleanup_reason(
-            connector_name,
-            trading_pair,
-            residual.get("cleanup_scope", "pair") == "pair",
-        )
-        if reason is None:
+        owner = self._cleanup_owners.get(key, {})
+        connector = owner.get("connector") or self.connectors.get(connector_name)
+        local_ok = False
+        try:
+            local_ok = await self._remove_owned_pair_state(
+                connector_name, trading_pair, connector
+            )
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            local_ok = False
+
+        scope = residual.get("cleanup_scope", "pair")
+        other_pairs = self._markets.get(connector_name, set()) - {trading_pair}
+        if not local_ok:
+            reason = "task_cleanup_pending"
+        elif scope == "connector" and other_pairs:
+            # A later pair now has independent ownership. Never stop its connector
+            # while retrying the earlier transaction's residue.
+            reason = None
+        else:
+            reason = await self._remote_cleanup_reason(
+                connector_name,
+                trading_pair,
+                scope == "pair",
+            )
+        stale_local = self._pair_exists_in_connector_state(
+            connector, getattr(connector, "order_book_tracker", None), trading_pair
+        ) if connector is not None else False
+        if reason is None and local_ok and not stale_local:
             self._cleanup_residuals.pop(key, None)
+            self._cleanup_owners.pop(key, None)
             return
-        residual["reason"] = reason
+        residual["reason"] = "cleanup_incomplete"
+        residual["cleanup_code"] = reason or (
+            "task_cleanup_pending" if not local_ok else "local_state_remaining"
+        )
         raise ConnectorCapabilityError(CapabilityErrorDetail.model_validate(residual))
 
     async def _finalize_failed_market_add(
@@ -411,27 +531,46 @@ class AccountTradingInterface:
         reason = await self._remote_cleanup_reason(
             connector_name, trading_pair, connector_preexisting
         )
+        local_ok = False
         try:
-            await self._remove_owned_pair_state(connector_name, trading_pair, connector)
-        except BaseException as local_error:
-            local_reason = f"local cleanup raised {type(local_error).__name__}: {local_error}"
-            reason = f"{reason}; {local_reason}" if reason else local_reason
+            local_ok = await self._remove_owned_pair_state(
+                connector_name, trading_pair, connector
+            )
+        except BaseException:
+            local_ok = False
 
-        key = (connector_name, trading_pair)
-        if reason is None:
+        stale_local = self._pair_exists_in_connector_state(
+            connector, getattr(connector, "order_book_tracker", None), trading_pair
+        ) if connector is not None else False
+
+        key = self._residual_key(
+            connector_name,
+            trading_pair,
+            "pair" if connector_preexisting else "connector",
+        )
+        if reason is None and local_ok and not stale_local:
             self._cleanup_residuals.pop(key, None)
+            self._cleanup_owners.pop(key, None)
             return None
+        cleanup_code = reason or (
+            "task_cleanup_pending" if not local_ok else "local_state_remaining"
+        )
         detail = CapabilityErrorDetail(
             code="market_cleanup_residual",
             message=f"Cleanup is incomplete for '{connector_name}/{trading_pair}'",
             connector=connector_name,
             feature=ConnectorFeature.LIVE_ORDER_BOOK.value,
             trading_pair=trading_pair,
-            reason=reason,
+            reason="cleanup_incomplete",
+            cleanup_scope="pair" if connector_preexisting else "connector",
+            cleanup_code=cleanup_code,
         )
         residual = detail.model_dump(exclude_none=True)
-        residual["cleanup_scope"] = "pair" if connector_preexisting else "connector"
         self._cleanup_residuals[key] = residual
+        self._cleanup_owners[key] = {
+            "connector": connector,
+            "connector_preexisting": connector_preexisting,
+        }
         return detail
 
     async def _complete_market_cleanup(
@@ -450,12 +589,17 @@ class AccountTradingInterface:
                 connector_preexisting,
             )
         )
+        cancelled = False
         while not cleanup_task.done():
             try:
                 await asyncio.shield(cleanup_task)
             except asyncio.CancelledError:
+                cancelled = True
                 continue
-        return cleanup_task.result()
+        result = cleanup_task.result()
+        if cancelled:
+            raise asyncio.CancelledError()
+        return result
 
     async def remove_market(
         self,
@@ -471,23 +615,42 @@ class AccountTradingInterface:
             trading_pair: Trading pair to remove
             remove_order_book: Whether to remove the order book (default True)
         """
-        if connector_name not in self._markets:
-            return
+        try:
+            self._require_capability(
+                connector_name, ConnectorFeature.DYNAMIC_SUBSCRIPTION, trading_pair
+            )
+        except ConnectorCapabilityError as exc:
+            # Executor cleanup is command-style: return a typed rejection while
+            # preserving membership so callers can surface it without ambiguity.
+            return CapabilityErrorDetail.model_validate(exc.detail)
+        async with self._market_transaction(connector_name):
+            if connector_name not in self._markets:
+                return
 
-        self._markets[connector_name].discard(trading_pair)
-        if not self._markets[connector_name]:
-            del self._markets[connector_name]
-
-        # Remove order book via MarketDataService
-        if remove_order_book:
-            try:
-                await self._market_data_service.remove_trading_pair(
+            # Remote cleanup must succeed before local membership is committed.
+            if remove_order_book:
+                result = await self._market_data_service.remove_trading_pair(
                     connector_name=connector_name,
                     trading_pair=trading_pair,
                     account_name=self._account_name
                 )
-            except Exception as e:
-                logger.warning(f"Failed to remove order book for {connector_name}/{trading_pair}: {e}")
+                if result is False:
+                    raise ConnectorCapabilityError(
+                        CapabilityErrorDetail(
+                            code="market_cleanup_residual",
+                            message=f"Cleanup is incomplete for '{connector_name}/{trading_pair}'",
+                            connector=connector_name,
+                            feature=ConnectorFeature.DYNAMIC_SUBSCRIPTION.value,
+                            trading_pair=trading_pair,
+                            reason="cleanup_incomplete",
+                            cleanup_scope="pair",
+                            cleanup_code="cleanup_returned_false",
+                        )
+                    )
+
+            self._markets[connector_name].discard(trading_pair)
+            if not self._markets[connector_name]:
+                del self._markets[connector_name]
 
         logger.info(f"Removed market {connector_name}/{trading_pair}")
 
@@ -535,6 +698,9 @@ class AccountTradingInterface:
         Returns:
             Client order ID
         """
+        self._require_capability(
+            connector_name, ConnectorFeature.ORDER_SUBMISSION, trading_pair
+        )
         connector = self.connectors.get(connector_name)
         if not connector:
             raise ValueError(f"Connector {connector_name} not loaded. Call ensure_connector first.")
@@ -570,6 +736,9 @@ class AccountTradingInterface:
         Returns:
             Client order ID
         """
+        self._require_capability(
+            connector_name, ConnectorFeature.ORDER_SUBMISSION, trading_pair
+        )
         connector = self.connectors.get(connector_name)
         if not connector:
             raise ValueError(f"Connector {connector_name} not loaded. Call ensure_connector first.")
@@ -599,6 +768,9 @@ class AccountTradingInterface:
         Returns:
             Client order ID that was cancelled
         """
+        self._require_capability(
+            connector_name, ConnectorFeature.ORDER_SUBMISSION, trading_pair
+        )
         connector = self.connectors.get(connector_name)
         if not connector:
             raise ValueError(f"Connector {connector_name} not loaded. Call ensure_connector first.")
@@ -615,6 +787,7 @@ class AccountTradingInterface:
         Returns:
             List of active in-flight orders
         """
+        self._require_capability(connector_name, ConnectorFeature.ORDER_SUBMISSION)
         connector = self.connectors.get(connector_name)
         if not connector:
             return []
