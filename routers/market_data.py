@@ -51,6 +51,24 @@ router = APIRouter(tags=["Market Data"], prefix="/market-data")
 CAPABILITY_ERROR_RESPONSES = {400: {"model": CapabilityErrorResponse}}
 
 
+def _unsupported_detail(
+    connector_name: str,
+    feature: ConnectorFeature,
+    reason: str,
+    trading_pair: Optional[str] = None,
+    code: str = "unsupported_connector_feature",
+) -> CapabilityErrorDetail:
+    """Build the exact detail shape advertised for capability-related HTTP 400s."""
+    return CapabilityErrorDetail(
+        code=code,
+        message=reason,
+        connector=connector_name,
+        feature=feature.value,
+        trading_pair=trading_pair,
+        reason=reason,
+    )
+
+
 @router.post("/candles", responses=CAPABILITY_ERROR_RESPONSES)
 async def get_candles(request: Request, candles_config: CandlesConfigRequest):
     """
@@ -76,17 +94,33 @@ async def get_candles(request: Request, candles_config: CandlesConfigRequest):
 
     available = list(CandlesFactory._candles_map.keys())
     if candles_config.connector_name not in CandlesFactory._candles_map:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported connector '{candles_config.connector_name}'. "
-                   f"Available connectors: {available}"
+        reason = (
+            f"Unsupported connector '{candles_config.connector_name}'. "
+            f"Available connectors: {available}"
+        )
+        raise ConnectorCapabilityError(
+            _unsupported_detail(
+                candles_config.connector_name,
+                ConnectorFeature.CANDLES,
+                reason,
+                candles_config.trading_pair,
+                code="unsupported_candle_connector",
+            )
         )
 
     if "-" not in candles_config.trading_pair:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid trading pair format '{candles_config.trading_pair}'. "
-                   f"Expected format: BASE-QUOTE (e.g., BTC-USDT)"
+        reason = (
+            f"Invalid trading pair format '{candles_config.trading_pair}'. "
+            "Expected format: BASE-QUOTE (e.g., BTC-USDT)"
+        )
+        raise ConnectorCapabilityError(
+            _unsupported_detail(
+                candles_config.connector_name,
+                ConnectorFeature.CANDLES,
+                reason,
+                candles_config.trading_pair,
+                code="invalid_trading_pair",
+            )
         )
 
     try:
@@ -99,7 +133,15 @@ async def get_candles(request: Request, candles_config: CandlesConfigRequest):
         try:
             candles_feed = await market_data_service.get_candles_feed(candles_cfg)
         except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+            raise ConnectorCapabilityError(
+                _unsupported_detail(
+                    candles_config.connector_name,
+                    ConnectorFeature.CANDLES,
+                    str(e),
+                    candles_config.trading_pair,
+                    code="unsupported_candle_request",
+                )
+            )
 
         # Wait for the candles feed to be ready with a timeout
         timeout = settings.market_data.candles_ready_timeout
@@ -128,7 +170,15 @@ async def get_candles(request: Request, candles_config: CandlesConfigRequest):
     except HTTPException:
         raise
     except UnsupportedConnectorException as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise ConnectorCapabilityError(
+            _unsupported_detail(
+                candles_config.connector_name,
+                ConnectorFeature.CANDLES,
+                str(e),
+                candles_config.trading_pair,
+                code="unsupported_candle_connector",
+            )
+        )
     except Exception as e:
         logger.error(f"Unexpected error fetching candles: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal error fetching candles: {str(e)}")
@@ -154,17 +204,33 @@ async def get_historical_candles(request: Request, config: HistoricalCandlesConf
 
     available = list(CandlesFactory._candles_map.keys())
     if config.connector_name not in CandlesFactory._candles_map:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported connector '{config.connector_name}'. "
-                   f"Available connectors: {available}"
+        reason = (
+            f"Unsupported connector '{config.connector_name}'. "
+            f"Available connectors: {available}"
+        )
+        raise ConnectorCapabilityError(
+            _unsupported_detail(
+                config.connector_name,
+                ConnectorFeature.CANDLES,
+                reason,
+                config.trading_pair,
+                code="unsupported_candle_connector",
+            )
         )
 
     if "-" not in config.trading_pair:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid trading pair format '{config.trading_pair}'. "
-                   f"Expected format: BASE-QUOTE (e.g., BTC-USDT)"
+        reason = (
+            f"Invalid trading pair format '{config.trading_pair}'. "
+            "Expected format: BASE-QUOTE (e.g., BTC-USDT)"
+        )
+        raise ConnectorCapabilityError(
+            _unsupported_detail(
+                config.connector_name,
+                ConnectorFeature.CANDLES,
+                reason,
+                config.trading_pair,
+                code="invalid_trading_pair",
+            )
         )
 
     try:
@@ -179,7 +245,15 @@ async def get_historical_candles(request: Request, config: HistoricalCandlesConf
         try:
             candles = await market_data_service.get_candles_feed(candles_config)
         except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+            raise ConnectorCapabilityError(
+                _unsupported_detail(
+                    config.connector_name,
+                    ConnectorFeature.CANDLES,
+                    str(e),
+                    config.trading_pair,
+                    code="unsupported_candle_request",
+                )
+            )
 
         timeout = settings.market_data.candles_ready_timeout
         historical_data = await asyncio.wait_for(
@@ -203,9 +277,26 @@ async def get_historical_candles(request: Request, config: HistoricalCandlesConf
                    f"The trading pair may not exist or the time range may be too large."
         )
     except UnsupportedConnectorException as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise ConnectorCapabilityError(
+            _unsupported_detail(
+                config.connector_name,
+                ConnectorFeature.CANDLES,
+                str(e),
+                config.trading_pair,
+                code="unsupported_candle_connector",
+            )
+        )
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid parameters: {str(e)}")
+        reason = f"Invalid parameters: {str(e)}"
+        raise ConnectorCapabilityError(
+            _unsupported_detail(
+                config.connector_name,
+                ConnectorFeature.CANDLES,
+                reason,
+                config.trading_pair,
+                code="unsupported_candle_request",
+            )
+        )
     except Exception as e:
         logger.error(f"Unexpected error fetching historical candles: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal error fetching historical candles: {str(e)}")
@@ -526,7 +617,14 @@ async def get_funding_info(
 
         if "error" in funding_info:
             if "not supported" in funding_info["error"]:
-                raise HTTPException(status_code=400, detail=funding_info["error"])
+                raise ConnectorCapabilityError(
+                    _unsupported_detail(
+                        request.connector_name,
+                        ConnectorFeature.PERPETUAL,
+                        funding_info["error"],
+                        request.trading_pair,
+                    )
+                )
             else:
                 raise HTTPException(status_code=500, detail=funding_info["error"])
 
@@ -854,6 +952,11 @@ async def remove_trading_pair(
         HTTPException: 500 if removal fails
     """
     try:
+        market_data_service.require_capability(
+            request.connector_name,
+            ConnectorFeature.DYNAMIC_SUBSCRIPTION,
+            request.trading_pair,
+        )
         success = await market_data_service.remove_trading_pair(
             connector_name=request.connector_name,
             trading_pair=request.trading_pair,
@@ -886,7 +989,10 @@ async def remove_trading_pair(
 
 # Order Book Tracker Diagnostics Endpoints
 
-@router.get("/order-book/diagnostics/{connector_name}")
+@router.get(
+    "/order-book/diagnostics/{connector_name}",
+    responses=CAPABILITY_ERROR_RESPONSES,
+)
 async def get_order_book_diagnostics(
         connector_name: str,
         account_name: str = None,
@@ -909,11 +1015,16 @@ async def get_order_book_diagnostics(
         Diagnostic information dictionary
     """
     try:
+        market_data_service.require_capability(
+            connector_name, ConnectorFeature.LIVE_ORDER_BOOK
+        )
         diagnostics = market_data_service.get_order_book_tracker_diagnostics(
             connector_name=connector_name,
             account_name=account_name
         )
         return diagnostics
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -921,7 +1032,10 @@ async def get_order_book_diagnostics(
         )
 
 
-@router.post("/order-book/restart/{connector_name}")
+@router.post(
+    "/order-book/restart/{connector_name}",
+    responses=CAPABILITY_ERROR_RESPONSES,
+)
 async def restart_order_book_tracker(
         connector_name: str,
         account_name: str = None,
@@ -944,11 +1058,16 @@ async def restart_order_book_tracker(
         Restart status with success/failure and trading pairs
     """
     try:
+        market_data_service.require_capability(
+            connector_name, ConnectorFeature.LIVE_ORDER_BOOK
+        )
         result = await market_data_service.restart_order_book_tracker(
             connector_name=connector_name,
             account_name=account_name
         )
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500,

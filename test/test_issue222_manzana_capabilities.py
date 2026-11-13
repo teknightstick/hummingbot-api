@@ -122,7 +122,12 @@ def _install_import_contract() -> None:
     )
 
     candles_types = _module("hummingbot.data_feed.candles_feed.data_types")
-    candles_types.CandlesConfig = type("CandlesConfig", (), {})
+
+    class CandlesConfig:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    candles_types.CandlesConfig = CandlesConfig
     class HistoricalCandlesConfig(BaseModel):
         connector_name: str
         trading_pair: str
@@ -208,12 +213,15 @@ def _scoped_import_contract(request):
     if request.node.name in {
         "test_b6_capability_json_is_deterministic_across_hash_seeds",
         "test_b7_contract_module_does_not_pollute_imports_or_use_bare_asserts",
+        "test_final_b8_fixture_restores_preexisting_module_dicts",
     }:
         yield
         return
 
     before = {
-        name: module for name, module in sys.modules.items() if _is_contract_module(name)
+        name: (module, dict(module.__dict__))
+        for name, module in sys.modules.items()
+        if _is_contract_module(name)
     }
     _install_import_contract()
     from models.market_data import OrderBookQueryResult as ResultModel
@@ -229,8 +237,10 @@ def _scoped_import_contract(request):
         for name in tuple(sys.modules):
             if _is_contract_module(name) and name not in before:
                 sys.modules.pop(name, None)
-        for name, module in before.items():
+        for name, (module, attributes) in before.items():
             sys.modules[name] = module
+            module.__dict__.clear()
+            module.__dict__.update(attributes)
 
 
 @dataclass
@@ -625,7 +635,8 @@ async def test_failed_add_market_preserves_markets_membership_exactly():
             return {"static": connector}
 
     market_data_service = types.SimpleNamespace(
-        initialize_order_book=AsyncMock(return_value=False)
+        initialize_order_book=AsyncMock(return_value=False),
+        remove_trading_pair=AsyncMock(return_value=True),
     )
     interface = AccountTradingInterface(
         ConnectorService(), market_data_service, "master"
@@ -935,6 +946,8 @@ async def test_b2_order_route_and_add_market_reject_before_downstream_work():
     interface = AccountTradingInterface(connector_service, market_data_service, "master")
     with pytest.raises(ConnectorCapabilityError):
         await interface.add_market("manzana", "BTC-USD")
+    with pytest.raises(ConnectorCapabilityError):
+        await interface.ensure_connector("manzana")
     CHECK.assertEqual(0, connector_service.ensure_calls)
 
 
@@ -1112,8 +1125,10 @@ async def test_b4_named_unloaded_spot_reads_reject_without_querying():
     class UnloadedConnectorService:
         def __init__(self):
             self.registry = ConnectorCapabilityRegistry()
+            self.connector_map_reads = 0
 
         def get_all_trading_connectors(self):
+            self.connector_map_reads += 1
             return {"master": {}}
 
         def get_connector_capabilities(self, connector_name):
@@ -1144,8 +1159,8 @@ async def test_b4_named_unloaded_spot_reads_reject_without_querying():
     CHECK.assertEqual(400, funding_error.value.status_code)
     CHECK.assertEqual(0, accounts_service.get_account_positions.await_count)
     CHECK.assertEqual(0, history_service.get_funding_payments.await_count)
+    CHECK.assertEqual(0, connector_service.connector_map_reads)
 
-    connector_service.get_all_trading_connectors = lambda: {}
     with pytest.raises(Exception) as globally_unloaded:
         await get_positions(
             PositionFilterRequest(connector_names=["manzana"]),
@@ -1153,7 +1168,9 @@ async def test_b4_named_unloaded_spot_reads_reject_without_querying():
             connector_service,
         )
     CHECK.assertEqual(400, globally_unloaded.value.status_code)
+    CHECK.assertEqual(0, connector_service.connector_map_reads)
 
+    connector_service.get_all_trading_connectors = lambda: {}
     global_positions = await get_positions(
         PositionFilterRequest(), accounts_service, connector_service
     )
@@ -1204,6 +1221,7 @@ def _transaction_state(connector):
 
 @pytest.mark.asyncio
 async def test_b5_add_market_rolls_back_partial_absent_and_preexisting_state():
+    from services.connector_capabilities import ConnectorCapabilityError
     from services.trading_service import AccountTradingInterface
 
     for preexisting in (False, True):
@@ -1235,7 +1253,7 @@ async def test_b5_add_market_rolls_back_partial_absent_and_preexisting_state():
         if preexisting:
             interface._markets = {"generic": {"BTC-USD"}}
         expected_markets = {key: set(value) for key, value in interface._markets.items()}
-        with pytest.raises(ValueError):
+        with pytest.raises(ConnectorCapabilityError):
             await interface.add_market("generic", "BTC-USD")
         CHECK.assertEqual(expected_markets, interface.markets)
         CHECK.assertEqual(before, _transaction_state(connector))
@@ -1399,6 +1417,801 @@ def test_b7_contract_module_does_not_pollute_imports_or_use_bare_asserts():
         if getattr(module, "__issue222_contract_shim__", False)
     )
     CHECK.assertEqual([], polluted)
+
+
+def test_final_b1_boolean_json_is_rejected_before_all_query_primitives():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from pydantic import ValidationError
+
+    from models.market_data import (
+        PriceForQuoteVolumeRequest,
+        PriceForVolumeRequest,
+        QuoteVolumeForPriceRequest,
+        VolumeForPriceRequest,
+        VWAPForVolumeRequest,
+    )
+    from routers import market_data as market_data_router
+
+    class QueryService:
+        def __init__(self):
+            self.calls = []
+
+        async def get_order_book_query_result(self, connector, pair, is_buy, **kwargs):
+            self.calls.append((connector, pair, is_buy, kwargs))
+            value = next(iter(kwargs.values()))
+            return {
+                "trading_pair": pair,
+                "is_buy": is_buy,
+                "query_volume": float(value),
+                "result_price": 100.0,
+                "result_volume": float(value),
+                "timestamp": 1.0,
+            }
+
+    service = QueryService()
+    app = FastAPI()
+    app.include_router(market_data_router.router)
+    app.dependency_overrides[market_data_router.get_market_data_service] = lambda: service
+    client = TestClient(app)
+    cases = (
+        ("/market-data/order-book/price-for-volume", "volume", PriceForVolumeRequest),
+        ("/market-data/order-book/volume-for-price", "price", VolumeForPriceRequest),
+        (
+            "/market-data/order-book/price-for-quote-volume",
+            "quote_volume",
+            PriceForQuoteVolumeRequest,
+        ),
+        (
+            "/market-data/order-book/quote-volume-for-price",
+            "price",
+            QuoteVolumeForPriceRequest,
+        ),
+        ("/market-data/order-book/vwap-for-volume", "volume", VWAPForVolumeRequest),
+    )
+    base = {"connector_name": "generic", "trading_pair": "BTC-USD", "is_buy": True}
+    for path, field, model in cases:
+        calls_before_booleans = len(service.calls)
+        for boolean in (True, False):
+            response = client.post(path, json={**base, field: boolean})
+            CHECK.assertEqual(422, response.status_code, (path, boolean, response.text))
+        CHECK.assertEqual(calls_before_booleans, len(service.calls))
+
+        for number in (1, 1.5):
+            response = client.post(path, json={**base, field: number})
+            CHECK.assertEqual(200, response.status_code, (path, number, response.text))
+        model(**base, **{field: Decimal("1.25")})
+        for invalid in (
+            0,
+            -1,
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            Decimal("0"),
+            Decimal("-1"),
+            Decimal("NaN"),
+            Decimal("Infinity"),
+            Decimal("-Infinity"),
+        ):
+            with pytest.raises(ValidationError):
+                model(**base, **{field: invalid})
+
+    CHECK.assertEqual(10, len(service.calls))
+
+
+def test_final_b2_all_adjacent_live_and_order_routes_gate_before_work():
+    from fastapi.testclient import TestClient
+
+    from models.connectors import CapabilityErrorResponse
+    from services.connector_capabilities import ConnectorCapabilityRegistry
+
+    app, _, market_data_router, trading_router = _router_contract_app()
+
+    class Downstream:
+        def __init__(self):
+            self.registry = ConnectorCapabilityRegistry()
+            self.calls = []
+            self.connector_service = self
+
+        def require_capability(self, connector_name, feature, trading_pair=None):
+            self.registry.require(connector_name, feature, trading_pair)
+
+        def get_data_connector(self, connector_name):
+            self.calls.append("order_types")
+            return types.SimpleNamespace(
+                supported_order_types=lambda: [types.SimpleNamespace(name="MARKET")]
+            )
+
+        async def cancel_order(self, **kwargs):
+            self.calls.append("cancel")
+            return kwargs["client_order_id"]
+
+        def get_order_book_tracker_diagnostics(self, **kwargs):
+            self.calls.append("diagnostics")
+            return {"tracker_ready": True}
+
+        async def restart_order_book_tracker(self, **kwargs):
+            self.calls.append("restart")
+            return {"success": True}
+
+        async def remove_trading_pair(self, **kwargs):
+            self.calls.append("remove_pair")
+            return True
+
+        def get_all_trading_connectors(self):
+            self.calls.append("active_orders")
+            return {}
+
+    downstream = Downstream()
+    app.state.market_data_service = downstream
+    app.dependency_overrides[market_data_router.get_market_data_service] = lambda: downstream
+    app.dependency_overrides[trading_router.get_accounts_service] = lambda: downstream
+    app.dependency_overrides[trading_router.get_connector_service] = lambda: downstream
+    client = TestClient(app)
+    requests = (
+        ("get", "/connectors/manzana/order-types", None),
+        ("post", "/trading/master/manzana/orders/order-1/cancel", None),
+        ("get", "/market-data/order-book/diagnostics/manzana", None),
+        ("post", "/market-data/order-book/restart/manzana", None),
+        (
+            "post",
+            "/market-data/trading-pair/remove",
+            {"connector_name": "manzana", "trading_pair": "BTC-USD"},
+        ),
+        (
+            "post",
+            "/trading/orders/active",
+            {"account_names": ["master"], "connector_names": ["manzana"]},
+        ),
+    )
+    for method, path, body in requests:
+        response = getattr(client, method)(path, json=body) if body is not None else getattr(client, method)(path)
+        CHECK.assertEqual(400, response.status_code, (path, response.text))
+        CapabilityErrorResponse.model_validate(response.json())
+    CHECK.assertEqual([], downstream.calls)
+
+    schema = app.openapi()["paths"]
+    schema_paths = {
+        "/connectors/manzana/order-types": "/connectors/{connector_name}/order-types",
+        "/trading/master/manzana/orders/order-1/cancel": (
+            "/trading/{account_name}/{connector_name}/orders/{client_order_id}/cancel"
+        ),
+        "/market-data/order-book/diagnostics/manzana": (
+            "/market-data/order-book/diagnostics/{connector_name}"
+        ),
+        "/market-data/order-book/restart/manzana": (
+            "/market-data/order-book/restart/{connector_name}"
+        ),
+    }
+    for method, path, _ in requests:
+        responses = schema[schema_paths.get(path, path)][method]["responses"]
+        CHECK.assertEqual(
+            "#/components/schemas/CapabilityErrorResponse",
+            responses["400"]["content"]["application/json"]["schema"]["$ref"],
+        )
+
+
+def test_final_b3_all_advertised_unsupported_bodies_match_openapi():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from models.connectors import (
+        CapabilityErrorResponse,
+        TradingRulesNotFoundResponse,
+        TradingRulesPartialResponse,
+    )
+    from routers import connectors as connectors_router
+    from routers import market_data as market_data_router
+
+    class UnsupportedService:
+        def require_capability(self, connector_name, feature, trading_pair=None):
+            return None
+
+        async def get_candles_feed(self, config):
+            raise market_data_router.UnsupportedConnectorException("unsupported candle source")
+
+        async def get_funding_info(self, connector_name, trading_pair):
+            return {"error": "Funding info not supported by this connector"}
+
+    service = UnsupportedService()
+    app = FastAPI()
+    app.include_router(market_data_router.router)
+    app.state.market_data_service = service
+    app.dependency_overrides[market_data_router.get_market_data_service] = lambda: service
+    client = TestClient(app)
+    original_map = market_data_router.CandlesFactory._candles_map
+    try:
+        market_data_router.CandlesFactory._candles_map = {}
+        unknown_requests = (
+            ("/market-data/candles", {"connector_name": "unknown", "trading_pair": "BTC-USD"}),
+            (
+                "/market-data/historical-candles",
+                {"connector_name": "unknown", "trading_pair": "BTC-USD", "interval": "1m"},
+            ),
+        )
+        responses = [client.post(path, json=body) for path, body in unknown_requests]
+
+        market_data_router.CandlesFactory._candles_map = {"generic": object()}
+        responses.extend(
+            [
+                client.post(
+                    "/market-data/candles",
+                    json={"connector_name": "generic", "trading_pair": "BTCUSD"},
+                ),
+                client.post(
+                    "/market-data/historical-candles",
+                    json={"connector_name": "generic", "trading_pair": "BTCUSD", "interval": "1m"},
+                ),
+                client.post(
+                    "/market-data/candles",
+                    json={"connector_name": "generic", "trading_pair": "BTC-USD"},
+                ),
+                client.post(
+                    "/market-data/historical-candles",
+                    json={"connector_name": "generic", "trading_pair": "BTC-USD", "interval": "1m"},
+                ),
+            ]
+        )
+        responses.append(
+            client.post(
+                "/market-data/funding-info",
+                json={"connector_name": "generic_perpetual", "trading_pair": "BTC-USD"},
+            )
+        )
+    finally:
+        market_data_router.CandlesFactory._candles_map = original_map
+
+    for response in responses:
+        CHECK.assertEqual(400, response.status_code, response.text)
+        CapabilityErrorResponse.model_validate(response.json())
+
+    schema = app.openapi()["paths"]
+    for path in (
+        "/market-data/candles",
+        "/market-data/historical-candles",
+        "/market-data/funding-info",
+    ):
+        CHECK.assertEqual(
+            "#/components/schemas/CapabilityErrorResponse",
+            schema[path]["post"]["responses"]["400"]["content"]["application/json"]["schema"]["$ref"],
+        )
+
+    class RulesService:
+        async def get_trading_rules(self, connector_name, trading_pairs):
+            return {
+                pair: (
+                    {"min_order_size": 0.001}
+                    if pair == "BTC-USD"
+                    else {"error": "missing"}
+                )
+                for pair in trading_pairs
+            }
+
+    rules_app = FastAPI()
+    rules_app.include_router(connectors_router.router)
+    rules_app.state.market_data_service = RulesService()
+    rules_client = TestClient(rules_app)
+    partial = rules_client.get(
+        "/connectors/generic/trading-rules",
+        params=(("trading_pairs", "BTC-USD"), ("trading_pairs", "ETH-USD")),
+    )
+    missing = rules_client.get(
+        "/connectors/generic/trading-rules",
+        params=(("trading_pairs", "ETH-USD"),),
+    )
+    CHECK.assertEqual(207, partial.status_code, partial.text)
+    TradingRulesPartialResponse.model_validate(partial.json())
+    CHECK.assertEqual(404, missing.status_code, missing.text)
+    TradingRulesNotFoundResponse.model_validate(missing.json())
+    rules_responses = rules_app.openapi()["paths"][
+        "/connectors/{connector_name}/trading-rules"
+    ]["get"]["responses"]
+    CHECK.assertEqual(
+        "#/components/schemas/TradingRulesPartialResponse",
+        rules_responses["207"]["content"]["application/json"]["schema"]["$ref"],
+    )
+    CHECK.assertEqual(
+        "#/components/schemas/TradingRulesNotFoundResponse",
+        rules_responses["404"]["content"]["application/json"]["schema"]["$ref"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_final_b4_cross_pair_failures_cannot_erase_successes():
+    from services.trading_service import AccountTradingInterface
+
+    class ReadyBook:
+        snapshot = ([1], [1])
+
+    tracker = TransactionTracker()
+    connector = TransactionConnector(tracker)
+    connector_service = TransactionConnectorService(connector)
+    a_started = asyncio.Event()
+
+    async def initialize_order_book(**kwargs):
+        pair = kwargs["trading_pair"]
+        connector._trading_pairs.append(pair)
+        tracker._trading_pairs.append(pair)
+        tracker.order_books[pair] = ReadyBook()
+        if pair == "A-USD":
+            a_started.set()
+            await asyncio.sleep(0.05)
+            return False
+        return True
+
+    interface = AccountTradingInterface(
+        connector_service,
+        types.SimpleNamespace(
+            initialize_order_book=initialize_order_book,
+            remove_trading_pair=lambda **kwargs: asyncio.sleep(0, result=True),
+        ),
+        "master",
+    )
+    failing = asyncio.create_task(interface.add_market("generic", "A-USD"))
+    await a_started.wait()
+    succeeding = asyncio.create_task(interface.add_market("generic", "B-USD"))
+    results = await asyncio.gather(failing, succeeding, return_exceptions=True)
+    CHECK.assertIsInstance(results[0], ValueError)
+    CHECK.assertIsNone(results[1])
+    CHECK.assertEqual({"generic": {"B-USD"}}, interface.markets)
+    CHECK.assertEqual(["B-USD"], connector._trading_pairs)
+    CHECK.assertEqual(["B-USD"], tracker._trading_pairs)
+    CHECK.assertEqual(["B-USD"], list(tracker.order_books))
+    CHECK.assertEqual({}, interface._market_locks)
+
+    # Both callers begin while the connector is absent. Connector-wide serialization
+    # makes A's owned rollback complete before B creates and commits its state.
+    absent_tracker = TransactionTracker()
+    absent_connector = TransactionConnector(absent_tracker)
+
+    class AbsentConnectorService:
+        def __init__(self):
+            self.loaded = False
+            self.stop_calls = 0
+
+        async def get_trading_connector(self, account_name, connector_name):
+            self.loaded = True
+            return absent_connector
+
+        def get_account_connectors(self, account_name):
+            return {"generic": absent_connector} if self.loaded else {}
+
+        async def stop_trading_connector(self, account_name, connector_name):
+            self.stop_calls += 1
+            self.loaded = False
+            absent_connector._trading_pairs.clear()
+            absent_tracker._trading_pairs.clear()
+            absent_tracker.order_books.clear()
+            return True
+
+    absent_service = AbsentConnectorService()
+    absent_a_started = asyncio.Event()
+
+    async def initialize_absent_order_book(**kwargs):
+        pair = kwargs["trading_pair"]
+        absent_connector._trading_pairs.append(pair)
+        absent_tracker._trading_pairs.append(pair)
+        absent_tracker.order_books[pair] = ReadyBook()
+        if pair == "A-USD":
+            absent_a_started.set()
+            await asyncio.sleep(0.05)
+            return False
+        return True
+
+    absent_interface = AccountTradingInterface(
+        absent_service,
+        types.SimpleNamespace(initialize_order_book=initialize_absent_order_book),
+        "master",
+    )
+    absent_failing = asyncio.create_task(absent_interface.add_market("generic", "A-USD"))
+    await absent_a_started.wait()
+    absent_succeeding = asyncio.create_task(absent_interface.add_market("generic", "B-USD"))
+    absent_results = await asyncio.gather(
+        absent_failing, absent_succeeding, return_exceptions=True
+    )
+    CHECK.assertIsInstance(absent_results[0], ValueError)
+    CHECK.assertIsNone(absent_results[1])
+    CHECK.assertEqual(1, absent_service.stop_calls)
+    CHECK.assertTrue(absent_service.loaded)
+    CHECK.assertEqual({"generic": {"B-USD"}}, absent_interface.markets)
+    CHECK.assertEqual(["B-USD"], absent_connector._trading_pairs)
+    CHECK.assertEqual(["B-USD"], absent_tracker._trading_pairs)
+    CHECK.assertEqual(["B-USD"], list(absent_tracker.order_books))
+    CHECK.assertEqual({}, absent_interface._market_locks)
+
+
+@pytest.mark.asyncio
+async def test_final_b5_cleanup_residuals_are_typed_observable_and_retryable():
+    from services.connector_capabilities import ConnectorCapabilityError
+    from services.trading_service import AccountTradingInterface
+
+    class ReadyBook:
+        snapshot = ([1], [1])
+
+    tracker = TransactionTracker()
+    connector = TransactionConnector(tracker)
+    connector_service = TransactionConnectorService(connector)
+    cleanup_mode = "false"
+    initialize_success = False
+    cleanup_attempts = []
+
+    async def initialize_order_book(**kwargs):
+        pair = kwargs["trading_pair"]
+        connector._trading_pairs.append(pair)
+        tracker._trading_pairs.append(pair)
+        tracker.order_books[pair] = ReadyBook()
+        return initialize_success
+
+    async def remove_trading_pair(**kwargs):
+        cleanup_attempts.append(cleanup_mode)
+        if cleanup_mode == "false":
+            return False
+        if cleanup_mode == "raise":
+            raise RuntimeError("cleanup failed")
+        if cleanup_mode == "cancel":
+            raise asyncio.CancelledError()
+        return True
+
+    market_data = types.SimpleNamespace(
+        initialize_order_book=initialize_order_book,
+        remove_trading_pair=remove_trading_pair,
+    )
+    interface = AccountTradingInterface(connector_service, market_data, "master")
+    for mode in ("false", "raise", "cancel"):
+        cleanup_mode = mode
+        with pytest.raises(ConnectorCapabilityError) as error:
+            await interface.add_market("generic", "BTC-USD")
+        CHECK.assertEqual("market_cleanup_residual", error.value.detail["code"])
+        CHECK.assertIn(("generic", "BTC-USD"), interface.cleanup_residuals)
+        CHECK.assertEqual([], connector._trading_pairs)
+        CHECK.assertEqual([], tracker._trading_pairs)
+        CHECK.assertEqual({}, tracker.order_books)
+
+    cleanup_mode = "success"
+    initialize_success = True
+    await interface.add_market("generic", "BTC-USD")
+    CHECK.assertEqual({}, interface.cleanup_residuals)
+    CHECK.assertEqual(["false", "raise", "cancel", "success"], cleanup_attempts)
+
+    cancel_tracker = TransactionTracker()
+    cancel_connector = TransactionConnector(cancel_tracker)
+    cancel_service = TransactionConnectorService(cancel_connector)
+    entered = asyncio.Event()
+
+    async def cancellable_initialize(**kwargs):
+        cancel_connector._trading_pairs.append("ETH-USD")
+        cancel_tracker._trading_pairs.append("ETH-USD")
+        cancel_tracker.order_books["ETH-USD"] = ReadyBook()
+        entered.set()
+        await asyncio.Event().wait()
+
+    cancel_interface = AccountTradingInterface(
+        cancel_service,
+        types.SimpleNamespace(
+            initialize_order_book=cancellable_initialize,
+            remove_trading_pair=lambda **kwargs: asyncio.sleep(0, result=False),
+        ),
+        "master",
+    )
+    task = asyncio.create_task(cancel_interface.add_market("generic", "ETH-USD"))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    CHECK.assertIn(("generic", "ETH-USD"), cancel_interface.cleanup_residuals)
+    CHECK.assertEqual([], cancel_connector._trading_pairs)
+    CHECK.assertEqual([], cancel_tracker._trading_pairs)
+    CHECK.assertEqual({}, cancel_tracker.order_books)
+
+
+def _load_unified_service_module():
+    from services.connector_capabilities import ConnectorCapabilityRegistry
+
+    config_crypt = _module("hummingbot.client.config.config_crypt")
+    config_crypt.ETHKeyFileSecretManger = type("ETHKeyFileSecretManger", (), {})
+    config_helpers = _module("hummingbot.client.config.config_helpers")
+    config_helpers.ClientConfigAdapter = type("ClientConfigAdapter", (), {})
+    config_helpers.api_keys_from_connector_config_map = lambda value: {}
+    config_helpers.get_connector_class = lambda name: object
+    metrics = _module("hummingbot.connector.connector_metrics_collector")
+    metrics.TradeVolumeMetricCollector = type("TradeVolumeMetricCollector", (), {})
+    exchange = _module("hummingbot.connector.exchange_py_base")
+    exchange.ExchangePyBase = type("ExchangePyBase", (), {})
+    gateway_package = _module("hummingbot.connector.gateway")
+    gateway_package.__path__ = []
+    gateway = _module("hummingbot.connector.gateway.gateway")
+    gateway.Gateway = type("Gateway", (), {})
+    perpetual = _module("hummingbot.connector.perpetual_derivative_py_base")
+    perpetual.PerpetualDerivativePyBase = type("PerpetualDerivativePyBase", (), {})
+    in_flight = _module("hummingbot.core.data_type.in_flight_order")
+    in_flight.InFlightOrder = type("InFlightOrder", (), {})
+    in_flight.OrderState = Enum("OrderState", "OPEN")
+    core_utils = _module("hummingbot.core.utils")
+    core_utils.__path__ = []
+    async_utils = _module("hummingbot.core.utils.async_utils")
+    async_utils.safe_ensure_future = asyncio.ensure_future
+    file_system = _module("utils.file_system")
+    file_system.fs_util = types.SimpleNamespace()
+    config_adapter = _module("utils.hummingbot_api_config_adapter")
+    config_adapter.HummingbotAPIConfigAdapter = type("HummingbotAPIConfigAdapter", (), {})
+    security = _module("utils.security")
+    security.BackendAPISecurity = type("BackendAPISecurity", (), {})
+
+    module_name = "issue222_final_unified_connector_service_under_test"
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        Path(__file__).resolve().parents[1] / "services" / "unified_connector_service.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module, ConnectorCapabilityRegistry
+
+
+@pytest.mark.asyncio
+async def test_final_b6_failed_connector_creation_restores_indices_and_drains_tasks():
+    module, ConnectorCapabilityRegistry = _load_unified_service_module()
+
+    class StopIndex:
+        def __init__(self):
+            self.stopped = False
+
+        async def stop(self):
+            self.stopped = True
+
+    class MetricIndex:
+        def __init__(self):
+            self.stopped = False
+
+        def stop(self):
+            self.stopped = True
+
+    blocker = asyncio.Event()
+    spawned = []
+
+    class Connector:
+        order_book_tracker = None
+        in_flight_orders = {}
+
+        async def _initialize_trading_pair_symbol_map(self):
+            return None
+
+        async def _update_trading_rules(self):
+            return None
+
+        async def _update_balances(self):
+            return None
+
+        async def stop_network(self):
+            return None
+
+    service = object.__new__(module.UnifiedConnectorService)
+    service._trading_connectors = {}
+    service._connector_locks = {}
+    service._connector_lock_users = {}
+    service._connector_locks_guard = asyncio.Lock()
+    service._orders_recorders = {}
+    service._funding_recorders = {}
+    service._metrics_collectors = {}
+    service._capability_registry = ConnectorCapabilityRegistry()
+    service.db_manager = None
+
+    connector = Connector()
+    service._create_trading_connector = lambda account, name: connector
+
+    def create_indices(connector_arg, account, name, cache_key):
+        service._orders_recorders[cache_key] = StopIndex()
+        service._funding_recorders[cache_key] = StopIndex()
+        service._metrics_collectors[cache_key] = MetricIndex()
+
+    service._initialize_metrics = create_indices
+
+    async def fail_after_task(connector_arg):
+        task = asyncio.create_task(blocker.wait())
+        connector_arg._user_stream_tracker_task = task
+        spawned.append(task)
+        raise RuntimeError("network start failed")
+
+    service._start_connector_network = fail_after_task
+    with pytest.raises(RuntimeError):
+        await service.get_trading_connector("acct", "generic")
+
+    CHECK.assertEqual({}, service._trading_connectors)
+    CHECK.assertEqual({}, service._connector_locks)
+    CHECK.assertEqual({}, service._orders_recorders)
+    CHECK.assertEqual({}, service._funding_recorders)
+    CHECK.assertEqual({}, service._metrics_collectors)
+    CHECK.assertEqual(1, len(spawned))
+    CHECK.assertTrue(spawned[0].done())
+    CHECK.assertIsNone(connector._user_stream_tracker_task)
+
+    # Cancellation preserves the caller's cancellation while restoring exact
+    # pre-existing per-key indices and draining a task spawned before cancellation.
+    cache_key = "acct:generic"
+    order_sentinel = object()
+    funding_sentinel = object()
+    metric_sentinel = object()
+    service._orders_recorders[cache_key] = order_sentinel
+    service._funding_recorders[cache_key] = funding_sentinel
+    service._metrics_collectors[cache_key] = metric_sentinel
+    connector = Connector()
+    service._create_trading_connector = lambda account, name: connector
+    replacement_indices = []
+
+    def create_replacement_indices(connector_arg, account, name, key):
+        orders = StopIndex()
+        funding = StopIndex()
+        metrics = MetricIndex()
+        replacement_indices.extend((orders, funding, metrics))
+        service._orders_recorders[key] = orders
+        service._funding_recorders[key] = funding
+        service._metrics_collectors[key] = metrics
+
+    service._initialize_metrics = create_replacement_indices
+    entered = asyncio.Event()
+    cancelled_spawned = []
+
+    async def wait_after_task(connector_arg):
+        task = asyncio.create_task(blocker.wait())
+        connector_arg._user_stream_tracker_task = task
+        cancelled_spawned.append(task)
+        entered.set()
+        await asyncio.Event().wait()
+
+    service._start_connector_network = wait_after_task
+    creation = asyncio.create_task(service.get_trading_connector("acct", "generic"))
+    await entered.wait()
+    creation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await creation
+    CHECK.assertEqual({}, service._trading_connectors)
+    CHECK.assertEqual({}, service._connector_locks)
+    CHECK.assertIs(order_sentinel, service._orders_recorders[cache_key])
+    CHECK.assertIs(funding_sentinel, service._funding_recorders[cache_key])
+    CHECK.assertIs(metric_sentinel, service._metrics_collectors[cache_key])
+    CHECK.assertTrue(all(index.stopped for index in replacement_indices))
+    CHECK.assertEqual(1, len(cancelled_spawned))
+    CHECK.assertTrue(cancelled_spawned[0].done())
+    CHECK.assertIsNone(connector._user_stream_tracker_task)
+
+    # Even a constructor seam that mutates the account map and spawns a task
+    # before raising is owned by this creation transaction and is removed.
+    partial_connector = Connector()
+    partial_spawned = []
+
+    def partially_mutating_create(account, name):
+        service._trading_connectors.setdefault(account, {})[name] = partial_connector
+        task = asyncio.create_task(blocker.wait())
+        partial_connector._user_stream_tracker_task = task
+        partial_spawned.append(task)
+        raise RuntimeError("partial constructor failure")
+
+    service._create_trading_connector = partially_mutating_create
+    with pytest.raises(RuntimeError, match="partial constructor failure"):
+        await service.get_trading_connector("partial", "generic")
+    CHECK.assertNotIn("partial", service._trading_connectors)
+    CHECK.assertEqual({}, service._connector_locks)
+    CHECK.assertEqual(1, len(partial_spawned))
+    CHECK.assertTrue(partial_spawned[0].done())
+    CHECK.assertIsNone(partial_connector._user_stream_tracker_task)
+
+    # A failed public network stop is an explicit residual command. A retry is
+    # rejected before constructing again, and an empty later stop cannot invent success.
+    class UncleanConnector(Connector):
+        async def stop_network(self):
+            return False
+
+    unclean_connector = UncleanConnector()
+    constructor_calls = 0
+
+    def create_unclean(account, name):
+        nonlocal constructor_calls
+        constructor_calls += 1
+        return unclean_connector
+
+    service._create_trading_connector = create_unclean
+    service._initialize_metrics = lambda *args: None
+
+    async def fail_unclean_start(connector_arg):
+        raise RuntimeError("unclean start failure")
+
+    service._start_connector_network = fail_unclean_start
+    with pytest.raises(module.ConnectorCapabilityError) as cleanup_residual:
+        await service.get_trading_connector("dirty", "generic")
+    CHECK.assertEqual(
+        "connector_creation_cleanup_residual",
+        cleanup_residual.value.detail["code"],
+    )
+    CHECK.assertIn("dirty:generic", service.connector_creation_residuals)
+    with pytest.raises(module.ConnectorCapabilityError):
+        await service.get_trading_connector("dirty", "generic")
+    CHECK.assertEqual(1, constructor_calls)
+    with pytest.raises(module.ConnectorCapabilityError):
+        await service.stop_trading_connector("dirty", "generic")
+    CHECK.assertIn("dirty:generic", service.connector_creation_residuals)
+
+
+@pytest.mark.asyncio
+async def test_final_b7_stale_pair_marker_rejects_before_remote_work():
+    from services.connector_capabilities import ConnectorCapabilityError
+    from services.trading_service import AccountTradingInterface
+
+    tracker = TransactionTracker("BTC-USD")
+    connector = TransactionConnector(tracker, "BTC-USD")
+    connector_service = TransactionConnectorService(connector)
+    initialize_calls = 0
+    cleanup_calls = 0
+
+    async def initialize_order_book(**kwargs):
+        nonlocal initialize_calls
+        initialize_calls += 1
+        return False
+
+    async def remove_trading_pair(**kwargs):
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        return True
+
+    interface = AccountTradingInterface(
+        connector_service,
+        types.SimpleNamespace(
+            initialize_order_book=initialize_order_book,
+            remove_trading_pair=remove_trading_pair,
+        ),
+        "master",
+    )
+    interface._markets = {"generic": {"BTC-USD"}}
+    with pytest.raises(ConnectorCapabilityError) as error:
+        await interface.add_market("generic", "BTC-USD")
+    CHECK.assertEqual("ambiguous_market_state", error.value.detail["code"])
+    CHECK.assertEqual(0, initialize_calls)
+    CHECK.assertEqual(0, cleanup_calls)
+    CHECK.assertEqual(["BTC-USD"], connector._trading_pairs)
+    CHECK.assertEqual(["BTC-USD"], tracker._trading_pairs)
+
+
+def test_final_b8_fixture_restores_preexisting_module_dicts():
+    selected = ("deps", "models", "services")
+    original_modules = {name: sys.modules.get(name) for name in selected}
+    sentinels = {}
+    before_dicts = {}
+    try:
+        for name in selected:
+            module = types.ModuleType(name)
+            module.__path__ = [str(Path(__file__).resolve().parents[1] / name)] if name != "deps" else []
+            sentinel = object()
+            module.preloaded_sentinel = sentinel
+            if name == "deps":
+                module.get_accounts_service = sentinel
+            sentinels[name] = module
+            before_dicts[name] = dict(module.__dict__)
+            sys.modules[name] = module
+
+        request = types.SimpleNamespace(node=types.SimpleNamespace(name="manual-fixture-check"))
+        fixture = _scoped_import_contract.__wrapped__(request)
+        next(fixture)
+        CHECK.assertIsNot(sentinels["deps"].get_accounts_service, before_dicts["deps"]["get_accounts_service"])
+        with pytest.raises(StopIteration):
+            next(fixture)
+
+        for name in selected:
+            CHECK.assertIs(sentinels[name], sys.modules[name])
+            CHECK.assertEqual(set(before_dicts[name]), set(sentinels[name].__dict__))
+            for key, value in before_dicts[name].items():
+                CHECK.assertIs(value, sentinels[name].__dict__[key], (name, key))
+        polluted = [
+            name
+            for name, module in sys.modules.items()
+            if getattr(module, "__issue222_contract_shim__", False)
+        ]
+        CHECK.assertEqual([], polluted)
+        tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+        CHECK.assertEqual([], [node.lineno for node in ast.walk(tree) if isinstance(node, ast.Assert)])
+    finally:
+        for name, module in original_modules.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
     tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
     bare_asserts = [node.lineno for node in ast.walk(tree) if isinstance(node, ast.Assert)]
     CHECK.assertEqual([], bare_asserts)

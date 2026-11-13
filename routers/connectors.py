@@ -15,6 +15,7 @@ from models.connectors import (
     TradingRulesPartialResponse,
 )
 from services.accounts_service import AccountsService
+from services.connector_capabilities import ConnectorFeature
 from services.market_data_service import MarketDataService
 
 router = APIRouter(tags=["Connectors"], prefix="/connectors")
@@ -160,7 +161,10 @@ async def get_trading_rules(
         raise HTTPException(status_code=500, detail=f"Error retrieving trading rules: {str(e)}")
 
 
-@router.get("/{connector_name}/order-types")
+@router.get(
+    "/{connector_name}/order-types",
+    responses={400: {"model": CapabilityErrorResponse}},
+)
 async def get_supported_order_types(request: Request, connector_name: str):
     """
     Get order types supported by a specific connector.
@@ -180,11 +184,15 @@ async def get_supported_order_types(request: Request, connector_name: str):
     """
     try:
         market_data_service: MarketDataService = request.app.state.market_data_service
+        connector_service = market_data_service.connector_service
+        connector_service.require_capability(
+            connector_name, ConnectorFeature.ORDER_SUBMISSION
+        )
 
         # Access connector through UnifiedConnectorService
         # This creates a data connector if it doesn't exist
         try:
-            connector_instance = market_data_service.connector_service.get_data_connector(connector_name)
+            connector_instance = connector_service.get_data_connector(connector_name)
         except (KeyError, ValueError) as e:
             raise HTTPException(status_code=404, detail=f"Connector '{connector_name}' not found: {str(e)}")
 

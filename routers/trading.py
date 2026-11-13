@@ -31,6 +31,33 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Trading"], prefix="/trading")
 
 
+def _raise_nonperpetual_capability(connector_name: str) -> None:
+    raise ConnectorCapabilityError(
+        CapabilityErrorDetail(
+            code="unsupported_connector_feature",
+            message=(
+                f"Connector '{connector_name}' does not support feature "
+                f"'{ConnectorFeature.PERPETUAL.value}'"
+            ),
+            connector=connector_name,
+            feature=ConnectorFeature.PERPETUAL.value,
+        )
+    )
+
+
+def _reject_declared_nonperpetual_connectors(filter_request, connector_service) -> None:
+    """Reject declared spot connectors before reading the live connector map."""
+    get_capabilities = getattr(connector_service, "get_connector_capabilities", None)
+    if not filter_request.connector_names or get_capabilities is None:
+        return
+    for connector_name in filter_request.connector_names:
+        capabilities = get_capabilities(connector_name)
+        if capabilities.declared and not connector_service.connector_supports_perpetual(
+            connector_name
+        ):
+            _raise_nonperpetual_capability(connector_name)
+
+
 def _reject_explicit_nonperpetual_connectors(
     filter_request,
     all_connectors: Dict,
@@ -63,16 +90,16 @@ def _reject_explicit_nonperpetual_connectors(
         if not connector_service.connector_supports_perpetual(
             connector_name, connector
         ):
-            raise ConnectorCapabilityError(
-                CapabilityErrorDetail(
-                    code="unsupported_connector_feature",
-                    message=(
-                        f"Connector '{connector_name}' does not support feature "
-                        f"'{ConnectorFeature.PERPETUAL.value}'"
-                    ),
-                    connector=connector_name,
-                    feature=ConnectorFeature.PERPETUAL.value,
-                )
+            _raise_nonperpetual_capability(connector_name)
+
+
+def _require_named_capability(filter_request, connector_service, feature) -> None:
+    """Gate explicitly named live connector reads before connector-map lookup."""
+    for connector_name in filter_request.connector_names or ():
+        trading_pairs = getattr(filter_request, "trading_pairs", None) or (None,)
+        for trading_pair in trading_pairs:
+            connector_service.require_capability(
+                connector_name, feature, trading_pair
             )
 
 
@@ -139,7 +166,10 @@ async def place_trade(
         raise HTTPException(status_code=500, detail=f"Unexpected error placing trade: {str(e)}")
 
 
-@router.post("/{account_name}/{connector_name}/orders/{client_order_id}/cancel")
+@router.post(
+    "/{account_name}/{connector_name}/orders/{client_order_id}/cancel",
+    responses={400: {"model": CapabilityErrorResponse}},
+)
 async def cancel_order(
     account_name: str,
     connector_name: str,
@@ -163,6 +193,9 @@ async def cancel_order(
         HTTPException: 404 if account/connector not found, 500 for cancellation errors
     """
     try:
+        accounts_service.require_capability(
+            connector_name, ConnectorFeature.ORDER_SUBMISSION
+        )
         cancelled_order_id = await accounts_service.cancel_order(
             account_name=account_name, connector_name=connector_name, client_order_id=client_order_id
         )
@@ -200,6 +233,7 @@ async def get_positions(
     """
     try:
         all_positions = []
+        _reject_declared_nonperpetual_connectors(filter_request, connector_service)
         all_connectors = connector_service.get_all_trading_connectors()
         _reject_explicit_nonperpetual_connectors(
             filter_request, all_connectors, connector_service
@@ -242,7 +276,11 @@ async def get_positions(
 
 
 # Active Orders Management - Real-time from connectors
-@router.post("/orders/active", response_model=PaginatedResponse)
+@router.post(
+    "/orders/active",
+    response_model=PaginatedResponse,
+    responses={400: {"model": CapabilityErrorResponse}},
+)
 async def get_active_orders(
     filter_request: ActiveOrderFilterRequest,
     connector_service = Depends(get_connector_service)
@@ -264,6 +302,9 @@ async def get_active_orders(
     """
     try:
         all_active_orders = []
+        _require_named_capability(
+            filter_request, connector_service, ConnectorFeature.ORDER_SUBMISSION
+        )
         all_connectors = connector_service.get_all_trading_connectors()
 
         # Use filter request values
@@ -304,6 +345,8 @@ async def get_active_orders(
         # Sort by cursor_id and apply cursor-based pagination
         return paginate_by_cursor(all_active_orders, filter_request.cursor, filter_request.limit)
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching active orders: {str(e)}")
 
@@ -588,6 +631,7 @@ async def get_funding_payments(
     """
     try:
         all_funding_payments = []
+        _reject_declared_nonperpetual_connectors(filter_request, connector_service)
         all_connectors = connector_service.get_all_trading_connectors()
         _reject_explicit_nonperpetual_connectors(
             filter_request, all_connectors, connector_service

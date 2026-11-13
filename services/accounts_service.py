@@ -1049,6 +1049,7 @@ class AccountsService:
         Raises:
             HTTPException: 404 if order not found, 500 if cancellation fails
         """
+        self.require_capability(connector_name, ConnectorFeature.ORDER_SUBMISSION)
         connector = await self.get_connector_instance(account_name, connector_name)
         
         # Check if order exists in in-flight orders

@@ -1,7 +1,21 @@
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, BeforeValidator, Field
+
+
+def _reject_boolean_number(value):
+    """Reject JSON booleans before Pydantic can coerce them to 1.0/0.0."""
+    if isinstance(value, bool):
+        raise ValueError("boolean values are not valid numeric inputs")
+    return value
+
+
+FinitePositiveFloat = Annotated[
+    float,
+    BeforeValidator(_reject_boolean_number),
+    Field(gt=0, allow_inf_nan=False),
+]
 
 
 class CandleData(BaseModel):
@@ -131,27 +145,27 @@ class OrderBookQueryRequest(BaseModel):
 
 class VolumeForPriceRequest(OrderBookQueryRequest):
     """Request model for getting volume at a specific price"""
-    price: float = Field(gt=0, allow_inf_nan=False, description="Price to query volume for")
+    price: FinitePositiveFloat = Field(description="Price to query volume for")
 
 
 class PriceForVolumeRequest(OrderBookQueryRequest):
     """Request model for getting price for a specific volume"""
-    volume: float = Field(gt=0, allow_inf_nan=False, description="Volume to query price for")
+    volume: FinitePositiveFloat = Field(description="Volume to query price for")
 
 
 class QuoteVolumeForPriceRequest(OrderBookQueryRequest):
     """Request model for getting quote volume at a specific price"""
-    price: float = Field(gt=0, allow_inf_nan=False, description="Price to query quote volume for")
+    price: FinitePositiveFloat = Field(description="Price to query quote volume for")
 
 
 class PriceForQuoteVolumeRequest(OrderBookQueryRequest):
     """Request model for getting price for a specific quote volume"""
-    quote_volume: float = Field(gt=0, allow_inf_nan=False, description="Quote volume to query price for")
+    quote_volume: FinitePositiveFloat = Field(description="Quote volume to query price for")
 
 
 class VWAPForVolumeRequest(OrderBookQueryRequest):
     """Request model for getting VWAP for a specific volume"""
-    volume: float = Field(gt=0, allow_inf_nan=False, description="Volume to calculate VWAP for")
+    volume: FinitePositiveFloat = Field(description="Volume to calculate VWAP for")
 
 
 class OrderBookQueryResult(BaseModel):
