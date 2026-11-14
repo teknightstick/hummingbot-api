@@ -79,7 +79,7 @@ class ConnectorCapabilityRegistry:
                     capabilities, source="bootstrap"
                 )
             except Exception:
-                self._raise_mismatch(connector_name)
+                self.raise_mismatch(connector_name)
         self._bootstrap_declarations = MappingProxyType(normalized)
 
     @staticmethod
@@ -129,7 +129,8 @@ class ConnectorCapabilityRegistry:
         )
 
     @staticmethod
-    def _raise_mismatch(connector_name: str) -> None:
+    def raise_mismatch(connector_name: str) -> None:
+        """Raise the stable public error for incompatible capability truth."""
         raise ConnectorCapabilityError(
             CapabilityErrorDetail(
                 code="connector_capability_mismatch",
@@ -154,7 +155,7 @@ class ConnectorCapabilityRegistry:
         except ConnectorCapabilityError:
             raise
         except Exception:
-            self._raise_mismatch(connector_name)
+            self.raise_mismatch(connector_name)
 
     def get(self, connector_name: str, connector: Any = None) -> ConnectorCapabilities:
         bootstrap = self._bootstrap_declarations.get(connector_name)
@@ -167,7 +168,7 @@ class ConnectorCapabilityRegistry:
                 if instance is None or not self._semantically_compatible(
                     bootstrap, instance
                 ):
-                    self._raise_mismatch(connector_name)
+                    self.raise_mismatch(connector_name)
                 return instance
             if instance is not None:
                 return instance
@@ -175,7 +176,7 @@ class ConnectorCapabilityRegistry:
         except ConnectorCapabilityError:
             raise
         except Exception:
-            self._raise_mismatch(connector_name)
+            self.raise_mismatch(connector_name)
 
     def instance_only_features(
         self,
@@ -193,7 +194,7 @@ class ConnectorCapabilityRegistry:
         except ConnectorCapabilityError:
             raise
         except Exception:
-            self._raise_mismatch(connector_name)
+            self.raise_mismatch(connector_name)
 
     def validate_instance(
         self,
@@ -211,12 +212,12 @@ class ConnectorCapabilityRegistry:
             if not instance_only_features.issubset(
                 validated_features or frozenset()
             ):
-                self._raise_mismatch(connector_name)
+                self.raise_mismatch(connector_name)
             return instance
         except ConnectorCapabilityError:
             raise
         except Exception:
-            self._raise_mismatch(connector_name)
+            self.raise_mismatch(connector_name)
 
     def require_resolved(
         self,

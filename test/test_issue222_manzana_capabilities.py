@@ -7530,6 +7530,256 @@ async def test_issue224_trading_discard_preserves_other_private_residuals():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("restart_stop_outcome", ["false", "raise", "pending"])
+async def test_issue224_data_discard_reconciles_restart_before_one_successor(
+    restart_stop_outcome,
+):
+    module, service, old_connector, tracker = _issue224_repair_service()
+    release_stop = asyncio.Event()
+    stop_cancelled = asyncio.Event()
+    tracker.stop_calls = 0
+
+    if restart_stop_outcome == "pending":
+
+        async def stop():
+            tracker.stop_calls += 1
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                stop_cancelled.set()
+                await release_stop.wait()
+
+    else:
+
+        def stop():
+            tracker.stop_calls += 1
+            if restart_stop_outcome == "raise":
+                raise RuntimeError("PRIVATE-RESTART-STOP-SECRET")
+            return False
+
+    tracker.stop = stop
+    restart = await service.restart_order_book_tracker("manzana")
+    restart_owner = ("__data__", "manzana", "restart")
+    public_owner = ("__data__", "manzana", "public_transaction")
+    connector_key = ("__data__", "manzana")
+    expected_error = (
+        "tracker_cleanup_pending"
+        if restart_stop_outcome == "pending"
+        else "tracker_stop_failed"
+    )
+    CHECK.assertEqual(expected_error, restart["error"])
+    CHECK.assertIn(restart_owner, service._connector_cleanup_owners)
+    CHECK.assertEqual(1, tracker.stop_calls)
+
+    successor = Issue224RepairConnector()
+    factory_calls = 0
+
+    def create_successor(connector_name):
+        nonlocal factory_calls
+        factory_calls += 1
+        service._data_connectors_started[connector_name] = True
+        return successor
+
+    async def replace_old_pairs_or_publish_successor(connector, trading_pair):
+        if connector is old_connector:
+            connector._trading_pairs = ["POISON-USD"]
+            return False
+        connector._trading_pairs.append(trading_pair)
+        connector.order_book_tracker._trading_pairs.append(trading_pair)
+        connector.order_book_tracker.order_books[trading_pair] = Issue224RepairBook()
+        return True
+
+    service._create_data_connector = create_successor
+    service._add_trading_pair_to_tracker = replace_old_pairs_or_publish_successor
+    service._wait_for_order_book = lambda *args: asyncio.sleep(0, result=True)
+
+    if restart_stop_outcome == "pending":
+        with pytest.raises(module.ConnectorCapabilityError) as first_blocked:
+            await service.initialize_order_book("manzana", "BTC-USD", timeout=0)
+        await stop_cancelled.wait()
+        CHECK.assertEqual(
+            "connector_cleanup_residual", first_blocked.value.detail["code"]
+        )
+        CHECK.assertEqual(
+            "restart_cleanup_incomplete",
+            first_blocked.value.detail["cleanup_code"],
+        )
+        CHECK.assertIs(old_connector, service._data_connectors["manzana"])
+        CHECK.assertEqual(0, old_connector.stop_calls)
+        CHECK.assertIn(restart_owner, service._connector_cleanup_owners)
+        CHECK.assertIn(public_owner, service._connector_cleanup_owners)
+        CHECK.assertIn(connector_key, service._connector_creation_residuals)
+
+        with pytest.raises(module.ConnectorCapabilityError):
+            await service.initialize_order_book("manzana", "BTC-USD", timeout=0)
+        CHECK.assertEqual(0, factory_calls)
+        CHECK.assertEqual(1, tracker.stop_calls)
+
+        restart_stop_task = service._connector_cleanup_phases[restart_owner][
+            "restart_stop"
+        ]["task"]
+        release_stop.set()
+        await restart_stop_task
+    else:
+        CHECK.assertIs(
+            await service.initialize_order_book("manzana", "BTC-USD", timeout=0),
+            False,
+        )
+        CHECK.assertEqual(1, old_connector.stop_calls)
+        CHECK.assertNotIn(restart_owner, service._connector_cleanup_owners)
+        CHECK.assertNotIn(public_owner, service._connector_cleanup_owners)
+        CHECK.assertNotIn(connector_key, service._connector_creation_residuals)
+        await service._retry_public_transaction_cleanup(connector_key)
+        CHECK.assertEqual(1, old_connector.stop_calls)
+        CHECK.assertEqual(0, factory_calls)
+
+    CHECK.assertIs(
+        await service.initialize_order_book("manzana", "BTC-USD", timeout=0),
+        True,
+    )
+    CHECK.assertIs(successor, service._data_connectors["manzana"])
+    CHECK.assertEqual(1, old_connector.stop_calls)
+    CHECK.assertEqual(1, tracker.stop_calls)
+    CHECK.assertEqual(1, factory_calls)
+    CHECK.assertEqual({}, service._connector_creation_residuals)
+    CHECK.assertEqual({}, service._connector_cleanup_owners)
+    CHECK.assertEqual({}, service._connector_residual_tasks)
+    CHECK.assertEqual({}, service._connector_cleanup_phases)
+
+    CHECK.assertIs(
+        await service.initialize_order_book("manzana", "BTC-USD", timeout=0),
+        True,
+    )
+    CHECK.assertEqual(1, factory_calls)
+
+
+@pytest.mark.parametrize("private_state", ["owner", "phase", "residual"])
+def test_issue224_data_factory_rejects_old_generation_private_state(private_state):
+    module, service, old_connector, _ = _issue224_repair_service()
+    connector_key = ("__data__", "manzana")
+    owner_key = ("__data__", "manzana", "data_network")
+    service._data_connectors = {}
+    service._data_connectors_started = {}
+
+    if private_state == "owner":
+        service._connector_cleanup_owners[owner_key] = old_connector
+    elif private_state == "phase":
+        service._connector_cleanup_phases[owner_key] = {
+            "connector_stop": {
+                "task": None,
+                "complete": False,
+                "result": None,
+                "error_code": None,
+                "cancel_requested": False,
+            }
+        }
+    else:
+        service._connector_creation_residuals[connector_key] = {
+            "code": "connector_cleanup_residual",
+            "message": "Connector cleanup is incomplete",
+            "connector": "manzana",
+            "feature": "connector_cleanup",
+            "reason": "cleanup_incomplete",
+            "cleanup_scope": "connector",
+            "cleanup_code": "owner_cleanup_incomplete",
+        }
+
+    factory_calls = 0
+
+    def create_successor(connector_name):
+        nonlocal factory_calls
+        factory_calls += 1
+        return Issue224RepairConnector()
+
+    service._create_data_connector = create_successor
+    with pytest.raises(module.ConnectorCapabilityError) as blocked:
+        service.get_data_connector("manzana")
+
+    CHECK.assertEqual("connector_cleanup_residual", blocked.value.detail["code"])
+    CHECK.assertEqual(0, factory_calls)
+    CHECK.assertEqual({}, service._data_connectors)
+    CHECK.assertIn(connector_key, service._connector_creation_residuals)
+
+
+@pytest.mark.asyncio
+async def test_issue224_invalid_data_declaration_reconciles_restart_owner():
+    module, service, connector, tracker = _issue224_repair_service()
+    tracker.stop_calls = 0
+
+    def stop():
+        tracker.stop_calls += 1
+        return False
+
+    tracker.stop = stop
+    restart = await service.restart_order_book_tracker("manzana")
+    restart_owner = ("__data__", "manzana", "restart")
+    CHECK.assertEqual("tracker_stop_failed", restart["error"])
+    CHECK.assertIn(restart_owner, service._connector_cleanup_owners)
+
+    declaration = _shift_successor_capabilities()
+    declaration["features"] = set(declaration["features"]) - {
+        module.ConnectorFeature.LIVE_ORDER_BOOK
+    }
+    connector.api_capabilities = declaration
+
+    with pytest.raises(module.ConnectorCapabilityError) as mismatch:
+        await service.initialize_order_book("manzana", "BTC-USD", timeout=0)
+
+    CHECK.assertEqual("connector_capability_mismatch", mismatch.value.detail["code"])
+    CHECK.assertEqual(1, tracker.stop_calls)
+    CHECK.assertEqual(1, connector.stop_calls)
+    CHECK.assertEqual({}, service._data_connectors)
+    CHECK.assertEqual({}, service._data_connectors_started)
+    CHECK.assertNotIn(restart_owner, service._connector_cleanup_owners)
+    CHECK.assertEqual({}, service._connector_creation_residuals)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_path", ["add", "fallback"])
+async def test_issue224_dynamic_subscription_logs_stable_code_without_secret(
+    caplog, failure_path
+):
+    _, service, connector, tracker = _issue224_repair_service()
+    secret = "PRIVATE-DYNAMIC-SUBSCRIPTION-SECRET"
+    keep_running = asyncio.Event()
+    listener = asyncio.create_task(keep_running.wait())
+    tracker._order_book_stream_listener_task = listener
+    tracker._init_order_books_task = None
+    tracker.ready = True
+
+    async def add_trading_pair(trading_pair):
+        if failure_path == "add":
+            raise RuntimeError(secret)
+        return False
+
+    class DataSource:
+        async def get_new_order_book(self, trading_pair):
+            raise RuntimeError(secret)
+
+    connector.add_trading_pair = add_trading_pair
+    connector._orderbook_ds = DataSource()
+    caplog.set_level("ERROR")
+
+    try:
+        CHECK.assertIs(
+            await service._add_trading_pair_to_tracker(connector, "BTC-USD"),
+            False,
+        )
+        records = [
+            record
+            for record in caplog.records
+            if "dynamic_subscription" in record.getMessage()
+        ]
+        CHECK.assertEqual(1, len(records))
+        CHECK.assertIn("RuntimeError", records[0].getMessage())
+        CHECK.assertNotIn(secret, records[0].getMessage())
+        CHECK.assertIsNone(records[0].exc_info)
+    finally:
+        listener.cancel()
+        await asyncio.gather(listener, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_issue224_revoked_task_token_cannot_retain_or_mutate_old_snapshot():
     import gc
     import weakref

@@ -215,7 +215,7 @@ class UnifiedConnectorService:
                     for member_name in member_names
                 )
             except Exception:
-                self._capability_registry._raise_mismatch(connector_name)
+                self._capability_registry.raise_mismatch(connector_name)
             if chain_is_callable:
                 validated_features.add(feature)
         return self._capability_registry.validate_instance(
@@ -518,6 +518,28 @@ class UnifiedConnectorService:
             Non-authenticated connector instance
         """
         if connector_name not in self._data_connectors:
+            self._ensure_connector_cleanup_state()
+            connector_key = self._connector_key("__data__", connector_name)
+            residual = self._connector_creation_residuals.get(connector_key)
+            if residual is None and self._connector_has_private_state(connector_key):
+                detail = CapabilityErrorDetail(
+                    code="connector_cleanup_residual",
+                    message=(
+                        f"Connector cleanup is incomplete for "
+                        f"'__data__:{connector_name}'"
+                    ),
+                    connector=connector_name,
+                    feature="connector_cleanup",
+                    reason="cleanup_incomplete",
+                    cleanup_scope="connector",
+                    cleanup_code="owner_cleanup_incomplete",
+                )
+                residual = detail.model_dump(exclude_none=True)
+                self._connector_creation_residuals[connector_key] = residual
+            if residual is not None:
+                raise ConnectorCapabilityError(
+                    CapabilityErrorDetail.model_validate(residual)
+                )
             connector = self._create_data_connector(connector_name)
             self._validate_instance_capabilities(connector_name, connector)
             self._data_connectors[connector_name] = connector
@@ -808,7 +830,6 @@ class UnifiedConnectorService:
             "claimed_task_slots": set(),
             "task_slot_ledgers": {},
             "provenance_tasks": set(),
-            "owned_declaration_deltas": [],
             "owned_started_delta": None,
             "owned_cache_delta": owned_cache_delta,
             "unsafe_mutation": False,
@@ -1362,7 +1383,6 @@ class UnifiedConnectorService:
                 "owned_pair_deltas",
                 "owned_book_deltas",
                 "owned_task_deltas",
-                "owned_declaration_deltas",
             )
         ) or any(
             snapshot[name] is not None
@@ -1448,33 +1468,7 @@ class UnifiedConnectorService:
     def _restore_public_transaction_state(
         self, snapshot: Mapping[str, Any]
     ) -> bool:
-        connector = snapshot["connector"]
         restored = True
-        for delta in reversed(snapshot["owned_declaration_deltas"]):
-            try:
-                current = getattr(connector, "api_capabilities")
-                before_value = delta["before_value"]
-                after_value = delta["after_value"]
-                if before_value is after_value and current is after_value:
-                    if not isinstance(current, dict):
-                        restored = False
-                        continue
-                    before_contents = delta["before_contents"]
-                    after_contents = delta["after_contents"]
-                    for key in set(before_contents) | set(after_contents):
-                        after_present = key in after_contents
-                        current_present = key in current
-                        if current_present != after_present:
-                            continue
-                        if after_present and current[key] != after_contents[key]:
-                            continue
-                        if key in before_contents:
-                            current[key] = copy.deepcopy(before_contents[key])
-                        else:
-                            current.pop(key, None)
-            except BaseException:
-                restored = False
-
         for delta in reversed(snapshot["owned_task_deltas"]):
             try:
                 owner = delta["owner"]
@@ -1609,6 +1603,25 @@ class UnifiedConnectorService:
         )
         return ConnectorCapabilityError(detail)
 
+    @staticmethod
+    def _rejected_capability_cleanup_detail(
+        connector_name: str,
+        cleanup_code: str,
+    ) -> CapabilityErrorDetail:
+        """Keep the stable rejected-capability residual at its public boundary."""
+        return CapabilityErrorDetail(
+            code="connector_capability_cleanup_residual",
+            message=(
+                f"Rejected capability cleanup is incomplete for "
+                f"'{connector_name}'"
+            ),
+            connector=connector_name,
+            feature="capabilities",
+            reason="cleanup_incomplete",
+            cleanup_scope="connector",
+            cleanup_code=cleanup_code,
+        )
+
     async def _discard_public_transaction_connector(
         self,
         owner_key: Tuple[str, str, str],
@@ -1617,38 +1630,39 @@ class UnifiedConnectorService:
         """Let the exact rejected connector own shutdown, then unpublish it."""
         connector = snapshot["connector"]
         account_name, connector_name = snapshot["connector_key"]
-        if account_name != "__data__":
-            if self._public_connector_is_owned(snapshot):
+        if self._public_connector_is_owned(snapshot):
+            if account_name == "__data__":
+                detail = await self._finalize_stop_data_connector(
+                    connector_name,
+                    invoking_owner_key=owner_key,
+                )
+            else:
                 detail = await self._finalize_stop_trading_connector(
                     account_name,
                     connector_name,
                     invoking_owner_key=owner_key,
                 )
-                if detail is not None:
-                    raise ConnectorCapabilityError(detail)
-            else:
-                stop_network = getattr(connector, "stop_network", None)
-                if stop_network is None:
-                    raise RuntimeError("connector_stop_unavailable")
-                await self._run_owner_operation(
-                    owner_key, "discard_stop", stop_network
-                )
+            if detail is not None:
+                if (
+                    account_name == "__data__"
+                    and detail.cleanup_code == "connector_cleanup_incomplete"
+                ):
+                    detail = self._rejected_capability_cleanup_detail(
+                        connector_name,
+                        "connector_stop_failed",
+                    )
+                    self._connector_creation_residuals[
+                        snapshot["connector_key"]
+                    ] = detail.model_dump(exclude_none=True)
+                raise ConnectorCapabilityError(detail)
             return
 
         stop_network = getattr(connector, "stop_network", None)
         if stop_network is None:
             raise RuntimeError("connector_stop_unavailable")
-        unpublished_owned = self._data_connectors.get(connector_name) is connector
-        if unpublished_owned:
-            self._data_connectors.pop(connector_name, None)
-            self._data_connectors_started.pop(connector_name, None)
         await self._run_owner_operation(
             owner_key, "discard_stop", stop_network
         )
-        if unpublished_owned and self._connector_incarnation(
-            snapshot["connector_key"]
-        ) == snapshot["incarnation"]:
-            self._prune_connector_incarnation(snapshot["connector_key"])
 
     async def _complete_public_transaction_disposition(
         self, owner_key: Tuple[str, str, str]
@@ -2025,36 +2039,20 @@ class UnifiedConnectorService:
         connector_key = snapshot["connector_key"]
         account_name, _ = connector_key
         if account_name == "__data__":
-            self._data_connectors.pop(connector_name, None)
-            self._data_connectors_started.pop(connector_name, None)
-            try:
-                await self._stop_data_connector_network(connector, connector_name)
-            except asyncio.CancelledError:
-                raise
-            except BaseException:
-                detail = CapabilityErrorDetail(
-                    code="connector_capability_cleanup_residual",
-                    message=(
-                        f"Rejected capability cleanup is incomplete for "
-                        f"'{connector_name}'"
-                    ),
-                    connector=connector_name,
-                    feature="capabilities",
-                    reason="cleanup_incomplete",
-                    cleanup_scope="connector",
-                    cleanup_code="connector_stop_failed",
+            cleanup_detail = await self._finalize_stop_data_connector(connector_name)
+        else:
+            cleanup_detail = await self._finalize_stop_trading_connector(
+                account_name, connector_name
+            )
+        if cleanup_detail is not None:
+            if cleanup_detail.cleanup_code == "connector_cleanup_incomplete":
+                cleanup_detail = self._rejected_capability_cleanup_detail(
+                    connector_name,
+                    "connector_stop_failed",
                 )
                 self._connector_creation_residuals[connector_key] = (
-                    detail.model_dump(exclude_none=True)
+                    cleanup_detail.model_dump(exclude_none=True)
                 )
-                raise ConnectorCapabilityError(detail) from None
-            self._prune_connector_incarnation(connector_key)
-            return
-
-        cleanup_detail = await self._finalize_stop_trading_connector(
-            account_name, connector_name
-        )
-        if cleanup_detail is not None:
             raise ConnectorCapabilityError(cleanup_detail)
 
     def _purge_trading_pair_registration(
@@ -2463,15 +2461,25 @@ class UnifiedConnectorService:
                     tracker._trading_pairs.append(trading_pair)
                 logger.info(f"Initialized order book for {trading_pair} via REST fallback")
                 return True
-            except Exception as e:
-                logger.error(f"Fallback order book initialization failed: {e}")
+            except Exception as exc:
+                logger.error(
+                    "dynamic_subscription_snapshot_failed for %s/%s (%s)",
+                    type(connector).__name__,
+                    trading_pair,
+                    type(exc).__name__,
+                )
 
             logger.error(f"Failed to add {trading_pair} to order book tracker")
             self._purge_trading_pair_registration(connector, trading_pair)
             return False
 
-        except Exception as e:
-            logger.error(f"Error adding trading pair {trading_pair}: {e}", exc_info=True)
+        except Exception as exc:
+            logger.error(
+                "dynamic_subscription_add_failed for %s/%s (%s)",
+                type(connector).__name__,
+                trading_pair,
+                type(exc).__name__,
+            )
             self._purge_trading_pair_registration(connector, trading_pair)
             return False
 
@@ -3359,6 +3367,8 @@ class UnifiedConnectorService:
         self,
         connector: ConnectorBase,
         connector_name: str,
+        *,
+        collect_connector_tasks: bool = True,
     ) -> None:
         """Stop one published data connector without double-stopping its tracker."""
         self._ensure_connector_cleanup_state()
@@ -3367,7 +3377,11 @@ class UnifiedConnectorService:
         if not await self._drain_owner_tasks(owner_key):
             raise RuntimeError("task_cleanup_pending")
 
-        tasks = self._collect_connector_tasks(connector)
+        tasks = (
+            self._collect_connector_tasks(connector)
+            if collect_connector_tasks
+            else set()
+        )
         stop_network = getattr(connector, "stop_network", None)
         if stop_network is None:
             raise RuntimeError("connector_stop_unavailable")
@@ -3376,7 +3390,8 @@ class UnifiedConnectorService:
             "connector_stop",
             stop_network,
         )
-        tasks.update(self._collect_connector_tasks(connector))
+        if collect_connector_tasks:
+            tasks.update(self._collect_connector_tasks(connector))
         if not await self._drain_owner_tasks(owner_key, tasks):
             raise RuntimeError("task_cleanup_pending")
         self._finish_owner_cleanup(owner_key)
@@ -4080,6 +4095,19 @@ class UnifiedConnectorService:
                 account_name, connector_name
             )
 
+    async def _finalize_stop_data_connector(
+        self,
+        connector_name: str,
+        *,
+        invoking_owner_key: Optional[Tuple[str, str, str]] = None,
+    ) -> Optional[CapabilityErrorDetail]:
+        """Finalize a data generation while reconciling every same-key owner."""
+        return await self._finalize_stop_trading_connector(
+            "__data__",
+            connector_name,
+            invoking_owner_key=invoking_owner_key,
+        )
+
     async def _finalize_stop_trading_connector(
         self,
         account_name: str,
@@ -4164,12 +4192,20 @@ class UnifiedConnectorService:
                 self._owner_key(account_name, connector_name, "network")
             )
         if connector is not None and not restart_phase_failed:
+            stopping_published_data = (
+                account_name == "__data__" and connector is data_connector
+            )
+            if stopping_published_data:
+                self._data_connectors.pop(connector_name, None)
+                self._data_connectors_started.pop(connector_name, None)
             try:
                 if account_name == "__data__" and (
                     connector is data_connector or connector is data_owner
                 ):
                     await self._stop_data_connector_network(
-                        connector, connector_name
+                        connector,
+                        connector_name,
+                        collect_connector_tasks=invoking_owner_key is None,
                     )
                 else:
                     await self._stop_connector_network(
@@ -4277,6 +4313,8 @@ class UnifiedConnectorService:
         # Future owner kinds retain task handles under the same identity.
         for owner_key in list(self._connector_residual_tasks):
             if owner_key[:2] != connector_key:
+                continue
+            if owner_key == invoking_owner_key:
                 continue
             if owner_key[2] == "restart":
                 continue
