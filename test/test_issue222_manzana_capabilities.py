@@ -22,7 +22,7 @@ from enum import Enum
 from pathlib import Path
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 
 CHECK = unittest.TestCase()
@@ -372,7 +372,27 @@ async def test_vwap_price_is_canonical_in_service_and_openapi_model():
     CHECK.assertEqual(105.0, OrderBookQueryResult(**result).result_price)
 
 
-def test_connector_capability_registry_is_declared_and_noninvasive():
+def _shift_successor_capabilities(*, supported_pairs=None, dynamic_subscription=True):
+    from services.connector_capabilities import ConnectorFeature
+
+    return {
+        "supported_pairs": supported_pairs,
+        "features": {
+            ConnectorFeature.ORDER_BOOK,
+            ConnectorFeature.ORDER_BOOK_QUERY,
+            ConnectorFeature.LIVE_ORDER_BOOK,
+            ConnectorFeature.TRADING_RULES,
+            ConnectorFeature.BEST_BID_ASK,
+            ConnectorFeature.DYNAMIC_SUBSCRIPTION,
+        },
+        "dynamic_subscription": dynamic_subscription,
+        "perpetual": False,
+        "candles": False,
+        "last_trade": False,
+    }
+
+
+def test_connector_capability_registry_has_immutable_shift_bootstrap_truth():
     from models.connectors import ConnectorCapabilities
     from services.connector_capabilities import ConnectorCapabilityRegistry, ConnectorFeature
 
@@ -380,14 +400,51 @@ def test_connector_capability_registry_is_declared_and_noninvasive():
     manzana = registry.get("manzana")
 
     CHECK.assertIs(manzana.declared, True)
-    CHECK.assertEqual(frozenset({"BTC-USD"}), manzana.supported_pairs)
-    CHECK.assertIs(manzana.dynamic_subscription, False)
+    CHECK.assertEqual("api-bootstrap", manzana.source)
+    CHECK.assertIsNone(manzana.supported_pairs)
+    CHECK.assertEqual(
+        frozenset(_shift_successor_capabilities()["features"]),
+        manzana.features,
+    )
+    CHECK.assertIs(manzana.dynamic_subscription, True)
     CHECK.assertIs(manzana.perpetual, False)
     CHECK.assertIs(manzana.candles, False)
     CHECK.assertIs(manzana.last_trade, False)
     CHECK.assertIn(ConnectorFeature.ORDER_BOOK, manzana.features)
     CHECK.assertIs(registry.supports_pair("manzana", "BTC-USD"), True)
-    CHECK.assertIs(registry.supports_pair("manzana", "ETH-USD"), False)
+    CHECK.assertIs(registry.supports_pair("manzana", "ETH-USD"), True)
+    for unsupported in (
+        ConnectorFeature.TICKERS,
+        ConnectorFeature.RATES,
+        ConnectorFeature.CANDLES,
+        ConnectorFeature.PERPETUAL,
+        ConnectorFeature.LAST_TRADE,
+        ConnectorFeature.ORDER_SUBMISSION,
+    ):
+        CHECK.assertIs(registry.supports_feature("manzana", unsupported), False)
+
+    with pytest.raises(ValidationError):
+        manzana.dynamic_subscription = False
+
+    injected = {
+        "custom-bootstrap": ConnectorCapabilities(
+            declared=True,
+            source="unit-bootstrap",
+            supported_pairs=frozenset({"ONE-USD"}),
+            features=frozenset({ConnectorFeature.ORDER_BOOK}),
+        )
+    }
+    injected_registry = ConnectorCapabilityRegistry(injected)
+    injected.clear()
+    CHECK.assertIs(
+        injected_registry.supports_feature(
+            "custom-bootstrap", ConnectorFeature.ORDER_BOOK
+        ),
+        True,
+    )
+    CHECK.assertIs(
+        injected_registry.supports_pair("custom-bootstrap", "TWO-USD"), False
+    )
 
     undeclared = registry.get("binance")
     CHECK.assertIs(undeclared.declared, False)
@@ -408,6 +465,54 @@ def test_connector_capability_registry_is_declared_and_noninvasive():
     CHECK.assertIs(declared.declared, True)
     CHECK.assertEqual(frozenset({"ONE-USD"}), declared.supported_pairs)
     CHECK.assertIs(registry.supports_pair("custom", "ONE-USD", ConnectorDeclared()), True)
+
+
+def test_loaded_manzana_capabilities_narrow_pairs_and_mismatch_fails_closed():
+    from services.connector_capabilities import (
+        ConnectorCapabilityError,
+        ConnectorCapabilityRegistry,
+        ConnectorFeature,
+    )
+
+    registry = ConnectorCapabilityRegistry()
+    discovered = types.SimpleNamespace(
+        api_capabilities=_shift_successor_capabilities(
+            supported_pairs={"BTC-USD", "ETH-USD"}
+        )
+    )
+    loaded = registry.get("manzana", discovered)
+    CHECK.assertEqual(frozenset({"BTC-USD", "ETH-USD"}), loaded.supported_pairs)
+    CHECK.assertIs(registry.supports_pair("manzana", "ETH-USD", discovered), True)
+    CHECK.assertIs(registry.supports_pair("manzana", "SOL-USD", discovered), False)
+
+    mismatched = types.SimpleNamespace(
+        api_capabilities=_shift_successor_capabilities(dynamic_subscription=False)
+    )
+    with pytest.raises(ConnectorCapabilityError) as mismatch:
+        registry.require(
+            "manzana",
+            ConnectorFeature.LIVE_ORDER_BOOK,
+            "BTC-USD",
+            mismatched,
+        )
+    CHECK.assertEqual(400, mismatch.value.status_code)
+    CHECK.assertEqual(
+        {
+            "code": "connector_capability_mismatch",
+            "message": (
+                "Connector 'manzana' capability declaration does not match "
+                "its bootstrap declaration"
+            ),
+            "connector": "manzana",
+            "feature": "capabilities",
+            "reason": "bootstrap_instance_incompatible",
+        },
+        mismatch.value.detail,
+    )
+
+    with pytest.raises(ConnectorCapabilityError) as absent:
+        registry.get("manzana", types.SimpleNamespace())
+    CHECK.assertEqual(mismatch.value.detail, absent.value.detail)
 
 
 @pytest.mark.asyncio
@@ -435,12 +540,52 @@ async def test_capabilities_route_exposes_api_local_declaration_without_lookup()
     capabilities = await get_connector_capabilities(request, "manzana")
 
     CHECK.assertIs(capabilities.declared, True)
-    CHECK.assertEqual("api-local-pending-connector-seam", capabilities.source)
-    CHECK.assertEqual(frozenset({"BTC-USD"}), capabilities.supported_pairs)
+    CHECK.assertEqual("api-bootstrap", capabilities.source)
+    CHECK.assertIsNone(capabilities.supported_pairs)
 
 
 @pytest.mark.asyncio
-async def test_unsupported_pair_and_feature_reject_before_connector_lookup():
+@pytest.mark.parametrize("trading_pair", ["BTC-USD", "ETH-USD"])
+async def test_first_shift_book_request_passes_gates_and_constructs_connector(
+    trading_pair,
+):
+    from services.connector_capabilities import ConnectorCapabilityRegistry
+
+    module, _ = _load_unified_service_module()
+    service = object.__new__(module.UnifiedConnectorService)
+    service._capability_registry = ConnectorCapabilityRegistry()
+    service._data_connectors = {}
+    service._data_connectors_started = {}
+    service._trading_connectors = {}
+    construction_calls = []
+
+    class ReadyBook:
+        snapshot = ([object()], [object()])
+
+    def construct(connector_name):
+        construction_calls.append(connector_name)
+        return types.SimpleNamespace(
+            api_capabilities=_shift_successor_capabilities(
+                supported_pairs={"BTC-USD", "ETH-USD"}
+            ),
+            _trading_pairs=[trading_pair],
+            order_book_tracker=types.SimpleNamespace(
+                _trading_pairs=[trading_pair],
+                order_books={trading_pair: ReadyBook()},
+            ),
+        )
+
+    service._create_data_connector = construct
+
+    ready = await service.initialize_order_book("manzana", trading_pair)
+
+    CHECK.assertIs(ready, True)
+    CHECK.assertEqual(["manzana"], construction_calls)
+    CHECK.assertIn("manzana", service._data_connectors)
+
+
+@pytest.mark.asyncio
+async def test_unsupported_feature_rejects_before_connector_lookup():
     from models.connectors import CapabilityErrorResponse
     from services.connector_capabilities import (
         ConnectorCapabilityError,
@@ -463,32 +608,40 @@ async def test_unsupported_pair_and_feature_reject_before_connector_lookup():
     connector_service = GuardedConnectorService()
     service = MarketDataService(connector_service)
 
-    with pytest.raises(ConnectorCapabilityError) as pair_error:
-        await service.get_order_book_data("manzana", "ETH-USD")
-    CHECK.assertEqual(400, pair_error.value.status_code)
-    CHECK.assertEqual(pair_error.value.detail, {
-        "code": "unsupported_trading_pair",
-        "message": "Connector 'manzana' does not support trading pair 'ETH-USD'",
-        "connector": "manzana",
-        "feature": ConnectorFeature.ORDER_BOOK.value,
-        "trading_pair": "ETH-USD",
-        "supported_pairs": ["BTC-USD"],
-    })
-    CapabilityErrorResponse.model_validate({"detail": pair_error.value.detail})
-
     with pytest.raises(ConnectorCapabilityError) as feature_error:
-        await service.get_prices("manzana", ["BTC-USD"])
+        await service.get_prices("manzana", ["ETH-USD"])
     CHECK.assertEqual(400, feature_error.value.status_code)
     CHECK.assertEqual("unsupported_connector_feature", feature_error.value.detail["code"])
     CHECK.assertEqual(ConnectorFeature.LAST_TRADE.value, feature_error.value.detail["feature"])
-
-    with pytest.raises(ConnectorCapabilityError) as readiness_error:
-        await service.initialize_order_book("manzana", "BTC-USD")
-    CHECK.assertEqual(400, readiness_error.value.status_code)
-    CHECK.assertEqual(
-        "dynamic_subscription", readiness_error.value.detail["feature"]
-    )
+    CapabilityErrorResponse.model_validate({"detail": feature_error.value.detail})
     CHECK.assertEqual(0, connector_service.connector_lookups)
+
+
+def test_mismatched_constructed_connector_is_not_published():
+    from services.connector_capabilities import (
+        ConnectorCapabilityError,
+        ConnectorCapabilityRegistry,
+    )
+
+    module, _ = _load_unified_service_module()
+    service = object.__new__(module.UnifiedConnectorService)
+    service._capability_registry = ConnectorCapabilityRegistry()
+    service._data_connectors = {}
+    service._trading_connectors = {}
+    constructed = types.SimpleNamespace(
+        api_capabilities=_shift_successor_capabilities(
+            dynamic_subscription=False
+        )
+    )
+    service._create_data_connector = lambda connector_name: constructed
+
+    with pytest.raises(ConnectorCapabilityError) as mismatch:
+        service.get_data_connector("manzana")
+
+    CHECK.assertEqual(
+        "connector_capability_mismatch", mismatch.value.detail["code"]
+    )
+    CHECK.assertEqual({}, service._data_connectors)
 
 
 @pytest.mark.asyncio
@@ -683,13 +836,10 @@ async def test_failed_add_market_preserves_markets_membership_exactly():
 
 
 @pytest.mark.asyncio
-async def test_static_connector_add_rejects_before_initialization():
+async def test_shift_connector_add_reaches_dynamic_initialization():
     from models.market_data import AddTradingPairRequest
     from routers.market_data import add_trading_pair
-    from services.connector_capabilities import (
-        ConnectorCapabilityError,
-        ConnectorCapabilityRegistry,
-    )
+    from services.connector_capabilities import ConnectorCapabilityRegistry
 
     class GuardedConnectorService:
         def __init__(self):
@@ -701,23 +851,21 @@ async def test_static_connector_add_rejects_before_initialization():
 
         async def initialize_order_book(self, **kwargs):
             self.initialize_calls += 1
-            raise AssertionError("static request reached dynamic initialization")
+            return True
 
     connector_service = GuardedConnectorService()
     service = MarketDataService(connector_service)
 
-    with pytest.raises(ConnectorCapabilityError) as unsupported:
-        await add_trading_pair(
-            AddTradingPairRequest(
-                connector_name="manzana",
-                trading_pair="BTC-USD",
-            ),
-            service,
-        )
+    response = await add_trading_pair(
+        AddTradingPairRequest(
+            connector_name="manzana",
+            trading_pair="BTC-USD",
+        ),
+        service,
+    )
 
-    CHECK.assertEqual(400, unsupported.value.status_code)
-    CHECK.assertEqual("dynamic_subscription", unsupported.value.detail["feature"])
-    CHECK.assertEqual(0, connector_service.initialize_calls)
+    CHECK.assertIs(response.success, True)
+    CHECK.assertEqual(1, connector_service.initialize_calls)
 
 
 @pytest.mark.asyncio
@@ -1525,7 +1673,7 @@ def test_final_b1_boolean_json_is_rejected_before_all_query_primitives():
     CHECK.assertEqual(10, len(service.calls))
 
 
-def test_final_b2_all_adjacent_live_and_order_routes_gate_before_work():
+def test_final_b2_adjacent_routes_follow_shift_bootstrap_truth():
     from fastapi.testclient import TestClient
 
     from models.connectors import CapabilityErrorResponse
@@ -1574,9 +1722,22 @@ def test_final_b2_all_adjacent_live_and_order_routes_gate_before_work():
     app.dependency_overrides[trading_router.get_accounts_service] = lambda: downstream
     app.dependency_overrides[trading_router.get_connector_service] = lambda: downstream
     client = TestClient(app)
-    requests = (
+    unsupported_requests = (
         ("get", "/connectors/manzana/order-types", None),
         ("post", "/trading/master/manzana/orders/order-1/cancel", None),
+        (
+            "post",
+            "/trading/orders/active",
+            {"account_names": ["master"], "connector_names": ["manzana"]},
+        ),
+    )
+    for method, path, body in unsupported_requests:
+        response = getattr(client, method)(path, json=body) if body is not None else getattr(client, method)(path)
+        CHECK.assertEqual(400, response.status_code, (path, response.text))
+        CapabilityErrorResponse.model_validate(response.json())
+    CHECK.assertEqual([], downstream.calls)
+
+    supported_requests = (
         ("get", "/market-data/order-book/diagnostics/manzana", None),
         ("post", "/market-data/order-book/restart/manzana", None),
         (
@@ -1584,17 +1745,11 @@ def test_final_b2_all_adjacent_live_and_order_routes_gate_before_work():
             "/market-data/trading-pair/remove",
             {"connector_name": "manzana", "trading_pair": "BTC-USD"},
         ),
-        (
-            "post",
-            "/trading/orders/active",
-            {"account_names": ["master"], "connector_names": ["manzana"]},
-        ),
     )
-    for method, path, body in requests:
+    for method, path, body in supported_requests:
         response = getattr(client, method)(path, json=body) if body is not None else getattr(client, method)(path)
-        CHECK.assertEqual(400, response.status_code, (path, response.text))
-        CapabilityErrorResponse.model_validate(response.json())
-    CHECK.assertEqual([], downstream.calls)
+        CHECK.assertEqual(200, response.status_code, (path, response.text))
+    CHECK.assertEqual(["diagnostics", "restart", "remove_pair"], downstream.calls)
 
     schema = app.openapi()["paths"]
     schema_paths = {
@@ -1609,7 +1764,7 @@ def test_final_b2_all_adjacent_live_and_order_routes_gate_before_work():
             "/market-data/order-book/restart/{connector_name}"
         ),
     }
-    for method, path, _ in requests:
+    for method, path, _ in unsupported_requests + supported_requests:
         responses = schema[schema_paths.get(path, path)][method]["responses"]
         CHECK.assertEqual(
             "#/components/schemas/CapabilityErrorResponse",
@@ -2346,7 +2501,6 @@ def test_closure_b1_advertised_trading_400_matches_runtime_body():
 @pytest.mark.asyncio
 async def test_closure_b2_public_executor_paths_reject_before_connector_work():
     from hummingbot.core.data_type.common import OrderType
-    from models.connectors import CapabilityErrorDetail
     from services.connector_capabilities import ConnectorCapabilityError
     from services.trading_service import AccountTradingInterface
 
@@ -2373,14 +2527,8 @@ async def test_closure_b2_public_executor_paths_reject_before_connector_work():
     )
 
     async def remove_trading_pair(**kwargs):
-        raise ConnectorCapabilityError(
-            CapabilityErrorDetail(
-                code="unsupported_connector_feature",
-                message="not dynamic",
-                connector="manzana",
-                feature="dynamic_subscription",
-            )
-        )
+        calls.append("remove_pair")
+        return True
 
     interface = AccountTradingInterface(
         connector_service,
@@ -2396,16 +2544,16 @@ async def test_closure_b2_public_executor_paths_reject_before_connector_work():
         with pytest.raises(ConnectorCapabilityError):
             operation()
     interface._markets = {"manzana": {"BTC-USD"}}
+    interface._register_market_owner("manzana", "BTC-USD")
     removal = await interface.remove_market("manzana", "BTC-USD")
 
-    CHECK.assertEqual([], calls)
-    CHECK.assertEqual("unsupported_connector_feature", removal.code)
-    CHECK.assertEqual({"manzana": {"BTC-USD"}}, interface.markets)
+    CHECK.assertEqual(["remove_pair"], calls)
+    CHECK.assertIsNone(removal)
+    CHECK.assertEqual({}, interface.markets)
 
 
 @pytest.mark.asyncio
 async def test_closure_b3_public_service_seams_gate_before_resolution():
-    from services.connector_capabilities import ConnectorCapabilityError
     from services.market_data_service import MarketDataService
 
     calls = []
@@ -2421,10 +2569,14 @@ async def test_closure_b3_public_service_seams_gate_before_resolution():
 
     market_data = object.__new__(MarketDataService)
     market_data._connector_service = ConnectorService()
-    with pytest.raises(ConnectorCapabilityError):
-        market_data.get_order_book_tracker_diagnostics("manzana")
-    with pytest.raises(ConnectorCapabilityError):
-        await market_data.restart_order_book_tracker("manzana")
+    CHECK.assertEqual(
+        {"reached": True},
+        market_data.get_order_book_tracker_diagnostics("manzana"),
+    )
+    CHECK.assertEqual(
+        {"reached": True},
+        await market_data.restart_order_book_tracker("manzana"),
+    )
 
     module, registry_type = _load_unified_service_module()
     unified = object.__new__(module.UnifiedConnectorService)
@@ -2438,13 +2590,12 @@ async def test_closure_b3_public_service_seams_gate_before_resolution():
         return StaticConnector()
 
     unified.get_best_connector_for_market = resolve
-    with pytest.raises(module.ConnectorCapabilityError) as initialize_error:
-        await unified.initialize_order_book("manzana", "BTC-USD")
-    CHECK.assertEqual("dynamic_subscription", initialize_error.value.detail["feature"])
-    with pytest.raises(module.ConnectorCapabilityError):
-        await unified.remove_trading_pair("manzana", "BTC-USD")
+    CHECK.assertIs(
+        await unified.initialize_order_book("manzana", "BTC-USD"), True
+    )
+    CHECK.assertIs(await unified.remove_trading_pair("manzana", "BTC-USD"), False)
 
-    CHECK.assertEqual([], calls)
+    CHECK.assertEqual(["diagnostics", "restart", "resolve", "resolve"], calls)
 
 
 def _load_accounts_service_module():

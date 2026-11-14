@@ -16,7 +16,7 @@ import logging
 import time
 from contextlib import asynccontextmanager
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 from hummingbot.client.config.config_crypt import ETHKeyFileSecretManger
 from hummingbot.client.config.config_helpers import ClientConfigAdapter, api_keys_from_connector_config_map, get_connector_class
@@ -30,7 +30,7 @@ from hummingbot.core.data_type.common import OrderType, PositionAction, Position
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
 from hummingbot.core.utils.async_utils import safe_ensure_future
 
-from models.connectors import CapabilityErrorDetail
+from models.connectors import CapabilityErrorDetail, ConnectorCapabilities
 from services.connector_capabilities import (
     ConnectorCapabilityError,
     ConnectorCapabilityRegistry,
@@ -69,7 +69,12 @@ class UnifiedConnectorService:
     METRICS_ACTIVATION_INTERVAL = Decimal("900")  # 15 minutes
     METRICS_VALUATION_TOKEN = "USDT"
 
-    def __init__(self, secrets_manager: ETHKeyFileSecretManger, db_manager=None):
+    def __init__(
+        self,
+        secrets_manager: ETHKeyFileSecretManger,
+        db_manager=None,
+        bootstrap_capabilities: Optional[Mapping[str, ConnectorCapabilities]] = None,
+    ):
         self.secrets_manager = secrets_manager
         self.db_manager = db_manager
 
@@ -106,9 +111,9 @@ class UnifiedConnectorService:
         # Exposes get_pair_rate(pair) -> Decimal, the RateOracle-compatible interface.
         self._rate_provider = None
 
-        # API-local declarations preserve existing behavior for undeclared connectors while
-        # allowing static connectors to publish bounded semantics without route-specific logic.
-        self._capability_registry = ConnectorCapabilityRegistry()
+        # Bootstrap declarations are copied into an immutable registry at construction.
+        # Undeclared connectors preserve their existing generic behavior.
+        self._capability_registry = ConnectorCapabilityRegistry(bootstrap_capabilities)
 
     def set_rate_provider(self, rate_provider):
         """Set the rate provider used by trade-volume telemetry (MarketDataService)."""
@@ -130,10 +135,6 @@ class UnifiedConnectorService:
         if connector is None:
             connector = self._get_cached_connector(connector_name)
         return self._capability_registry.get(connector_name, connector)
-
-    def register_connector_capabilities(self, connector_name: str, capabilities) -> None:
-        """Register a declaration supplied by an API-local adapter or accepted connector seam."""
-        self._capability_registry.register(connector_name, capabilities)
 
     def require_capability(
         self,
@@ -341,9 +342,11 @@ class UnifiedConnectorService:
             Non-authenticated connector instance
         """
         if connector_name not in self._data_connectors:
-            self._data_connectors[connector_name] = self._create_data_connector(
-                connector_name
+            connector = self._create_data_connector(connector_name)
+            self._capability_registry.validate_instance(
+                connector_name, connector
             )
+            self._data_connectors[connector_name] = connector
         return self._data_connectors[connector_name]
 
     async def ensure_data_connector_started(
@@ -931,6 +934,7 @@ class UnifiedConnectorService:
         # Authenticate and create connector
         connector = self._create_trading_connector(account_name, connector_name)
         creation_owner["connector"] = connector
+        self._capability_registry.validate_instance(connector_name, connector)
         setattr(connector, "_api_cleanup_account", account_name)
         setattr(connector, "_api_cleanup_connector", connector_name)
 

@@ -1,12 +1,16 @@
-"""Reusable connector capability declarations for API-local validation.
+"""Immutable bootstrap and instance connector capability declarations.
 
-Connector implementations can expose an ``api_capabilities`` class or instance attribute
-using the same schema. The API-local declaration below is the temporary seam for the pinned
-Manzana connector until child B/C publish an accepted connector interface.
+Bootstrap declarations let gates answer before connector construction. Connector
+implementations can then expose an ``api_capabilities`` class or instance attribute using
+the same schema. A loaded instance may narrow discovered pairs, but it may not silently
+change the bootstrap feature contract.
 """
 
 from enum import Enum
-from typing import Any, Dict, Mapping, Optional
+from types import MappingProxyType
+from typing import Any, Mapping, Optional
+
+from pydantic import ValidationError
 
 from fastapi import HTTPException
 
@@ -38,78 +42,164 @@ class ConnectorCapabilityError(HTTPException):
         )
 
 
-_API_LOCAL_DECLARATIONS: Dict[str, ConnectorCapabilities] = {
-    "manzana": ConnectorCapabilities(
-        declared=True,
-        source="api-local-pending-connector-seam",
-        supported_pairs=frozenset({"BTC-USD"}),
-        features=frozenset(
-            {
-                ConnectorFeature.ORDER_BOOK.value,
-                ConnectorFeature.ORDER_BOOK_QUERY.value,
-                ConnectorFeature.TRADING_RULES.value,
-                ConnectorFeature.RATES.value,
-            }
-        ),
-        dynamic_subscription=False,
-        perpetual=False,
-        candles=False,
-        last_trade=False,
-    )
-}
+_BOOTSTRAP_DECLARATIONS: Mapping[str, ConnectorCapabilities] = MappingProxyType(
+    {
+        "manzana": ConnectorCapabilities(
+            declared=True,
+            source="api-bootstrap",
+            supported_pairs=None,
+            features=frozenset(
+                {
+                    ConnectorFeature.ORDER_BOOK.value,
+                    ConnectorFeature.ORDER_BOOK_QUERY.value,
+                    ConnectorFeature.LIVE_ORDER_BOOK.value,
+                    ConnectorFeature.TRADING_RULES.value,
+                    ConnectorFeature.BEST_BID_ASK.value,
+                    ConnectorFeature.DYNAMIC_SUBSCRIPTION.value,
+                }
+            ),
+            dynamic_subscription=True,
+            perpetual=False,
+            candles=False,
+            last_trade=False,
+        )
+    }
+)
 
 
 class ConnectorCapabilityRegistry:
-    """Resolve API-local or connector-declared capability contracts."""
+    """Resolve immutable bootstrap declarations and compatible instance truth."""
 
     def __init__(self, declarations: Optional[Mapping[str, ConnectorCapabilities]] = None):
-        self._declarations = dict(_API_LOCAL_DECLARATIONS)
+        bootstrap = dict(_BOOTSTRAP_DECLARATIONS)
         if declarations:
-            self._declarations.update(declarations)
-
-    def register(self, connector_name: str, capabilities: ConnectorCapabilities) -> None:
-        self._declarations[connector_name] = capabilities.model_copy(
-            update={"declared": True, "source": capabilities.source or "registered"}
+            bootstrap.update(declarations)
+        self._bootstrap_declarations = MappingProxyType(
+            {
+                connector_name: self._normalize_declaration(
+                    capabilities, source="bootstrap"
+                )
+                for connector_name, capabilities in bootstrap.items()
+            }
         )
 
-    def get(self, connector_name: str, connector: Any = None) -> ConnectorCapabilities:
-        declaration = getattr(connector, "api_capabilities", None) if connector is not None else None
-        if declaration is not None:
-            if isinstance(declaration, ConnectorCapabilities):
-                return declaration.model_copy(update={"declared": True, "source": "connector"})
-            return ConnectorCapabilities.model_validate(
-                {**dict(declaration), "declared": True, "source": "connector"}
+    @staticmethod
+    def _normalize_declaration(declaration: Any, *, source: str) -> ConnectorCapabilities:
+        if isinstance(declaration, ConnectorCapabilities):
+            normalized_source = declaration.source
+            if normalized_source == "undeclared":
+                normalized_source = source
+            return declaration.model_copy(
+                update={"declared": True, "source": normalized_source}
             )
+        return ConnectorCapabilities.model_validate(
+            {**dict(declaration), "declared": True, "source": source}
+        )
 
-        declared = self._declarations.get(connector_name)
-        if declared is not None:
-            return declared
+    @staticmethod
+    def _semantic_features(capabilities: ConnectorCapabilities) -> frozenset[str]:
+        """Canonicalize redundant flag/feature representations for comparison."""
+        features = set(capabilities.features)
+        for feature, flag in (
+            (ConnectorFeature.DYNAMIC_SUBSCRIPTION, capabilities.dynamic_subscription),
+            (ConnectorFeature.PERPETUAL, capabilities.perpetual),
+            (ConnectorFeature.CANDLES, capabilities.candles),
+            (ConnectorFeature.LAST_TRADE, capabilities.last_trade),
+        ):
+            if flag is True:
+                features.add(feature.value)
+            elif flag is False:
+                features.discard(feature.value)
+        return frozenset(features)
+
+    @classmethod
+    def _semantically_compatible(
+        cls,
+        bootstrap: ConnectorCapabilities,
+        instance: ConnectorCapabilities,
+    ) -> bool:
+        if cls._semantic_features(bootstrap) != cls._semantic_features(instance):
+            return False
+        if bootstrap.supported_pairs is None:
+            return True
+        return (
+            instance.supported_pairs is not None
+            and instance.supported_pairs.issubset(bootstrap.supported_pairs)
+        )
+
+    @staticmethod
+    def _raise_mismatch(connector_name: str) -> None:
+        raise ConnectorCapabilityError(
+            CapabilityErrorDetail(
+                code="connector_capability_mismatch",
+                message=(
+                    f"Connector '{connector_name}' capability declaration does not "
+                    "match its bootstrap declaration"
+                ),
+                connector=connector_name,
+                feature="capabilities",
+                reason="bootstrap_instance_incompatible",
+            )
+        )
+
+    def _instance_declaration(
+        self, connector_name: str, connector: Any
+    ) -> Optional[ConnectorCapabilities]:
+        declaration = getattr(connector, "api_capabilities", None)
+        if declaration is None:
+            return None
+        try:
+            return self._normalize_declaration(declaration, source="connector")
+        except (TypeError, ValueError, ValidationError):
+            self._raise_mismatch(connector_name)
+
+    def get(self, connector_name: str, connector: Any = None) -> ConnectorCapabilities:
+        bootstrap = self._bootstrap_declarations.get(connector_name)
+        if connector is None:
+            return bootstrap if bootstrap is not None else ConnectorCapabilities()
+
+        instance = self._instance_declaration(connector_name, connector)
+        if bootstrap is not None:
+            if instance is None or not self._semantically_compatible(
+                bootstrap, instance
+            ):
+                self._raise_mismatch(connector_name)
+            return instance
+        if instance is not None:
+            return instance
         return ConnectorCapabilities()
 
-    def supports_pair(self, connector_name: str, trading_pair: str, connector: Any = None) -> bool:
-        capabilities = self.get(connector_name, connector)
+    def validate_instance(self, connector_name: str, connector: Any) -> None:
+        """Fail closed before a constructed connector is published in a cache."""
+        self.get(connector_name, connector)
+
+    @staticmethod
+    def _supports_pair(
+        capabilities: ConnectorCapabilities, trading_pair: str
+    ) -> bool:
         return (
             not capabilities.declared
             or capabilities.supported_pairs is None
             or trading_pair in capabilities.supported_pairs
         )
 
+    def supports_pair(self, connector_name: str, trading_pair: str, connector: Any = None) -> bool:
+        capabilities = self.get(connector_name, connector)
+        return self._supports_pair(capabilities, trading_pair)
+
+    @classmethod
+    def _supports_feature(
+        cls, capabilities: ConnectorCapabilities, feature: ConnectorFeature
+    ) -> bool:
+        if not capabilities.declared:
+            return True
+        return feature.value in cls._semantic_features(capabilities)
+
     def supports_feature(
         self, connector_name: str, feature: ConnectorFeature, connector: Any = None
     ) -> bool:
         capabilities = self.get(connector_name, connector)
-        if not capabilities.declared:
-            return True
-
-        flag = {
-            ConnectorFeature.DYNAMIC_SUBSCRIPTION: capabilities.dynamic_subscription,
-            ConnectorFeature.PERPETUAL: capabilities.perpetual,
-            ConnectorFeature.CANDLES: capabilities.candles,
-            ConnectorFeature.LAST_TRADE: capabilities.last_trade,
-        }.get(feature)
-        if flag is not None:
-            return flag
-        return feature.value in capabilities.features
+        return self._supports_feature(capabilities, feature)
 
     def require(
         self,
@@ -119,8 +209,8 @@ class ConnectorCapabilityRegistry:
         connector: Any = None,
     ) -> None:
         capabilities = self.get(connector_name, connector)
-        if trading_pair is not None and not self.supports_pair(
-            connector_name, trading_pair, connector
+        if trading_pair is not None and not self._supports_pair(
+            capabilities, trading_pair
         ):
             raise ConnectorCapabilityError(
                 CapabilityErrorDetail(
@@ -135,7 +225,7 @@ class ConnectorCapabilityRegistry:
                     supported_pairs=sorted(capabilities.supported_pairs or ()),
                 )
             )
-        if not self.supports_feature(connector_name, feature, connector):
+        if not self._supports_feature(capabilities, feature):
             raise ConnectorCapabilityError(
                 CapabilityErrorDetail(
                     code="unsupported_connector_feature",

@@ -6,7 +6,7 @@ These models define the request/response schemas for connector-related endpoints
 
 from typing import Any, Dict, FrozenSet, List, Literal, Optional
 
-from pydantic import BaseModel, Field, field_serializer
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
 
 class ConnectorInfo(BaseModel):
@@ -23,6 +23,8 @@ class ConnectorCapabilities(BaseModel):
     the connector predates this seam, so the API preserves its existing generic behavior.
     """
 
+    model_config = ConfigDict(frozen=True)
+
     declared: bool = Field(default=False, description="Whether the capability set is explicit")
     source: str = Field(default="undeclared", description="Origin of the declaration")
     supported_pairs: Optional[FrozenSet[str]] = Field(
@@ -32,7 +34,7 @@ class ConnectorCapabilities(BaseModel):
         default_factory=frozenset,
         description=(
             "Explicitly supported API features; order_book is snapshot access, while "
-            "live_order_book is authenticated stream readiness"
+            "live_order_book is public stream readiness"
         ),
     )
     dynamic_subscription: Optional[bool] = Field(
