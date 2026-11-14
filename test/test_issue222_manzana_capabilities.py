@@ -37,21 +37,23 @@ def _module(name: str) -> types.ModuleType:
     return module
 
 
-def _install_import_contract() -> None:
-    if importlib.util.find_spec("hummingbot") is not None:
+def _install_import_contract(*, force: bool = False) -> None:
+    real_core_available = importlib.util.find_spec("hummingbot") is not None
+    if real_core_available and not force:
         return
 
-    for package in (
-        "hummingbot",
-        "hummingbot.client",
-        "hummingbot.connector",
-        "hummingbot.core",
-        "hummingbot.core.data_type",
-        "hummingbot.data_feed",
-        "hummingbot.data_feed.candles_feed",
-    ):
-        module = _module(package)
-        module.__path__ = []
+    if not real_core_available:
+        for package in (
+            "hummingbot",
+            "hummingbot.client",
+            "hummingbot.connector",
+            "hummingbot.core",
+            "hummingbot.core.data_type",
+            "hummingbot.data_feed",
+            "hummingbot.data_feed.candles_feed",
+        ):
+            module = _module(package)
+            module.__path__ = []
 
     services = _module("services")
     services.__path__ = [str(Path(__file__).resolve().parents[1] / "services")]
@@ -60,12 +62,13 @@ def _install_import_contract() -> None:
     routers = _module("routers")
     routers.__path__ = [str(Path(__file__).resolve().parents[1] / "routers")]
 
-    settings_module = _module("hummingbot.client.settings")
-    settings_module.AllConnectorSettings = type(
-        "AllConnectorSettings",
-        (),
-        {"get_connector_settings": staticmethod(lambda: {})},
-    )
+    if not real_core_available:
+        settings_module = _module("hummingbot.client.settings")
+        settings_module.AllConnectorSettings = type(
+            "AllConnectorSettings",
+            (),
+            {"get_connector_settings": staticmethod(lambda: {})},
+        )
 
     deps = _module("deps")
     deps.get_accounts_service = lambda: None
@@ -83,57 +86,59 @@ def _install_import_contract() -> None:
         market_data=types.SimpleNamespace(candles_ready_timeout=1.0)
     )
 
-    connector_utils = _module("hummingbot.connector.utils")
-    connector_utils.combine_to_hb_trading_pair = lambda base, quote: f"{base}-{quote}"
-    connector_utils.split_hb_trading_pair = lambda trading_pair: tuple(trading_pair.rsplit("-", 1))
+    if not real_core_available:
+        connector_utils = _module("hummingbot.connector.utils")
+        connector_utils.combine_to_hb_trading_pair = lambda base, quote: f"{base}-{quote}"
+        connector_utils.split_hb_trading_pair = lambda trading_pair: tuple(trading_pair.rsplit("-", 1))
 
-    connector_base = _module("hummingbot.connector.connector_base")
-    connector_base.ConnectorBase = type("ConnectorBase", (), {})
+        connector_base = _module("hummingbot.connector.connector_base")
+        connector_base.ConnectorBase = type("ConnectorBase", (), {})
 
-    common = _module("hummingbot.core.data_type.common")
+        common = _module("hummingbot.core.data_type.common")
 
-    class OrderType(Enum):
-        LIMIT = 1
-        MARKET = 2
-        LIMIT_MAKER = 3
+        class OrderType(Enum):
+            LIMIT = 1
+            MARKET = 2
+            LIMIT_MAKER = 3
 
-    class PositionAction(Enum):
-        NIL = 0
-        OPEN = 1
-        CLOSE = 2
+        class PositionAction(Enum):
+            NIL = 0
+            OPEN = 1
+            CLOSE = 2
 
-    class PositionMode(Enum):
-        HEDGE = 1
-        ONEWAY = 2
+        class PositionMode(Enum):
+            HEDGE = 1
+            ONEWAY = 2
 
-    class TradeType(Enum):
-        BUY = 1
-        SELL = 2
+        class TradeType(Enum):
+            BUY = 1
+            SELL = 2
 
-    common.OrderType = OrderType
-    common.PositionAction = PositionAction
-    common.PositionMode = PositionMode
-    common.TradeType = TradeType
+        common.OrderType = OrderType
+        common.PositionAction = PositionAction
+        common.PositionMode = PositionMode
+        common.TradeType = TradeType
 
-    candles_factory = _module("hummingbot.data_feed.candles_feed.candles_factory")
-    candles_factory.CandlesFactory = type("CandlesFactory", (), {"_candles_map": {}})
-    candles_factory.UnsupportedConnectorException = type(
-        "UnsupportedConnectorException", (Exception,), {}
-    )
+        candles_factory = _module("hummingbot.data_feed.candles_feed.candles_factory")
+        candles_factory.CandlesFactory = type("CandlesFactory", (), {"_candles_map": {}})
+        candles_factory.UnsupportedConnectorException = type(
+            "UnsupportedConnectorException", (Exception,), {}
+        )
 
-    candles_types = _module("hummingbot.data_feed.candles_feed.data_types")
+        candles_types = _module("hummingbot.data_feed.candles_feed.data_types")
 
-    class CandlesConfig:
-        def __init__(self, **kwargs):
-            self.__dict__.update(kwargs)
+        class CandlesConfig:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
 
-    candles_types.CandlesConfig = CandlesConfig
-    class HistoricalCandlesConfig(BaseModel):
-        connector_name: str
-        trading_pair: str
-        interval: str = "1m"
+        candles_types.CandlesConfig = CandlesConfig
 
-    candles_types.HistoricalCandlesConfig = HistoricalCandlesConfig
+        class HistoricalCandlesConfig(BaseModel):
+            connector_name: str
+            trading_pair: str
+            interval: str = "1m"
+
+        candles_types.HistoricalCandlesConfig = HistoricalCandlesConfig
 
     ticker_sources = _module("services.ticker_sources")
     ticker_sources.Ticker = type("Ticker", (), {})
@@ -224,7 +229,7 @@ def _scoped_import_contract(request):
         for name, module in sys.modules.items()
         if _is_contract_module(name)
     }
-    _install_import_contract()
+    _install_import_contract(force=request.node.name == "manual-fixture-check")
     from models.market_data import OrderBookQueryResult as ResultModel
     from services.market_data_service import MarketDataService as Service
 
@@ -1942,7 +1947,13 @@ def test_final_b3_all_advertised_unsupported_bodies_match_openapi():
             ("/market-data/candles", {"connector_name": "unknown", "trading_pair": "BTC-USD"}),
             (
                 "/market-data/historical-candles",
-                {"connector_name": "unknown", "trading_pair": "BTC-USD", "interval": "1m"},
+                {
+                    "connector_name": "unknown",
+                    "trading_pair": "BTC-USD",
+                    "interval": "1m",
+                    "start_time": 1,
+                    "end_time": 2,
+                },
             ),
         )
         responses = [client.post(path, json=body) for path, body in unknown_requests]
@@ -1956,7 +1967,13 @@ def test_final_b3_all_advertised_unsupported_bodies_match_openapi():
                 ),
                 client.post(
                     "/market-data/historical-candles",
-                    json={"connector_name": "generic", "trading_pair": "BTCUSD", "interval": "1m"},
+                    json={
+                        "connector_name": "generic",
+                        "trading_pair": "BTCUSD",
+                        "interval": "1m",
+                        "start_time": 1,
+                        "end_time": 2,
+                    },
                 ),
                 client.post(
                     "/market-data/candles",
@@ -1964,7 +1981,13 @@ def test_final_b3_all_advertised_unsupported_bodies_match_openapi():
                 ),
                 client.post(
                     "/market-data/historical-candles",
-                    json={"connector_name": "generic", "trading_pair": "BTC-USD", "interval": "1m"},
+                    json={
+                        "connector_name": "generic",
+                        "trading_pair": "BTC-USD",
+                        "interval": "1m",
+                        "start_time": 1,
+                        "end_time": 2,
+                    },
                 ),
             ]
         )
@@ -3447,12 +3470,19 @@ async def test_public_transaction_rolls_back_every_adverse_boundary(
         connector.order_book_tracker._tracking_tasks["DIRTY-PAIR"],
     )
     CHECK.assertTrue(spawned_tasks)
-    CHECK.assertTrue(all(task.done() for task in spawned_tasks))
-    CHECK.assertTrue(all(task.cancelled() for task in spawned_tasks))
+    if boundary == "start":
+        CHECK.assertTrue(all(task.done() for task in spawned_tasks))
+        CHECK.assertTrue(all(task.cancelled() for task in spawned_tasks))
+    else:
+        CHECK.assertTrue(all(not task.done() for task in spawned_tasks))
     CHECK.assertIn("DIRTY-PAIR", connector._trading_pairs)
     CHECK.assertEqual({}, service._connector_cleanup_owners)
     CHECK.assertEqual({}, service._connector_residual_tasks)
     CHECK.assertEqual({}, service._connector_cleanup_phases)
+    for spawned in spawned_tasks:
+        if not spawned.done():
+            spawned.cancel()
+    await asyncio.gather(*spawned_tasks, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -7200,6 +7230,91 @@ async def test_issue224_owned_delta_rollback_preserves_concurrent_unrelated_stat
 
 
 @pytest.mark.asyncio
+async def test_issue224_start_rollback_uses_value_count_after_unrelated_insertion():
+    _, service, connector, _ = _issue224_repair_service()
+    service._data_connectors_started = {}
+    start_entered = asyncio.Event()
+    release_start = asyncio.Event()
+
+    async def start_network():
+        start_entered.set()
+        await release_start.wait()
+        return False
+
+    connector.start_network = start_network
+    request = asyncio.create_task(
+        service.ensure_data_connector_started("manzana", "BTC-USD")
+    )
+    await start_entered.wait()
+    connector._trading_pairs.insert(0, "ETH-USD")
+    release_start.set()
+
+    CHECK.assertIs(await request, False)
+    CHECK.assertIs(connector, service._data_connectors["manzana"])
+    CHECK.assertEqual(["ETH-USD", "BASE-USD"], connector._trading_pairs)
+    CHECK.assertEqual(0, connector.stop_calls)
+
+
+@pytest.mark.asyncio
+async def test_issue224_ambiguous_pair_duplicates_force_discard():
+    _, service, connector, _ = _issue224_repair_service()
+    connector._trading_pairs = ["BASE-USD", "BTC-USD", "BTC-USD"]
+
+    async def remove_one_duplicate(connector_arg, trading_pair):
+        connector_arg._trading_pairs.remove(trading_pair)
+        return False
+
+    service._add_trading_pair_to_tracker = remove_one_duplicate
+
+    CHECK.assertIs(
+        await service.initialize_order_book("manzana", "BTC-USD", timeout=0),
+        False,
+    )
+    CHECK.assertEqual({}, service._data_connectors)
+    CHECK.assertEqual({}, service._data_connectors_started)
+    CHECK.assertEqual(1, connector.stop_calls)
+    CHECK.assertEqual(1, connector._trading_pairs.count("BTC-USD"))
+
+
+@pytest.mark.asyncio
+async def test_issue224_unproven_task_set_mutation_discards_without_claiming_member():
+    _, service, connector, tracker = _issue224_repair_service()
+    pair_entered = asyncio.Event()
+    release_pair = asyncio.Event()
+
+    async def pending():
+        await asyncio.Event().wait()
+
+    unrelated_task = asyncio.create_task(pending())
+
+    async def add_pair(connector_arg, trading_pair):
+        connector_arg._trading_pairs.append(trading_pair)
+        tracker._trading_pairs.append(trading_pair)
+        pair_entered.set()
+        await release_pair.wait()
+        return False
+
+    service._add_trading_pair_to_tracker = add_pair
+    request = asyncio.create_task(
+        service.initialize_order_book("manzana", "BTC-USD", timeout=0)
+    )
+    await pair_entered.wait()
+    tracker._in_flight_transactions.add(unrelated_task)
+    release_pair.set()
+
+    try:
+        CHECK.assertIs(await request, False)
+        CHECK.assertEqual({}, service._data_connectors)
+        CHECK.assertEqual({}, service._data_connectors_started)
+        CHECK.assertEqual(1, connector.stop_calls)
+        CHECK.assertFalse(unrelated_task.done())
+        CHECK.assertIn(unrelated_task, tracker._in_flight_transactions)
+    finally:
+        unrelated_task.cancel()
+        await asyncio.gather(unrelated_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_issue224_owned_pair_and_book_removals_are_restored_in_place():
     _, service, connector, tracker = _issue224_repair_service()
     baseline_book = object()
@@ -7257,8 +7372,9 @@ async def test_issue224_uninstrumented_book_wait_mutation_is_unpublished_not_rew
     CHECK.assertIn("HIDDEN-USD", tracker._trading_pairs)
     CHECK.assertIn("HIDDEN-USD", tracker.order_books)
     CHECK.assertIs(hidden_task, tracker._tracking_tasks["HIDDEN-USD"])
-    CHECK.assertTrue(hidden_task.done())
-    CHECK.assertTrue(hidden_task.cancelled())
+    CHECK.assertFalse(hidden_task.done())
+    hidden_task.cancel()
+    await asyncio.gather(hidden_task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -7298,10 +7414,11 @@ async def test_issue224_task_ledger_cancels_owned_handle_not_replacement():
         CHECK.assertTrue(owned_task.cancelled())
         CHECK.assertTrue(set_task.done())
         CHECK.assertTrue(set_task.cancelled())
-        CHECK.assertNotIn(set_task, tracker._in_flight_transactions)
         CHECK.assertFalse(replacement_task.done())
         CHECK.assertIs(replacement_task, tracker._tracking_tasks["BTC-USD"])
-        CHECK.assertIs(connector, service._data_connectors["manzana"])
+        CHECK.assertEqual({}, service._data_connectors)
+        CHECK.assertEqual({}, service._data_connectors_started)
+        CHECK.assertEqual(1, connector.stop_calls)
     finally:
         for task in (owned_task, set_task, replacement_task):
             if task is not None and not task.done():
@@ -7314,6 +7431,161 @@ async def test_issue224_task_ledger_cancels_owned_handle_not_replacement():
             ),
             return_exceptions=True,
         )
+
+
+@pytest.mark.asyncio
+async def test_issue224_task_ledger_retains_all_explicit_owned_generations():
+    _, service, connector, tracker = _issue224_repair_service()
+    owned_tasks = []
+
+    async def pending():
+        await asyncio.Event().wait()
+
+    async def add_pair(connector_arg, trading_pair):
+        first = asyncio.create_task(pending())
+        owned_tasks.append(first)
+        tracker._tracking_tasks[trading_pair] = first
+        await asyncio.sleep(0)
+        second = asyncio.create_task(pending())
+        owned_tasks.append(second)
+        tracker._tracking_tasks[trading_pair] = second
+        return False
+
+    service._add_trading_pair_to_tracker = add_pair
+
+    CHECK.assertIs(
+        await service.initialize_order_book("manzana", "BTC-USD", timeout=0),
+        False,
+    )
+    CHECK.assertEqual(2, len(owned_tasks))
+    CHECK.assertTrue(all(task.done() for task in owned_tasks))
+    CHECK.assertTrue(all(task.cancelled() for task in owned_tasks))
+    CHECK.assertNotIn("BTC-USD", tracker._tracking_tasks)
+    CHECK.assertIs(connector, service._data_connectors["manzana"])
+    CHECK.assertEqual(0, connector.stop_calls)
+
+
+@pytest.mark.asyncio
+async def test_issue224_unsafe_discard_survives_resistant_task_retry():
+    module, service, connector, tracker = _issue224_repair_service()
+    cancellation_seen = asyncio.Event()
+    release_owned = asyncio.Event()
+    owned_task = None
+
+    async def resistant():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancellation_seen.set()
+            await release_owned.wait()
+
+    async def add_pair(connector_arg, trading_pair):
+        nonlocal owned_task
+        connector_arg._trading_pairs = ["POISON-USD"]
+        owned_task = asyncio.create_task(resistant())
+        tracker._tracking_tasks[trading_pair] = owned_task
+        await asyncio.sleep(0)
+        return False
+
+    service._add_trading_pair_to_tracker = add_pair
+    with pytest.raises(module.ConnectorCapabilityError) as pending:
+        await service.initialize_order_book("manzana", "BTC-USD", timeout=0)
+
+    await cancellation_seen.wait()
+    CHECK.assertEqual(
+        "connector_capability_cleanup_residual", pending.value.detail["code"]
+    )
+    CHECK.assertIs(connector, service._data_connectors["manzana"])
+    CHECK.assertEqual(0, connector.stop_calls)
+
+    release_owned.set()
+    await owned_task
+    await service._retry_public_transaction_cleanup(("__data__", "manzana"))
+
+    CHECK.assertEqual({}, service._data_connectors)
+    CHECK.assertEqual({}, service._data_connectors_started)
+    CHECK.assertEqual(1, connector.stop_calls)
+    CHECK.assertEqual({}, service._connector_creation_residuals)
+    CHECK.assertEqual({}, service._connector_cleanup_owners)
+    CHECK.assertEqual({}, service._connector_residual_tasks)
+    CHECK.assertEqual({}, service._connector_cleanup_phases)
+
+
+@pytest.mark.asyncio
+async def test_issue224_remove_pair_uses_initialization_owner_lock():
+    _, service, connector, tracker = _issue224_repair_service()
+    tracker.order_books["BTC-USD"] = types.SimpleNamespace(snapshot=([], []))
+    connector._trading_pairs.append("BTC-USD")
+    tracker._trading_pairs.append("BTC-USD")
+    pair_entered = asyncio.Event()
+    release_pair = asyncio.Event()
+
+    async def add_pair(connector_arg, trading_pair):
+        pair_entered.set()
+        await release_pair.wait()
+        return False
+
+    async def remove_pair(trading_pair):
+        connector._trading_pairs.remove(trading_pair)
+        tracker._trading_pairs.remove(trading_pair)
+        tracker.order_books.pop(trading_pair, None)
+        return True
+
+    service._add_trading_pair_to_tracker = add_pair
+    connector.remove_trading_pair = remove_pair
+    initialization = asyncio.create_task(
+        service.initialize_order_book("manzana", "BTC-USD", timeout=0)
+    )
+    await pair_entered.wait()
+    removal = asyncio.create_task(
+        service.remove_trading_pair("manzana", "BTC-USD")
+    )
+    await asyncio.sleep(0)
+
+    try:
+        CHECK.assertFalse(removal.done())
+        release_pair.set()
+        CHECK.assertIs(await initialization, False)
+        CHECK.assertIs(await removal, True)
+        CHECK.assertNotIn("BTC-USD", connector._trading_pairs)
+        CHECK.assertNotIn("BTC-USD", tracker._trading_pairs)
+        CHECK.assertNotIn("BTC-USD", tracker.order_books)
+    finally:
+        release_pair.set()
+        await asyncio.gather(initialization, removal, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_issue224_task_reconciliation_does_not_busy_spin():
+    _, service, _, _ = _issue224_repair_service()
+    pair_entered = asyncio.Event()
+    release_pair = asyncio.Event()
+    scans = 0
+    discover = service._discover_public_transaction_tasks
+
+    def counted_discovery(snapshot, boundary):
+        nonlocal scans
+        scans += 1
+        return discover(snapshot, boundary)
+
+    async def add_pair(connector_arg, trading_pair):
+        pair_entered.set()
+        await release_pair.wait()
+        return False
+
+    service._discover_public_transaction_tasks = counted_discovery
+    service._add_trading_pair_to_tracker = add_pair
+    request = asyncio.create_task(
+        service.initialize_order_book("manzana", "BTC-USD", timeout=0)
+    )
+    await pair_entered.wait()
+    await asyncio.sleep(0.01)
+
+    try:
+        CHECK.assertLessEqual(scans, 2)
+    finally:
+        release_pair.set()
+        await request
 
 
 @pytest.mark.asyncio

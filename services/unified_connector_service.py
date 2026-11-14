@@ -16,6 +16,7 @@ import inspect
 import logging
 import time
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from decimal import Decimal
 from types import MappingProxyType
 from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
@@ -60,6 +61,10 @@ _INSTANCE_FEATURE_CALLABLE_CHAINS = MappingProxyType(
         ConnectorFeature.ORDER_SUBMISSION.value: ("buy", "sell", "cancel"),
     }
 )
+_PUBLIC_TRANSACTION_CONTEXT = ContextVar(
+    "public_transaction_context", default=None
+)
+_PUBLIC_TASK_FACTORY_STATES: Dict[Any, Dict[str, Any]] = {}
 
 
 class UnknownConnectorError(ValueError):
@@ -759,7 +764,7 @@ class UnifiedConnectorService:
                 "key": cache_connector_name,
                 "owned_value": connector,
             }
-        return {
+        snapshot = {
             "connector_name": connector_name,
             "connector_key": connector_key,
             "connector": connector,
@@ -788,6 +793,8 @@ class UnifiedConnectorService:
             "owned_task_deltas": [],
             "owned_tasks": set(),
             "claimed_task_slots": set(),
+            "task_slot_ledgers": {},
+            "provenance_tasks": set(),
             "owned_declaration_deltas": [],
             "owned_started_delta": None,
             "owned_cache_delta": owned_cache_delta,
@@ -799,6 +806,8 @@ class UnifiedConnectorService:
                 connector_name
             ),
         }
+        self._seed_public_task_ledgers(snapshot)
+        return snapshot
 
     @staticmethod
     def _snapshot_state_for(
@@ -817,6 +826,43 @@ class UnifiedConnectorService:
     def _task_slot_key(owner, attribute: str, key: Any = None) -> tuple:
         return id(owner), attribute, key
 
+    def _seed_public_task_ledgers(self, snapshot: Dict[str, Any]) -> None:
+        """Seed task-slot generations from the transaction baseline."""
+        ledgers = snapshot["task_slot_ledgers"]
+        for owner, attributes in (
+            (snapshot["connector"], snapshot["connector_task_attributes"]),
+            (snapshot["tracker"], snapshot["tracker_task_attributes"]),
+        ):
+            if owner is None:
+                continue
+            for attribute, (present, value) in attributes.items():
+                ledgers[self._task_slot_key(owner, attribute)] = {
+                    "owner": owner,
+                    "attribute": attribute,
+                    "key": None,
+                    "baseline_present": present,
+                    "baseline_value": value,
+                    "generations": [value] if isinstance(value, asyncio.Task) else [],
+                }
+        tracker = snapshot["tracker"]
+        trading_pair = snapshot["trading_pair"]
+        if tracker is None:
+            return
+        for attribute in _TRACKER_TASK_CONTAINERS:
+            state = self._snapshot_state_for(snapshot, tracker, attribute)
+            if state is None or state["kind"] != "dict":
+                continue
+            present = trading_pair in state["contents"]
+            value = state["contents"].get(trading_pair)
+            ledgers[self._task_slot_key(tracker, attribute, trading_pair)] = {
+                "owner": tracker,
+                "attribute": attribute,
+                "key": trading_pair,
+                "baseline_present": present,
+                "baseline_value": value,
+                "generations": [value] if isinstance(value, asyncio.Task) else [],
+            }
+
     def _record_public_task_slot(
         self,
         snapshot: Dict[str, Any],
@@ -826,35 +872,55 @@ class UnifiedConnectorService:
         *,
         key: Any = None,
     ) -> None:
-        if task is snapshot["request_task"] or task in snapshot["tasks"]:
-            return
         slot_key = self._task_slot_key(owner, attribute, key)
-        if slot_key in snapshot["claimed_task_slots"]:
-            return
         try:
             value = getattr(owner, attribute)
         except BaseException:
             return
-        if key is None:
-            attributes = (
-                snapshot["connector_task_attributes"]
-                if owner is snapshot["connector"]
-                else snapshot["tracker_task_attributes"]
-            )
-            baseline_present, baseline_value = attributes.get(
-                attribute, (False, None)
-            )
-        else:
-            baseline = self._snapshot_state_for(snapshot, owner, attribute)
-            baseline_present = bool(
-                baseline is not None and key in baseline["contents"]
-            )
-            baseline_value = (
-                baseline["contents"].get(key) if baseline_present else None
-            )
-            if not isinstance(value, dict) or value.get(key) is not task:
-                return
-        snapshot["claimed_task_slots"].add(slot_key)
+        ledger = snapshot["task_slot_ledgers"].get(slot_key)
+        if ledger is None:
+            if key is None:
+                attributes = (
+                    snapshot["connector_task_attributes"]
+                    if owner is snapshot["connector"]
+                    else snapshot["tracker_task_attributes"]
+                )
+                baseline_present, baseline_value = attributes.get(
+                    attribute, (False, None)
+                )
+            else:
+                baseline = self._snapshot_state_for(snapshot, owner, attribute)
+                baseline_present = bool(
+                    baseline is not None and key in baseline["contents"]
+                )
+                baseline_value = (
+                    baseline["contents"].get(key) if baseline_present else None
+                )
+            ledger = {
+                "owner": owner,
+                "attribute": attribute,
+                "key": key,
+                "baseline_present": baseline_present,
+                "baseline_value": baseline_value,
+                "generations": [],
+            }
+            snapshot["task_slot_ledgers"][slot_key] = ledger
+        if key is not None and (
+            not isinstance(value, dict) or value.get(key) is not task
+        ):
+            return
+        generations = ledger["generations"]
+        if not generations or generations[-1] is not task:
+            generations.append(task)
+        if task is snapshot["request_task"] or task in snapshot["tasks"]:
+            return
+        if task not in snapshot["provenance_tasks"]:
+            snapshot["unsafe_mutation"] = True
+            return
+        delta_key = (*slot_key, id(task))
+        if delta_key in snapshot["claimed_task_slots"]:
+            return
+        snapshot["claimed_task_slots"].add(delta_key)
         snapshot["owned_tasks"].add(task)
         snapshot["owned_task_deltas"].append(
             {
@@ -862,8 +928,8 @@ class UnifiedConnectorService:
                 "owner": owner,
                 "attribute": attribute,
                 "key": key,
-                "baseline_present": baseline_present,
-                "baseline_value": baseline_value,
+                "baseline_present": ledger["baseline_present"],
+                "baseline_value": ledger["baseline_value"],
                 "task": task,
             }
         )
@@ -877,6 +943,9 @@ class UnifiedConnectorService:
         task: asyncio.Task,
     ) -> None:
         if task is snapshot["request_task"] or task in snapshot["tasks"]:
+            return
+        if task not in snapshot["provenance_tasks"]:
+            snapshot["unsafe_mutation"] = True
             return
         slot_key = self._task_slot_key(owner, attribute, id(task))
         if slot_key in snapshot["claimed_task_slots"]:
@@ -901,6 +970,7 @@ class UnifiedConnectorService:
     def _discover_public_transaction_tasks(
         self, snapshot: Dict[str, Any], boundary: str
     ) -> None:
+        snapshot["owned_tasks"].update(snapshot["provenance_tasks"])
         tracker = snapshot["tracker"]
         trading_pair = snapshot["trading_pair"]
         if boundary == "start":
@@ -912,6 +982,18 @@ class UnifiedConnectorService:
                         self._record_public_task_slot(
                             snapshot, owner, attribute, value
                         )
+                for ledger in snapshot["task_slot_ledgers"].values():
+                    if ledger["owner"] is not owner or ledger["key"] is not None:
+                        continue
+                    attribute = ledger["attribute"]
+                    present = hasattr(owner, attribute)
+                    current = getattr(owner, attribute, None)
+                    if isinstance(current, asyncio.Task):
+                        continue
+                    if present != ledger["baseline_present"] or (
+                        present and current is not ledger["baseline_value"]
+                    ):
+                        snapshot["unsafe_mutation"] = True
         if tracker is None:
             return
         for attribute in _TRACKER_TASK_CONTAINERS:
@@ -921,7 +1003,23 @@ class UnifiedConnectorService:
                 continue
             if not isinstance(value, dict):
                 if isinstance(value, (list, set)):
-                    for task in tuple(value):
+                    state = self._snapshot_state_for(
+                        snapshot, tracker, attribute
+                    )
+                    if state is None or value is not state["value"]:
+                        snapshot["unsafe_mutation"] = True
+                        continue
+                    baseline_tasks = {
+                        task
+                        for task in state["contents"]
+                        if isinstance(task, asyncio.Task)
+                    }
+                    current_tasks = {
+                        task for task in value if isinstance(task, asyncio.Task)
+                    }
+                    if baseline_tasks - current_tasks:
+                        snapshot["unsafe_mutation"] = True
+                    for task in current_tasks - baseline_tasks:
                         if isinstance(task, asyncio.Task):
                             self._record_public_task_member(
                                 snapshot,
@@ -940,17 +1038,67 @@ class UnifiedConnectorService:
                     task,
                     key=trading_pair,
                 )
+            else:
+                ledger = snapshot["task_slot_ledgers"].get(
+                    self._task_slot_key(tracker, attribute, trading_pair)
+                )
+                current_present = trading_pair in value
+                current_value = value.get(trading_pair)
+                if ledger is not None and (
+                    current_present != ledger["baseline_present"]
+                    or (
+                        current_present
+                        and current_value is not ledger["baseline_value"]
+                    )
+                ):
+                    snapshot["unsafe_mutation"] = True
 
-    async def _watch_public_transaction_tasks(
-        self,
-        snapshot: Dict[str, Any],
-        boundary: str,
-        stop: asyncio.Event,
-    ) -> None:
-        while not stop.is_set():
-            self._discover_public_transaction_tasks(snapshot, boundary)
-            await asyncio.sleep(0)
-        self._discover_public_transaction_tasks(snapshot, boundary)
+    @asynccontextmanager
+    async def _capture_public_task_provenance(
+        self, snapshot: Dict[str, Any]
+    ):
+        """Tag tasks created by the awaited connector operation without polling."""
+        loop = asyncio.get_running_loop()
+        state = _PUBLIC_TASK_FACTORY_STATES.get(loop)
+        if state is None:
+            previous = loop.get_task_factory()
+
+            def task_factory(factory_loop, coroutine, **kwargs):
+                context = kwargs.get("context")
+                transaction = (
+                    context.get(_PUBLIC_TRANSACTION_CONTEXT)
+                    if context is not None
+                    else _PUBLIC_TRANSACTION_CONTEXT.get()
+                )
+                if previous is None:
+                    task = asyncio.Task(
+                        coroutine, loop=factory_loop, **kwargs
+                    )
+                else:
+                    task = previous(factory_loop, coroutine, **kwargs)
+                if transaction is not None and isinstance(task, asyncio.Task):
+                    transaction["provenance_tasks"].add(task)
+                    transaction["owned_tasks"].add(task)
+                return task
+
+            state = {
+                "previous": previous,
+                "factory": task_factory,
+                "users": 0,
+            }
+            _PUBLIC_TASK_FACTORY_STATES[loop] = state
+            loop.set_task_factory(task_factory)
+        state["users"] += 1
+        token = _PUBLIC_TRANSACTION_CONTEXT.set(snapshot)
+        try:
+            yield
+        finally:
+            _PUBLIC_TRANSACTION_CONTEXT.reset(token)
+            state["users"] -= 1
+            if state["users"] == 0:
+                if loop.get_task_factory() is state["factory"]:
+                    loop.set_task_factory(state["previous"])
+                _PUBLIC_TASK_FACTORY_STATES.pop(loop, None)
 
     def _record_public_pair_deltas(self, snapshot: Dict[str, Any]) -> None:
         trading_pair = snapshot["trading_pair"]
@@ -967,24 +1115,28 @@ class UnifiedConnectorService:
             value = state["value"]
             baseline_count = state["contents"].count(trading_pair)
             current_count = value.count(trading_pair)
-            if current_count == baseline_count:
+            existing = next(
+                (
+                    delta
+                    for delta in snapshot["owned_pair_deltas"]
+                    if delta["container"] is value
+                ),
+                None,
+            )
+            if existing is not None:
+                if current_count != existing["owned_count"]:
+                    snapshot["unsafe_mutation"] = True
                 continue
-            if any(
-                delta["container"] is value
-                for delta in snapshot["owned_pair_deltas"]
-            ):
+            if current_count == baseline_count:
                 continue
             if current_count == baseline_count + 1:
                 action = "add"
-                index = max(
-                    index
-                    for index, pair in enumerate(value)
-                    if pair == trading_pair
-                )
             elif current_count == baseline_count - 1:
                 action = "remove"
-                index = state["contents"].index(trading_pair)
             else:
+                snapshot["unsafe_mutation"] = True
+                continue
+            if max(baseline_count, current_count) > 1:
                 snapshot["unsafe_mutation"] = True
                 continue
             snapshot["owned_pair_deltas"].append(
@@ -994,8 +1146,8 @@ class UnifiedConnectorService:
                     "attribute": attribute,
                     "container": value,
                     "value": trading_pair,
-                    "index": index,
                     "baseline_count": baseline_count,
+                    "owned_count": current_count,
                 }
             )
 
@@ -1008,6 +1160,23 @@ class UnifiedConnectorService:
         baseline_present = trading_pair in state["contents"]
         baseline_value = state["contents"].get(trading_pair)
         current_present = trading_pair in books
+        existing = next(
+            (
+                delta
+                for delta in snapshot["owned_book_deltas"]
+                if delta["container"] is books
+                and delta["key"] == trading_pair
+            ),
+            None,
+        )
+        if existing is not None:
+            expected_present = existing["action"] == "set"
+            if current_present != expected_present or (
+                current_present
+                and books.get(trading_pair) is not existing["owned_value"]
+            ):
+                snapshot["unsafe_mutation"] = True
+            return
         if not current_present and not baseline_present:
             return
         if current_present:
@@ -1018,11 +1187,6 @@ class UnifiedConnectorService:
         else:
             owned_value = None
             action = "remove"
-        if any(
-            delta["container"] is books and delta["key"] == trading_pair
-            for delta in snapshot["owned_book_deltas"]
-        ):
-            return
         snapshot["owned_book_deltas"].append(
             {
                 "action": action,
@@ -1104,19 +1268,15 @@ class UnifiedConnectorService:
             if hidden_boundary
             else set()
         )
-        stop = asyncio.Event()
-        watcher = None
         if boundary in {"start", "pair"}:
-            watcher = asyncio.create_task(
-                self._watch_public_transaction_tasks(snapshot, boundary, stop)
-            )
-            await asyncio.sleep(0)
+            self._record_public_pair_deltas(snapshot)
+            self._discover_public_transaction_tasks(snapshot, boundary)
         try:
+            if boundary in {"start", "pair"}:
+                async with self._capture_public_task_provenance(snapshot):
+                    return await operation
             return await operation
         finally:
-            if watcher is not None:
-                stop.set()
-                await asyncio.shield(watcher)
             if boundary in {"start", "pair"}:
                 self._record_public_pair_deltas(snapshot)
                 self._discover_public_transaction_tasks(snapshot, boundary)
@@ -1321,11 +1481,14 @@ class UnifiedConnectorService:
                     delta["action"] == "remove"
                     and pairs.count(value) == delta["baseline_count"] - 1
                 ):
-                    pairs.insert(min(delta["index"], len(pairs)), value)
-                elif pairs.count(value) == delta["baseline_count"] + 1:
-                    index = delta["index"]
-                    if index < len(pairs) and pairs[index] == value:
-                        pairs.pop(index)
+                    pairs.append(value)
+                elif (
+                    delta["action"] == "add"
+                    and pairs.count(value) == delta["baseline_count"] + 1
+                ):
+                    pairs.remove(value)
+                else:
+                    restored = False
             except BaseException:
                 restored = False
 
@@ -1344,21 +1507,40 @@ class UnifiedConnectorService:
         self,
         snapshot: Mapping[str, Any],
         pending: Set[asyncio.Task],
+        disposition: str,
     ) -> ConnectorCapabilityError:
         connector_key = snapshot["connector_key"]
         owner_key = self._owner_key(*connector_key, "public_transaction")
-        self._connector_cleanup_owners[owner_key] = snapshot["connector"]
+        self._connector_cleanup_owners[owner_key] = {
+            "connector": snapshot["connector"],
+            "snapshot": snapshot,
+            "disposition": disposition,
+        }
         self._connector_residual_tasks.setdefault(owner_key, set()).update(pending)
         self._connector_cleanup_phases[owner_key] = {
             "task_drain": {
-                "task": next(iter(pending)),
+                "task": next(iter(pending), None),
                 "tasks": tuple(pending),
+                "complete": not pending,
+                "result": True if not pending else None,
+                "error_code": (
+                    "public_task_cleanup_pending" if pending else None
+                ),
+                "cancel_requested": bool(pending),
+            },
+            "disposition": {
+                "task": None,
                 "complete": False,
-                "result": None,
-                "error_code": "public_task_cleanup_pending",
-                "cancel_requested": True,
-            }
+                "result": disposition,
+                "error_code": None,
+                "cancel_requested": False,
+            },
         }
+        cleanup_code = (
+            "public_task_cleanup_pending"
+            if pending
+            else "public_disposition_pending"
+        )
         detail = CapabilityErrorDetail(
             code="connector_capability_cleanup_residual",
             message=(
@@ -1369,12 +1551,72 @@ class UnifiedConnectorService:
             feature="capabilities",
             reason="cleanup_incomplete",
             cleanup_scope="connector",
-            cleanup_code="public_task_cleanup_pending",
+            cleanup_code=cleanup_code,
         )
         self._connector_creation_residuals[connector_key] = detail.model_dump(
             exclude_none=True
         )
         return ConnectorCapabilityError(detail)
+
+    async def _discard_public_transaction_connector(
+        self,
+        owner_key: Tuple[str, str, str],
+        snapshot: Mapping[str, Any],
+    ) -> None:
+        """Let the exact rejected connector own shutdown, then unpublish it."""
+        connector = snapshot["connector"]
+        account_name, connector_name = snapshot["connector_key"]
+        if account_name != "__data__":
+            if self._public_connector_is_owned(snapshot):
+                detail = await self._finalize_stop_trading_connector(
+                    account_name, connector_name
+                )
+                if detail is not None:
+                    raise ConnectorCapabilityError(detail)
+            else:
+                stop_network = getattr(connector, "stop_network", None)
+                if stop_network is None:
+                    raise RuntimeError("connector_stop_unavailable")
+                await self._run_owner_operation(
+                    owner_key, "discard_stop", stop_network
+                )
+            return
+
+        stop_network = getattr(connector, "stop_network", None)
+        if stop_network is None:
+            raise RuntimeError("connector_stop_unavailable")
+        unpublished_owned = self._data_connectors.get(connector_name) is connector
+        if unpublished_owned:
+            self._data_connectors.pop(connector_name, None)
+            self._data_connectors_started.pop(connector_name, None)
+        await self._run_owner_operation(
+            owner_key, "discard_stop", stop_network
+        )
+        if unpublished_owned and self._connector_incarnation(
+            snapshot["connector_key"]
+        ) == snapshot["incarnation"]:
+            self._prune_connector_incarnation(snapshot["connector_key"])
+
+    async def _complete_public_transaction_disposition(
+        self, owner_key: Tuple[str, str, str]
+    ) -> None:
+        owner = self._connector_cleanup_owners[owner_key]
+        snapshot = owner["snapshot"]
+        disposition = owner["disposition"]
+        phase = self._connector_cleanup_phases[owner_key]["disposition"]
+        if disposition == "restore":
+            if self._public_transaction_can_restore(
+                snapshot
+            ) and self._restore_public_transaction_state(snapshot):
+                phase["complete"] = True
+                phase["result"] = "restore"
+                return
+            disposition = "discard"
+            owner["disposition"] = disposition
+            phase["result"] = disposition
+        await self._discard_public_transaction_connector(owner_key, snapshot)
+        phase["complete"] = True
+        phase["result"] = "discard"
 
     async def _retry_public_transaction_cleanup(
         self, connector_key: Tuple[str, str]
@@ -1392,13 +1634,42 @@ class UnifiedConnectorService:
             phase["complete"] = True
             phase["error_code"] = None
             phase["result"] = True
+        try:
+            await self._complete_public_transaction_disposition(owner_key)
+        except asyncio.CancelledError:
+            raise
+        except ConnectorCapabilityError:
+            raise
+        except BaseException as exc:
+            disposition_phase = self._connector_cleanup_phases.get(
+                owner_key, {}
+            ).get("disposition")
+            if disposition_phase is not None:
+                disposition_phase["error_code"] = "public_disposition_pending"
+            detail = CapabilityErrorDetail(
+                code="connector_capability_cleanup_residual",
+                message=(
+                    f"Rejected capability cleanup is incomplete for "
+                    f"'{connector_key[1]}'"
+                ),
+                connector=connector_key[1],
+                feature="capabilities",
+                reason="cleanup_incomplete",
+                cleanup_scope="connector",
+                cleanup_code="public_disposition_pending",
+            )
+            self._connector_creation_residuals[connector_key] = (
+                detail.model_dump(exclude_none=True)
+            )
+            logger.error(
+                "Public transaction cleanup failed for %s/%s (%s)",
+                connector_key[0],
+                connector_key[1],
+                type(exc).__name__,
+            )
+            raise ConnectorCapabilityError(detail) from None
         self._finish_owner_cleanup(owner_key)
-        residual = self._connector_creation_residuals.get(connector_key)
-        if (
-            residual is not None
-            and residual.get("cleanup_code") == "public_task_cleanup_pending"
-        ):
-            self._connector_creation_residuals.pop(connector_key, None)
+        self._connector_creation_residuals.pop(connector_key, None)
 
     def _validate_public_transaction_state(
         self, snapshot: Mapping[str, Any]
@@ -1424,42 +1695,16 @@ class UnifiedConnectorService:
             not force_discard
             and self._public_transaction_can_restore(snapshot)
         )
-        retained_error = None
         if pending:
-            retained_error = self._retain_public_transaction_tasks(snapshot, pending)
-        restored = can_restore and self._restore_public_transaction_state(snapshot)
-        if retained_error is not None:
-            raise retained_error
-        if can_restore and restored:
-            return
-        if self._public_connector_is_owned(snapshot):
-            await self._discard_invalid_public_declaration(
-                snapshot["connector_name"], snapshot["connector"], snapshot
+            raise self._retain_public_transaction_tasks(
+                snapshot,
+                pending,
+                "restore" if can_restore else "discard",
             )
+        if can_restore and self._restore_public_transaction_state(snapshot):
             return
-        if changed:
-            account_name, connector_name = snapshot["connector_key"]
-            try:
-                await self._stop_connector_network(
-                    snapshot["connector"], account_name, connector_name
-                )
-            except BaseException:
-                detail = CapabilityErrorDetail(
-                    code="connector_capability_cleanup_residual",
-                    message=(
-                        f"Rejected capability cleanup is incomplete for "
-                        f"'{connector_name}'"
-                    ),
-                    connector=connector_name,
-                    feature="capabilities",
-                    reason="cleanup_incomplete",
-                    cleanup_scope="connector",
-                    cleanup_code="connector_stop_failed",
-                )
-                self._connector_creation_residuals[snapshot["connector_key"]] = (
-                    detail.model_dump(exclude_none=True)
-                )
-                raise ConnectorCapabilityError(detail) from None
+        self._retain_public_transaction_tasks(snapshot, set(), "discard")
+        await self._retry_public_transaction_cleanup(snapshot["connector_key"])
 
     async def _await_public_transaction_cleanup(
         self,
@@ -2203,20 +2448,51 @@ class UnifiedConnectorService:
         self.require_capability(
             connector_name, ConnectorFeature.DYNAMIC_SUBSCRIPTION, trading_pair
         )
-        if account_name is not None:
-            # Never clean another account's connector when the requested account
-            # does not own this connector.
-            connector = self._trading_connectors.get(account_name, {}).get(
-                connector_name
+        while True:
+            connector_key = self._resolve_public_connector_key(
+                connector_name, account_name
             )
-        else:
-            connector = self.get_best_connector_for_market(connector_name)
-
-        if not connector:
-            logger.warning(f"No connector available for {connector_name} to remove {trading_pair}")
-            return False
-
-        return await self._remove_trading_pair_from_tracker(connector, trading_pair)
+            async with self._connector_creation_lock(connector_key):
+                if (
+                    self._resolve_public_connector_key(
+                        connector_name, account_name
+                    )
+                    != connector_key
+                ):
+                    continue
+                await self._retry_public_transaction_cleanup(connector_key)
+                residual = self._connector_creation_residuals.get(connector_key)
+                if residual is not None:
+                    raise ConnectorCapabilityError(
+                        CapabilityErrorDetail.model_validate(residual)
+                    )
+                connector = self._connector_for_public_key(connector_key)
+                if not connector:
+                    logger.warning(
+                        "No connector available for %s to remove %s",
+                        connector_name,
+                        trading_pair,
+                    )
+                    return False
+                if self._connector_incarnation(connector_key) is None:
+                    self._advance_connector_incarnation(connector_key)
+                incarnation = self._connector_incarnation(connector_key)
+                result = await self._remove_trading_pair_from_tracker(
+                    connector, trading_pair
+                )
+                if not result:
+                    return False
+                if (
+                    self._connector_incarnation(connector_key) != incarnation
+                    or self._cached_public_connector(connector_key) is not connector
+                ):
+                    logger.warning(
+                        "Connector lifecycle changed while removing %s from %s",
+                        trading_pair,
+                        connector_name,
+                    )
+                    return False
+                return True
 
     async def _remove_trading_pair_from_tracker(
         self,
