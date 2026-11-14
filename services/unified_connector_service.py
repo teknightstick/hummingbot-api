@@ -99,6 +99,9 @@ class UnifiedConnectorService:
         # Locks to prevent race conditions in connector creation
         self._connector_locks: Dict[Tuple[str, str], asyncio.Lock] = {}
         self._connector_lock_users: Dict[Tuple[str, str], int] = {}
+        self._connector_creation_failures: Dict[
+            Tuple[str, str], Dict[str, Any]
+        ] = {}
         self._connector_locks_guard = asyncio.Lock()
         self._connector_creation_residuals: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._connector_cleanup_owners: Dict[Tuple[str, str, str], Any] = {}
@@ -227,6 +230,7 @@ class UnifiedConnectorService:
         """Initialize private lifecycle registries for dependency-light instances."""
         defaults = (
             ("_connector_creation_residuals", {}),
+            ("_connector_creation_failures", {}),
             ("_connector_cleanup_owners", {}),
             ("_connector_cleanup_indices", {}),
             ("_connector_residual_tasks", {}),
@@ -267,13 +271,26 @@ class UnifiedConnectorService:
                 raise ConnectorCapabilityError(
                     CapabilityErrorDetail.model_validate(residual)
                 )
+            failure = self._connector_creation_failures.get(connector_key)
+            if failure is not None:
+                raise ConnectorCapabilityError(
+                    CapabilityErrorDetail.model_validate(failure)
+                )
             existing = self._trading_connectors.get(account_name, {}).get(connector_name)
             if existing is not None:
                 return existing
 
-            connector = await self._create_and_initialize_trading_connector(
-                account_name, connector_name
-            )
+            try:
+                connector = await self._create_and_initialize_trading_connector(
+                    account_name, connector_name
+                )
+            except ConnectorCapabilityError as error:
+                # Callers already queued on this creation attempt must observe its
+                # typed terminal result instead of constructing and stopping the
+                # same failed connector again. The lock prunes this transient
+                # result when the final waiter leaves, so a later call may retry.
+                self._connector_creation_failures[connector_key] = dict(error.detail)
+                raise
             self._trading_connectors.setdefault(account_name, {})[connector_name] = connector
             self._connector_creation_residuals.pop(connector_key, None)
             return connector
@@ -304,6 +321,9 @@ class UnifiedConnectorService:
                     self._connector_lock_users.pop(connector_key, None)
                     if self._connector_locks.get(connector_key) is lock:
                         self._connector_locks.pop(connector_key, None)
+                    getattr(self, "_connector_creation_failures", {}).pop(
+                        connector_key, None
+                    )
 
     def get_all_trading_connectors(self) -> Dict[str, Dict[str, ConnectorBase]]:
         """
@@ -659,6 +679,10 @@ class UnifiedConnectorService:
             )
             return False
 
+        # Lazy symbol/instrument discovery may replace api_capabilities. Validate
+        # that loaded declaration before any pair, book, or tracker state changes.
+        self._validate_instance_capabilities(connector_name, connector)
+
         # For data connectors, ensure network is started
         if connector_name in self._data_connectors:
             if not self._data_connectors_started.get(connector_name, False):
@@ -962,6 +986,10 @@ class UnifiedConnectorService:
 
         # Initialize symbol map and trading rules
         await connector._initialize_trading_pair_symbol_map()
+        # Manzana replaces api_capabilities with pair-narrowed loaded truth at
+        # this boundary. Reject incompatible truth before later initialization
+        # creates recorders, metrics, tasks, or other externally visible state.
+        self._validate_instance_capabilities(connector_name, connector)
         await connector._update_trading_rules()
         await connector._update_balances()
 
@@ -1004,6 +1032,10 @@ class UnifiedConnectorService:
             except Exception as e:
                 logger.error(f"Error updating initial order status for {connector_name}: {e}")
 
+        # This is the final declaration boundary. Any accepted initialization
+        # seam that replaces api_capabilities after symbol discovery is still
+        # rejected before the caller can publish the connector in its cache.
+        self._validate_instance_capabilities(connector_name, connector)
         logger.info(f"Initialized trading connector {connector_name} for {account_name}")
         return connector
 

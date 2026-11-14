@@ -2220,6 +2220,388 @@ def _load_unified_service_module():
     return module, ConnectorCapabilityRegistry
 
 
+def _final_boundary_service(module, registry_type):
+    service = object.__new__(module.UnifiedConnectorService)
+    service._trading_connectors = {}
+    service._data_connectors = {}
+    service._data_connectors_started = {}
+    service._connector_locks = {}
+    service._connector_lock_users = {}
+    service._connector_locks_guard = asyncio.Lock()
+    service._orders_recorders = {}
+    service._funding_recorders = {}
+    service._metrics_collectors = {}
+    service._connector_creation_residuals = {}
+    service._connector_cleanup_owners = {}
+    service._connector_cleanup_indices = {}
+    service._connector_residual_tasks = {}
+    service._connector_cleanup_phases = {}
+    service._capability_registry = registry_type()
+    service.db_manager = None
+    return service
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["bootstrap_loss", "incomplete_chain"])
+async def test_final_declaration_boundary_rejects_concurrent_waiters_transactionally(
+    mutation,
+):
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    symbol_map_entered = asyncio.Event()
+    release_symbol_map = asyncio.Event()
+    constructor_calls = 0
+    post_symbol_calls = []
+
+    class Tracker:
+        def __init__(self):
+            self._trading_pairs = []
+            self.order_books = {}
+            self._tracking_tasks = {}
+            self.stop_calls = 0
+
+        def stop(self):
+            self.stop_calls += 1
+
+    class Connector:
+        in_flight_orders = {}
+
+        def __init__(self):
+            self.api_capabilities = _shift_successor_capabilities()
+            self.order_book_tracker = Tracker()
+            self._trading_pairs = []
+            self.stop_calls = 0
+            self.symbol_map_calls = 0
+
+        async def _initialize_trading_pair_symbol_map(self):
+            self.symbol_map_calls += 1
+            symbol_map_entered.set()
+            await release_symbol_map.wait()
+            declaration = _shift_successor_capabilities(
+                supported_pairs={"BTC-USD", "ETH-USD"}
+            )
+            if mutation == "bootstrap_loss":
+                declaration["features"] = set(declaration["features"]) - {
+                    module.ConnectorFeature.ORDER_BOOK
+                }
+            else:
+                declaration["features"] = {
+                    *declaration["features"],
+                    module.ConnectorFeature.ORDER_SUBMISSION,
+                }
+                self.buy = lambda **kwargs: "buy-id"
+                self.sell = lambda **kwargs: "sell-id"
+                self.cancel = None
+            self.api_capabilities = declaration
+
+        async def _update_trading_rules(self):
+            post_symbol_calls.append("rules")
+
+        async def _update_balances(self):
+            post_symbol_calls.append("balances")
+
+        async def stop_network(self):
+            self.stop_calls += 1
+
+    connector = Connector()
+
+    def construct(account_name, connector_name):
+        nonlocal constructor_calls
+        constructor_calls += 1
+        return connector
+
+    service._create_trading_connector = construct
+    service._initialize_metrics = lambda *args: post_symbol_calls.append("metrics")
+
+    async def start_network(connector_arg):
+        post_symbol_calls.append("network")
+
+    service._start_connector_network = start_network
+    first = asyncio.create_task(
+        service.get_trading_connector("master", "manzana")
+    )
+    await symbol_map_entered.wait()
+    second = asyncio.create_task(
+        service.get_trading_connector("master", "manzana")
+    )
+    while service._connector_lock_users.get(("master", "manzana"), 0) < 2:
+        await asyncio.sleep(0)
+    release_symbol_map.set()
+    results = await asyncio.gather(first, second, return_exceptions=True)
+
+    CHECK.assertTrue(
+        all(isinstance(result, module.ConnectorCapabilityError) for result in results),
+        results,
+    )
+    CHECK.assertEqual(
+        ["connector_capability_mismatch", "connector_capability_mismatch"],
+        [result.detail["code"] for result in results],
+    )
+    CHECK.assertEqual(1, constructor_calls)
+    CHECK.assertEqual(1, connector.symbol_map_calls)
+    CHECK.assertEqual([], post_symbol_calls)
+    CHECK.assertEqual(1, connector.order_book_tracker.stop_calls)
+    CHECK.assertEqual(1, connector.stop_calls)
+    CHECK.assertEqual([], connector._trading_pairs)
+    CHECK.assertEqual([], connector.order_book_tracker._trading_pairs)
+    CHECK.assertEqual({}, connector.order_book_tracker.order_books)
+    CHECK.assertEqual({}, service._trading_connectors)
+    CHECK.assertEqual({}, service._orders_recorders)
+    CHECK.assertEqual({}, service._funding_recorders)
+    CHECK.assertEqual({}, service._metrics_collectors)
+    CHECK.assertEqual({}, service._connector_creation_residuals)
+    CHECK.assertEqual({}, service._connector_cleanup_owners)
+    CHECK.assertEqual({}, service._connector_cleanup_indices)
+    CHECK.assertEqual({}, service._connector_residual_tasks)
+    CHECK.assertEqual({}, service._connector_cleanup_phases)
+    CHECK.assertEqual({}, service._connector_lock_users)
+    CHECK.assertEqual({}, service._connector_locks)
+    CHECK.assertEqual(
+        {}, getattr(service, "_connector_creation_failures", {})
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final_declaration", ["pair_narrowed", "validated_superset"])
+async def test_final_declaration_boundary_publishes_compatible_truth(final_declaration):
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    lifecycle_calls = []
+
+    class Connector:
+        order_book_tracker = None
+        in_flight_orders = {}
+
+        def __init__(self):
+            self.api_capabilities = _shift_successor_capabilities()
+
+        async def _initialize_trading_pair_symbol_map(self):
+            declaration = _shift_successor_capabilities(
+                supported_pairs={"BTC-USD", "ETH-USD"}
+            )
+            if final_declaration == "validated_superset":
+                declaration["features"] = {
+                    *declaration["features"],
+                    module.ConnectorFeature.ORDER_SUBMISSION,
+                }
+                self.buy = lambda **kwargs: "buy-id"
+                self.sell = lambda **kwargs: "sell-id"
+                self.cancel = lambda **kwargs: "cancel-id"
+            self.api_capabilities = declaration
+            lifecycle_calls.append("symbol_map")
+
+        async def _update_trading_rules(self):
+            lifecycle_calls.append("rules")
+
+        async def _update_balances(self):
+            lifecycle_calls.append("balances")
+
+        async def stop_network(self):
+            lifecycle_calls.append("stop")
+
+    connector = Connector()
+    service._create_trading_connector = lambda account, name: connector
+    service._initialize_metrics = lambda *args: lifecycle_calls.append("metrics")
+
+    async def start_network(connector_arg):
+        lifecycle_calls.append("network")
+
+    service._start_connector_network = start_network
+    loaded = await service.get_trading_connector("master", "manzana")
+
+    CHECK.assertIs(connector, loaded)
+    CHECK.assertIs(
+        connector, service._trading_connectors["master"]["manzana"]
+    )
+    CHECK.assertEqual(
+        ["symbol_map", "rules", "balances", "metrics", "network"],
+        lifecycle_calls,
+    )
+    CHECK.assertEqual(
+        frozenset({"BTC-USD", "ETH-USD"}),
+        service.get_connector_capabilities("manzana", connector).supported_pairs,
+    )
+    CHECK.assertEqual({}, service._connector_lock_users)
+    CHECK.assertEqual({}, service._connector_locks)
+
+
+@pytest.mark.asyncio
+async def test_final_declaration_boundary_rechecks_after_late_initialization():
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+
+    class Index:
+        def __init__(self):
+            self.stop_calls = 0
+
+        async def stop(self):
+            self.stop_calls += 1
+
+    class Connector:
+        order_book_tracker = None
+        in_flight_orders = {}
+
+        def __init__(self):
+            self.api_capabilities = _shift_successor_capabilities()
+            self.stop_calls = 0
+
+        async def _initialize_trading_pair_symbol_map(self):
+            self.api_capabilities = _shift_successor_capabilities(
+                supported_pairs={"BTC-USD"}
+            )
+
+        async def _update_trading_rules(self):
+            return None
+
+        async def _update_balances(self):
+            return None
+
+        async def stop_network(self):
+            self.stop_calls += 1
+
+    connector = Connector()
+    orders = Index()
+    funding = Index()
+    metrics = Index()
+    service._create_trading_connector = lambda account, name: connector
+
+    def initialize_indices(connector_arg, account_name, connector_name, cache_key):
+        service._orders_recorders[cache_key] = orders
+        service._funding_recorders[cache_key] = funding
+        service._metrics_collectors[cache_key] = metrics
+
+    service._initialize_metrics = initialize_indices
+
+    async def mutate_after_network_start(connector_arg):
+        declaration = _shift_successor_capabilities(
+            supported_pairs={"BTC-USD"}
+        )
+        declaration["features"] = set(declaration["features"]) - {
+            module.ConnectorFeature.LIVE_ORDER_BOOK
+        }
+        connector_arg.api_capabilities = declaration
+
+    service._start_connector_network = mutate_after_network_start
+
+    with pytest.raises(module.ConnectorCapabilityError) as mismatch:
+        await service.get_trading_connector("master", "manzana")
+
+    CHECK.assertEqual("connector_capability_mismatch", mismatch.value.detail["code"])
+    CHECK.assertEqual(1, connector.stop_calls)
+    CHECK.assertEqual((1, 1, 1), (orders.stop_calls, funding.stop_calls, metrics.stop_calls))
+    CHECK.assertEqual({}, service._trading_connectors)
+    CHECK.assertEqual({}, service._orders_recorders)
+    CHECK.assertEqual({}, service._funding_recorders)
+    CHECK.assertEqual({}, service._metrics_collectors)
+    CHECK.assertEqual({}, service._connector_creation_residuals)
+    CHECK.assertEqual({}, service._connector_cleanup_owners)
+    CHECK.assertEqual({}, service._connector_cleanup_indices)
+    CHECK.assertEqual({}, service._connector_residual_tasks)
+    CHECK.assertEqual({}, service._connector_cleanup_phases)
+    CHECK.assertEqual({}, service._connector_lock_users)
+    CHECK.assertEqual({}, service._connector_locks)
+    CHECK.assertEqual({}, service._connector_creation_failures)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["bootstrap_loss", "incomplete_chain"])
+async def test_public_symbol_discovery_revalidates_before_pair_mutation(mutation):
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    pair_mutation_calls = []
+
+    class Tracker:
+        _trading_pairs = []
+        order_books = {}
+
+    class Connector:
+        def __init__(self):
+            self.api_capabilities = _shift_successor_capabilities()
+            self._trading_pairs = []
+            self.order_book_tracker = Tracker()
+
+        async def exchange_symbol_associated_to_pair(self, trading_pair):
+            declaration = _shift_successor_capabilities(
+                supported_pairs={"BTC-USD"}
+            )
+            if mutation == "bootstrap_loss":
+                declaration["features"] = set(declaration["features"]) - {
+                    module.ConnectorFeature.ORDER_BOOK
+                }
+            else:
+                declaration["features"] = {
+                    *declaration["features"],
+                    module.ConnectorFeature.ORDER_SUBMISSION,
+                }
+                self.buy = lambda **kwargs: "buy-id"
+                self.sell = lambda **kwargs: "sell-id"
+                self.cancel = None
+            self.api_capabilities = declaration
+            return "BTCUSD"
+
+    connector = Connector()
+    service._data_connectors = {"manzana": connector}
+    service._data_connectors_started = {"manzana": True}
+
+    async def mutate_pair(connector_arg, trading_pair):
+        pair_mutation_calls.append(trading_pair)
+        connector_arg._trading_pairs.append(trading_pair)
+        connector_arg.order_book_tracker._trading_pairs.append(trading_pair)
+        connector_arg.order_book_tracker.order_books[trading_pair] = object()
+        return True
+
+    service._add_trading_pair_to_tracker = mutate_pair
+    service._wait_for_order_book = lambda *args: asyncio.sleep(0, result=True)
+
+    with pytest.raises(module.ConnectorCapabilityError) as mismatch:
+        await service.initialize_order_book("manzana", "BTC-USD")
+
+    CHECK.assertEqual("connector_capability_mismatch", mismatch.value.detail["code"])
+    CHECK.assertEqual([], pair_mutation_calls)
+    CHECK.assertEqual([], connector._trading_pairs)
+    CHECK.assertEqual([], connector.order_book_tracker._trading_pairs)
+    CHECK.assertEqual({}, connector.order_book_tracker.order_books)
+
+
+@pytest.mark.asyncio
+async def test_public_symbol_discovery_accepts_compatible_final_declaration():
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    pair_mutation_calls = []
+
+    class Tracker:
+        _trading_pairs = []
+        order_books = {}
+
+    class Connector:
+        def __init__(self):
+            self.api_capabilities = _shift_successor_capabilities()
+            self._trading_pairs = []
+            self.order_book_tracker = Tracker()
+
+        async def exchange_symbol_associated_to_pair(self, trading_pair):
+            self.api_capabilities = _shift_successor_capabilities(
+                supported_pairs={"BTC-USD"}
+            )
+            return "BTCUSD"
+
+    connector = Connector()
+    service._data_connectors = {"manzana": connector}
+    service._data_connectors_started = {"manzana": True}
+
+    async def add_pair(connector_arg, trading_pair):
+        pair_mutation_calls.append(trading_pair)
+        return True
+
+    service._add_trading_pair_to_tracker = add_pair
+    service._wait_for_order_book = lambda *args: asyncio.sleep(0, result=True)
+
+    ready = await service.initialize_order_book("manzana", "BTC-USD")
+
+    CHECK.assertIs(ready, True)
+    CHECK.assertEqual(["BTC-USD"], pair_mutation_calls)
+
+
 @pytest.mark.asyncio
 async def test_final_b6_failed_connector_creation_restores_indices_and_drains_tasks():
     module, ConnectorCapabilityRegistry = _load_unified_service_module()
