@@ -76,7 +76,7 @@ def test_real_core_query_primitives():
     cases = (
         (book.get_price_for_volume(True, 1), Decimal("101"), Decimal("1")),
         (book.get_price_for_volume(False, 1), Decimal("99"), Decimal("1")),
-        (book.get_price_for_quote_volume(True, 101), Decimal("101"), Decimal("1")),
+        (book.get_price_for_quote_volume(True, 101), Decimal("101"), Decimal("101")),
         (book.get_volume_for_price(True, 101), Decimal("101"), Decimal("2")),
         (book.get_quote_volume_for_price(False, 99), Decimal("99"), Decimal("198")),
         (book.get_vwap_for_volume(True, 1), Decimal("101"), Decimal("1")),

@@ -201,8 +201,8 @@ OrderBookQueryResult = None
 
 
 def _is_contract_module(name: str) -> bool:
-    return name in {"deps", "config"} or name.startswith(
-        ("hummingbot", "models", "routers", "services", "utils")
+    return name in {"deps", "config", "database"} or name.startswith(
+        ("database.", "hummingbot", "models", "routers", "services", "utils")
     )
 
 
@@ -213,6 +213,7 @@ def _scoped_import_contract(request):
     if request.node.name in {
         "test_b6_capability_json_is_deterministic_across_hash_seeds",
         "test_b7_contract_module_does_not_pollute_imports_or_use_bare_asserts",
+        "test_b9_fixture_database_shim_does_not_poison_real_import_order",
         "test_final_b8_fixture_restores_preexisting_module_dicts",
     }:
         yield
@@ -328,6 +329,29 @@ async def test_quote_order_book_queries_use_the_pinned_primitives():
         "result_quote_volume": 210.0,
         "timestamp": quote_for_price["timestamp"],
     })
+
+
+@pytest.mark.asyncio
+async def test_b9_quote_volume_result_is_fulfilled_quote_volume():
+    """Mirror accepted core: result_volume is fulfilled quote, not base, volume."""
+
+    class RealCoreShapedOrderBook:
+        def get_price_for_quote_volume(self, is_buy, quote_volume):
+            CHECK.assertIs(is_buy, True)
+            CHECK.assertEqual(101.0, quote_volume)
+            return QueryResult(float("nan"), quote_volume, 101.0, 101.0)
+
+    service = MarketDataService(
+        OrderBookConnectorService(RealCoreShapedOrderBook())
+    )
+
+    result = await service.get_order_book_query_result(
+        "static", "BTC-USD", True, quote_volume=101.0
+    )
+
+    CHECK.assertEqual(101.0, result["result_price"])
+    CHECK.assertEqual(101.0, result["result_quote_volume"])
+    CHECK.assertNotIn("result_volume", result)
 
 
 @pytest.mark.asyncio
@@ -2172,14 +2196,18 @@ async def test_final_b7_stale_pair_marker_rejects_before_remote_work():
 
 
 def test_final_b8_fixture_restores_preexisting_module_dicts():
-    selected = ("deps", "models", "services")
+    selected = ("deps", "models", "services", "database")
     original_modules = {name: sys.modules.get(name) for name in selected}
     sentinels = {}
     before_dicts = {}
     try:
         for name in selected:
             module = types.ModuleType(name)
-            module.__path__ = [str(Path(__file__).resolve().parents[1] / name)] if name != "deps" else []
+            module.__path__ = (
+                [str(Path(__file__).resolve().parents[1] / name)]
+                if name != "deps"
+                else []
+            )
             sentinel = object()
             module.preloaded_sentinel = sentinel
             if name == "deps":
@@ -2217,6 +2245,65 @@ def test_final_b8_fixture_restores_preexisting_module_dicts():
     tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
     bare_asserts = [node.lineno for node in ast.walk(tree) if isinstance(node, ast.Assert)]
     CHECK.assertEqual([], bare_asserts)
+
+
+def test_b9_fixture_database_shim_does_not_poison_real_import_order():
+    """A capability test may create database shims without poisoning later imports."""
+    repo = Path(__file__).resolve().parents[1]
+    script = r"""
+import importlib
+import pathlib
+import sys
+
+import pytest
+
+root = pathlib.Path(sys.argv[1]).resolve()
+node = (
+    "test/test_issue222_manzana_capabilities.py::"
+    "test_closure_b2_accounts_active_orders_gate_before_connector_lookup"
+)
+result = pytest.main(["-q", "-p", "no:cacheprovider", node])
+if result != pytest.ExitCode.OK:
+    raise SystemExit(f"capability fixture probe failed: {result}")
+
+database = importlib.import_module("database")
+repositories = importlib.import_module("database.repositories")
+for module in (database, repositories):
+    module_file = getattr(module, "__file__", None)
+    if module_file is None or not pathlib.Path(module_file).resolve().is_relative_to(root):
+        raise SystemExit(f"wrong database module provenance: {module_file}")
+    if getattr(module, "__issue222_contract_shim__", False):
+        raise SystemExit("capability database shim leaked after fixture cleanup")
+if not hasattr(database, "__path__"):
+    raise SystemExit("real database package was replaced by a non-package shim")
+print(f"DATABASE_REPOSITORIES={repositories.__file__}")
+"""
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    env.pop("PYTHONHOME", None)
+    env["PYTHONNOUSERSITE"] = "1"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTHONHASHSEED"] = "22209"
+    command = [sys.executable, "-B"]
+    if sys.flags.optimize:
+        command.append("-O")
+    command.extend(("-c", script, str(repo)))
+
+    result = subprocess.run(
+        command,
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    CHECK.assertEqual(
+        0,
+        result.returncode,
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+    )
+    CHECK.assertIn("DATABASE_REPOSITORIES=", result.stdout)
 
 
 def test_closure_b1_advertised_trading_400_matches_runtime_body():
@@ -3950,6 +4037,11 @@ async def test_adjacent_b7_duplicate_websocket_failure_preserves_old_subscriptio
         def require_capability(self, connector, feature, trading_pair=None):
             self.registry.require(connector, feature, trading_pair)
 
+        def validate_order_book_ready(self, connector, trading_pair):
+            if self.fail:
+                raise ValueError("invalid pair")
+            return True
+
         async def initialize_order_book(self, connector, trading_pair):
             if self.fail:
                 raise ValueError("invalid pair")
@@ -4401,6 +4493,20 @@ async def test_final_adjacent_b6_false_websocket_validation_preserves_old_subscr
     class MarketData:
         registry = ConnectorCapabilityRegistry()
 
+        def __init__(self):
+            tracker = types.SimpleNamespace(
+                _trading_pairs=["BTC-USD"],
+                order_books={},
+            )
+            connector = types.SimpleNamespace(
+                _trading_pairs=["BTC-USD"],
+                order_book_tracker=tracker,
+            )
+            self._connector_service = types.SimpleNamespace(
+                _trading_connectors={"master": {"generic": connector}},
+                _data_connectors={},
+            )
+
         def require_capability(self, connector, feature, trading_pair=None):
             self.registry.require(connector, feature, trading_pair)
 
@@ -4750,6 +4856,57 @@ async def test_lifecycle_b2_published_restart_owner_coalesces_final_stop():
 
 
 @pytest.mark.asyncio
+async def test_b9_data_restart_and_stop_all_coalesce_final_tracker_stop():
+    module, registry_type = _load_unified_service_module()
+    service = _adjacent_unified_service(module, registry_type)
+
+    class Tracker:
+        _trading_pairs = ["BTC-USD"]
+        _tracking_tasks = {}
+        order_books = {}
+
+        def __init__(self):
+            self.stop_calls = 0
+
+        def stop(self):
+            self.stop_calls += 1
+
+        def start(self):
+            return None
+
+        async def wait_ready(self):
+            return True
+
+    class DataConnector:
+        def __init__(self, tracker):
+            self.order_book_tracker = tracker
+            self.stop_network_calls = 0
+
+        async def stop_network(self):
+            self.stop_network_calls += 1
+            self.order_book_tracker.stop()
+
+    tracker = Tracker()
+    connector = DataConnector(tracker)
+    service._data_connectors = {"generic": connector}
+    service._data_connectors_started = {"generic": True}
+    service._wait_for_websocket_ready = lambda *args, **kwargs: asyncio.sleep(
+        0, result=False
+    )
+
+    restart = await service.restart_order_book_tracker("generic")
+    CHECK.assertEqual("tracker_websocket_not_ready", restart["error"])
+    await service.stop_all()
+
+    CHECK.assertEqual(1, connector.stop_network_calls)
+    CHECK.assertEqual(2, tracker.stop_calls)
+    CHECK.assertEqual({}, service._connector_cleanup_owners)
+    CHECK.assertEqual({}, service._connector_cleanup_phases)
+    CHECK.assertEqual({}, service._connector_residual_tasks)
+    CHECK.assertEqual({}, service._connector_locks)
+
+
+@pytest.mark.asyncio
 async def test_lifecycle_b3_cancelled_async_start_is_stopped_after_activation():
     module, registry_type = _load_unified_service_module()
     service = _adjacent_unified_service(module, registry_type)
@@ -4934,6 +5091,88 @@ async def test_lifecycle_b4_websocket_replacement_validation_is_read_only():
     CHECK.assertEqual(["BTC-USD"], tracker._trading_pairs)
     CHECK.assertEqual(["BTC-USD"], list(tracker.order_books))
     fallback.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_b9_hidden_owner_websocket_replacement_is_typed_and_nonmutating():
+    from models.connectors import CapabilityErrorDetail
+    from services.connector_capabilities import ConnectorCapabilityRegistry
+
+    module = _load_websocket_manager_module()
+
+    class Task:
+        def __init__(self):
+            self.cancelled = False
+
+        def done(self):
+            return False
+
+        def cancel(self):
+            self.cancelled = True
+
+    class WebSocket:
+        def __init__(self):
+            self.payloads = []
+
+        async def send_json(self, payload):
+            self.payloads.append(payload)
+
+    hidden_feed = {
+        "pairs": ["BTC-USD"],
+        "books": {"BTC-USD": object()},
+        "tasks": {"BTC-USD": object()},
+    }
+    initialize_calls = []
+
+    class HiddenOwnerService:
+        registry = ConnectorCapabilityRegistry()
+
+        def require_capability(self, connector_name, feature, trading_pair=None):
+            self.registry.require(connector_name, feature, trading_pair)
+
+        async def initialize_order_book(self, connector_name, trading_pair):
+            initialize_calls.append((connector_name, trading_pair))
+            hidden_feed["pairs"].clear()
+            hidden_feed["books"].clear()
+            hidden_feed["tasks"].clear()
+            return False
+
+    old_task = Task()
+    sub_id = "order_book_generic_BTC-USD"
+    old = module.Subscription(
+        subscription_id=sub_id,
+        sub_type="order_book",
+        connector="generic",
+        trading_pair="BTC-USD",
+        update_interval=1.0,
+        task=old_task,
+    )
+    websocket = WebSocket()
+    manager = module.WebSocketManager(HiddenOwnerService())
+    manager._connections = {"connection": {sub_id: old}}
+
+    await manager.handle_subscribe(
+        "connection",
+        websocket,
+        {
+            "type": "order_book",
+            "connector": "generic",
+            "trading_pair": "BTC-USD",
+        },
+    )
+
+    CHECK.assertIs(old, manager._connections["connection"][sub_id])
+    CHECK.assertFalse(old_task.cancelled)
+    CHECK.assertEqual([], initialize_calls)
+    CHECK.assertEqual(["BTC-USD"], hidden_feed["pairs"])
+    CHECK.assertEqual(["BTC-USD"], list(hidden_feed["books"]))
+    CHECK.assertEqual(["BTC-USD"], list(hidden_feed["tasks"]))
+    detail = websocket.payloads[-1]["detail"]
+    CapabilityErrorDetail.model_validate(detail)
+    CHECK.assertEqual("replacement_validation_unavailable", detail["code"])
+    CHECK.assertEqual("generic", detail["connector"])
+    CHECK.assertEqual("BTC-USD", detail["trading_pair"])
+    manager.shutdown()
 
 
 @pytest.mark.asyncio

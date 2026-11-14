@@ -1613,6 +1613,32 @@ class UnifiedConnectorService:
             raise RuntimeError("task_cleanup_pending")
         self._finish_owner_cleanup(owner_key)
 
+    async def _stop_data_connector_network(
+        self,
+        connector: ConnectorBase,
+        connector_name: str,
+    ) -> None:
+        """Stop one published data connector without double-stopping its tracker."""
+        self._ensure_connector_cleanup_state()
+        owner_key = self._owner_key("__data__", connector_name, "data_network")
+        self._connector_cleanup_owners[owner_key] = connector
+        if not await self._drain_owner_tasks(owner_key):
+            raise RuntimeError("task_cleanup_pending")
+
+        tasks = self._collect_connector_tasks(connector)
+        stop_network = getattr(connector, "stop_network", None)
+        if stop_network is None:
+            raise RuntimeError("connector_stop_unavailable")
+        await self._run_owner_operation(
+            owner_key,
+            "connector_stop",
+            stop_network,
+        )
+        tasks.update(self._collect_connector_tasks(connector))
+        if not await self._drain_owner_tasks(owner_key, tasks):
+            raise RuntimeError("task_cleanup_pending")
+        self._finish_owner_cleanup(owner_key)
+
     async def refresh_connector_state(
         self,
         connector: ConnectorBase,
@@ -2370,7 +2396,14 @@ class UnifiedConnectorService:
             restart_owner_keys - verified_restart_owners
         )
         account_connectors = self._trading_connectors.get(account_name)
-        connector = account_connectors.get(connector_name) if account_connectors else None
+        data_connector = (
+            self._data_connectors.get(connector_name)
+            if account_name == "__data__"
+            else None
+        )
+        connector = data_connector
+        if connector is None and account_connectors:
+            connector = account_connectors.get(connector_name)
         stopped_connectors = []
         network_cleanup_failed = restart_phase_failed
         if connector is None:
@@ -2379,15 +2412,24 @@ class UnifiedConnectorService:
             )
         if connector is not None and not restart_phase_failed:
             try:
-                await self._stop_connector_network(
-                    connector, account_name, connector_name
-                )
+                if connector is data_connector:
+                    await self._stop_data_connector_network(
+                        connector, connector_name
+                    )
+                else:
+                    await self._stop_connector_network(
+                        connector, account_name, connector_name
+                    )
             except BaseException:
                 cleanup_codes.append("connector_cleanup_incomplete")
                 network_cleanup_failed = True
             else:
                 stopped_connectors.append(connector)
-                if account_connectors and account_connectors.get(connector_name) is connector:
+                if connector is data_connector:
+                    if self._data_connectors.get(connector_name) is connector:
+                        self._data_connectors.pop(connector_name, None)
+                    self._data_connectors_started.pop(connector_name, None)
+                elif account_connectors and account_connectors.get(connector_name) is connector:
                     account_connectors.pop(connector_name, None)
                 if account_connectors is not None and not account_connectors:
                     self._trading_connectors.pop(account_name, None)
@@ -2455,7 +2497,13 @@ class UnifiedConnectorService:
                 continue
             if not await self._drain_owner_tasks(owner_key):
                 cleanup_codes.append(f"{owner_key[2]}_cleanup_incomplete")
-            elif owner_key[2] not in {"orders", "funding", "metrics", "network"}:
+            elif owner_key[2] not in {
+                "orders",
+                "funding",
+                "metrics",
+                "network",
+                "data_network",
+            }:
                 self._finish_owner_cleanup(owner_key)
 
         market_tasks = getattr(self, "_market_residual_tasks", {})
@@ -2531,6 +2579,10 @@ class UnifiedConnectorService:
             for account_name, connectors in self._trading_connectors.items()
             for connector_name in connectors
         }
+        connector_keys.update(
+            ("__data__", connector_name)
+            for connector_name in self._data_connectors
+        )
 
         def add_key(raw_key) -> None:
             if isinstance(raw_key, tuple) and len(raw_key) >= 2:
@@ -2569,22 +2621,10 @@ class UnifiedConnectorService:
                     type(exc).__name__,
                 )
 
-        # Stop data connectors
-        for connector_name, connector in self._data_connectors.items():
-            try:
-                await connector.stop_network()
-            except Exception as exc:
-                logger.error(
-                    "Error stopping data connector %s (%s)",
-                    connector_name,
-                    type(exc).__name__,
-                )
-
-        self._data_connectors.clear()
-        self._data_connectors_started.clear()
-
         if failures:
             raise failures[0]
+        self._data_connectors.clear()
+        self._data_connectors_started.clear()
         logger.info("Stopped all connectors")
 
     # =========================================================================

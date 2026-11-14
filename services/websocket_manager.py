@@ -13,6 +13,7 @@ from hummingbot.core.event.events import OrderBookEvent, OrderBookTradeEvent
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 
 from config import settings
+from models.connectors import CapabilityErrorDetail
 from services.connector_capabilities import (
     ConnectorCapabilityError,
     ConnectorFeature,
@@ -144,6 +145,17 @@ class WebSocketManager:
             return True
 
         snapshots = self._snapshot_order_book_ownership(connector)
+        if connector is None or not snapshots:
+            raise ConnectorCapabilityError(
+                CapabilityErrorDetail(
+                    code="replacement_validation_unavailable",
+                    message="The existing feed cannot be validated for replacement",
+                    connector=connector_name,
+                    feature=ConnectorFeature.LIVE_ORDER_BOOK.value,
+                    trading_pair=trading_pair,
+                    reason="existing feed ownership is not discoverable",
+                )
+            )
         try:
             result = self._market_data_service.initialize_order_book(
                 connector_name, trading_pair
@@ -252,6 +264,11 @@ class WebSocketManager:
                 if initialized is not True:
                     await self._send_error(websocket, "feed_validation_failed")
                     return
+        except ConnectorCapabilityError as exc:
+            await self._send_json(
+                websocket, {"type": "error", "detail": dict(exc.detail)}
+            )
+            return
         except ValueError as exc:
             logger.info(
                 "WebSocket feed request rejected (%s)", type(exc).__name__
