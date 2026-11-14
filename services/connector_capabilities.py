@@ -10,8 +10,6 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, Mapping, Optional
 
-from pydantic import ValidationError
-
 from fastapi import HTTPException
 
 from models.connectors import CapabilityErrorDetail, ConnectorCapabilities
@@ -74,14 +72,15 @@ class ConnectorCapabilityRegistry:
         bootstrap = dict(_BOOTSTRAP_DECLARATIONS)
         if declarations:
             bootstrap.update(declarations)
-        self._bootstrap_declarations = MappingProxyType(
-            {
-                connector_name: self._normalize_declaration(
+        normalized = {}
+        for connector_name, capabilities in bootstrap.items():
+            try:
+                normalized[connector_name] = self._normalize_declaration(
                     capabilities, source="bootstrap"
                 )
-                for connector_name, capabilities in bootstrap.items()
-            }
-        )
+            except Exception:
+                self._raise_mismatch(connector_name)
+        self._bootstrap_declarations = MappingProxyType(normalized)
 
     @staticmethod
     def _normalize_declaration(declaration: Any, *, source: str) -> ConnectorCapabilities:
@@ -147,12 +146,14 @@ class ConnectorCapabilityRegistry:
     def _instance_declaration(
         self, connector_name: str, connector: Any
     ) -> Optional[ConnectorCapabilities]:
-        declaration = getattr(connector, "api_capabilities", None)
-        if declaration is None:
-            return None
         try:
+            declaration = getattr(connector, "api_capabilities", None)
+            if declaration is None:
+                return None
             return self._normalize_declaration(declaration, source="connector")
-        except (TypeError, ValueError, ValidationError):
+        except ConnectorCapabilityError:
+            raise
+        except Exception:
             self._raise_mismatch(connector_name)
 
     def get(self, connector_name: str, connector: Any = None) -> ConnectorCapabilities:
@@ -160,35 +161,102 @@ class ConnectorCapabilityRegistry:
         if connector is None:
             return bootstrap if bootstrap is not None else ConnectorCapabilities()
 
-        instance = self._instance_declaration(connector_name, connector)
-        if bootstrap is not None:
-            if instance is None or not self._semantically_compatible(
-                bootstrap, instance
-            ):
-                self._raise_mismatch(connector_name)
-            return instance
-        if instance is not None:
-            return instance
-        return ConnectorCapabilities()
+        try:
+            instance = self._instance_declaration(connector_name, connector)
+            if bootstrap is not None:
+                if instance is None or not self._semantically_compatible(
+                    bootstrap, instance
+                ):
+                    self._raise_mismatch(connector_name)
+                return instance
+            if instance is not None:
+                return instance
+            return ConnectorCapabilities()
+        except ConnectorCapabilityError:
+            raise
+        except Exception:
+            self._raise_mismatch(connector_name)
+
+    def instance_only_features(
+        self,
+        connector_name: str,
+        capabilities: ConnectorCapabilities,
+    ) -> frozenset[str]:
+        """Return instance additions while sanitizing every member-access failure."""
+        bootstrap = self._bootstrap_declarations.get(connector_name)
+        if bootstrap is None:
+            return frozenset()
+        try:
+            return self._semantic_features(capabilities).difference(
+                self._semantic_features(bootstrap)
+            )
+        except ConnectorCapabilityError:
+            raise
+        except Exception:
+            self._raise_mismatch(connector_name)
 
     def validate_instance(
         self,
         connector_name: str,
         connector: Any,
         validated_features: Optional[frozenset[str]] = None,
-    ) -> None:
+        capabilities: Optional[ConnectorCapabilities] = None,
+    ) -> ConnectorCapabilities:
         """Fail closed unless instance-only truth has a validated service chain."""
-        instance = self.get(connector_name, connector)
-        bootstrap = self._bootstrap_declarations.get(connector_name)
-        if bootstrap is None:
-            return
-        instance_only_features = self._semantic_features(instance).difference(
-            self._semantic_features(bootstrap)
-        )
-        if not instance_only_features.issubset(
-            validated_features or frozenset()
-        ):
+        try:
+            instance = capabilities or self.get(connector_name, connector)
+            instance_only_features = self.instance_only_features(
+                connector_name, instance
+            )
+            if not instance_only_features.issubset(
+                validated_features or frozenset()
+            ):
+                self._raise_mismatch(connector_name)
+            return instance
+        except ConnectorCapabilityError:
+            raise
+        except Exception:
             self._raise_mismatch(connector_name)
+
+    def require_resolved(
+        self,
+        connector_name: str,
+        capabilities: ConnectorCapabilities,
+        feature: ConnectorFeature,
+        trading_pair: Optional[str] = None,
+    ) -> None:
+        """Apply a gate to one already validated immutable declaration."""
+        if trading_pair is not None and not self._supports_pair(
+            capabilities, trading_pair
+        ):
+            raise ConnectorCapabilityError(
+                CapabilityErrorDetail(
+                    code="unsupported_trading_pair",
+                    message=(
+                        f"Connector '{connector_name}' does not support trading pair "
+                        f"'{trading_pair}'"
+                    ),
+                    connector=connector_name,
+                    feature=feature.value,
+                    trading_pair=trading_pair,
+                    supported_pairs=sorted(capabilities.supported_pairs or ()),
+                )
+            )
+        if not self._supports_feature(capabilities, feature):
+            raise ConnectorCapabilityError(
+                CapabilityErrorDetail(
+                    code="unsupported_connector_feature",
+                    message=f"Connector '{connector_name}' does not support feature '{feature.value}'",
+                    connector=connector_name,
+                    feature=feature.value,
+                    trading_pair=trading_pair,
+                    supported_pairs=(
+                        sorted(capabilities.supported_pairs)
+                        if capabilities.supported_pairs is not None
+                        else None
+                    ),
+                )
+            )
 
     @staticmethod
     def _supports_pair(
@@ -226,34 +294,6 @@ class ConnectorCapabilityRegistry:
         connector: Any = None,
     ) -> None:
         capabilities = self.get(connector_name, connector)
-        if trading_pair is not None and not self._supports_pair(
-            capabilities, trading_pair
-        ):
-            raise ConnectorCapabilityError(
-                CapabilityErrorDetail(
-                    code="unsupported_trading_pair",
-                    message=(
-                        f"Connector '{connector_name}' does not support trading pair "
-                        f"'{trading_pair}'"
-                    ),
-                    connector=connector_name,
-                    feature=feature.value,
-                    trading_pair=trading_pair,
-                    supported_pairs=sorted(capabilities.supported_pairs or ()),
-                )
-            )
-        if not self._supports_feature(capabilities, feature):
-            raise ConnectorCapabilityError(
-                CapabilityErrorDetail(
-                    code="unsupported_connector_feature",
-                    message=f"Connector '{connector_name}' does not support feature '{feature.value}'",
-                    connector=connector_name,
-                    feature=feature.value,
-                    trading_pair=trading_pair,
-                    supported_pairs=(
-                        sorted(capabilities.supported_pairs)
-                        if capabilities.supported_pairs is not None
-                        else None
-                    ),
-                )
-            )
+        self.require_resolved(
+            connector_name, capabilities, feature, trading_pair
+        )

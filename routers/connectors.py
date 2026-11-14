@@ -61,7 +61,10 @@ async def get_connector_config_map(connector_name: str, accounts_service: Accoun
 @router.get(
     "/{connector_name}/capabilities",
     response_model=ConnectorCapabilities,
-    responses={404: {"model": CapabilityErrorResponse}},
+    responses={
+        400: {"model": CapabilityErrorResponse},
+        404: {"model": CapabilityErrorResponse},
+    },
 )
 async def get_connector_capabilities(request: Request, connector_name: str):
     """Return explicit connector semantics without constructing it or touching its network."""

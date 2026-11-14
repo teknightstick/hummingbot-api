@@ -143,7 +143,9 @@ class UnifiedConnectorService:
         """Return declared semantics without constructing a connector or starting its network."""
         if connector is None:
             connector = self._get_cached_connector(connector_name)
-        return self._capability_registry.get(connector_name, connector)
+        if connector is not None:
+            return self._validate_instance_capabilities(connector_name, connector)
+        return self._capability_registry.get(connector_name)
 
     def require_capability(
         self,
@@ -155,24 +157,42 @@ class UnifiedConnectorService:
         """Reject unsupported semantics before connector or tracker lookup."""
         if connector is None:
             connector = self._get_cached_connector(connector_name)
-        self._capability_registry.require(connector_name, feature, trading_pair, connector)
+        capabilities = (
+            self._validate_instance_capabilities(connector_name, connector)
+            if connector is not None
+            else self._capability_registry.get(connector_name)
+        )
+        self._capability_registry.require_resolved(
+            connector_name, capabilities, feature, trading_pair
+        )
 
     def _validate_instance_capabilities(
         self, connector_name: str, connector: ConnectorBase
-    ) -> None:
+    ) -> ConnectorCapabilities:
         """Validate instance-only feature chains before publishing the connector."""
-        validated_features = frozenset(
-            feature
-            for feature, member_names in _INSTANCE_FEATURE_CALLABLE_CHAINS.items()
-            if all(
-                callable(getattr(connector, member_name, None))
-                for member_name in member_names
-            )
+        capabilities = self._capability_registry.get(connector_name, connector)
+        instance_only_features = self._capability_registry.instance_only_features(
+            connector_name, capabilities
         )
-        self._capability_registry.validate_instance(
+        validated_features = set()
+        for feature in instance_only_features:
+            member_names = _INSTANCE_FEATURE_CALLABLE_CHAINS.get(feature)
+            if member_names is None:
+                continue
+            try:
+                chain_is_callable = all(
+                    callable(getattr(connector, member_name, None))
+                    for member_name in member_names
+                )
+            except Exception:
+                self._capability_registry._raise_mismatch(connector_name)
+            if chain_is_callable:
+                validated_features.add(feature)
+        return self._capability_registry.validate_instance(
             connector_name,
             connector,
-            validated_features=validated_features,
+            validated_features=frozenset(validated_features),
+            capabilities=capabilities,
         )
 
     def _is_perpetual_connector(self, connector: ConnectorBase) -> bool:
@@ -443,6 +463,7 @@ class UnifiedConnectorService:
 
     async def _is_trading_pair_supported(
         self,
+        connector_name: str,
         connector: ConnectorBase,
         trading_pair: str
     ) -> bool:
@@ -458,12 +479,64 @@ class UnifiedConnectorService:
         try:
             await connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
             return True
-        except KeyError:
-            return False
-        except Exception as e:
-            # Symbol map unavailable (network error, etc.) - don't block on it
-            logger.warning(f"Could not validate {trading_pair} against symbol map: {e}")
-            return True
+        except Exception as exc:
+            logger.warning(
+                "Symbol discovery failed for %s/%s (%s)",
+                connector_name,
+                trading_pair,
+                type(exc).__name__,
+            )
+            raise ConnectorCapabilityError(
+                CapabilityErrorDetail(
+                    code="connector_symbol_discovery_failed",
+                    message=(
+                        f"Connector '{connector_name}' could not validate trading pair "
+                        f"'{trading_pair}'"
+                    ),
+                    connector=connector_name,
+                    feature=ConnectorFeature.DYNAMIC_SUBSCRIPTION.value,
+                    trading_pair=trading_pair,
+                    reason="symbol_discovery_failed",
+                )
+            ) from None
+
+    async def _discard_invalid_public_declaration(
+        self,
+        connector_name: str,
+        connector: ConnectorBase,
+        approved_capabilities: ConnectorCapabilities,
+    ) -> None:
+        """Remove rejected data truth or restore immutable truth on a trading owner."""
+        if self._data_connectors.get(connector_name) is connector:
+            self._data_connectors.pop(connector_name, None)
+            self._data_connectors_started.pop(connector_name, None)
+            try:
+                await self._stop_data_connector_network(connector, connector_name)
+            except asyncio.CancelledError:
+                raise
+            except BaseException:
+                raise ConnectorCapabilityError(
+                    CapabilityErrorDetail(
+                        code="connector_capability_cleanup_residual",
+                        message=(
+                            f"Rejected capability cleanup is incomplete for "
+                            f"'{connector_name}'"
+                        ),
+                        connector=connector_name,
+                        feature="capabilities",
+                        reason="cleanup_incomplete",
+                        cleanup_scope="connector",
+                        cleanup_code="connector_stop_failed",
+                    )
+                ) from None
+            return
+
+        try:
+            setattr(connector, "api_capabilities", approved_capabilities)
+        except Exception:
+            # The rejected declaration remains untrusted: every later read repeats
+            # validation and therefore cannot admit it through a feature gate.
+            return
 
     def _purge_trading_pair_registration(
         self,
@@ -640,6 +713,8 @@ class UnifiedConnectorService:
         self.require_capability(
             connector_name, ConnectorFeature.LIVE_ORDER_BOOK, trading_pair
         )
+        data_connectors = getattr(self, "_data_connectors", {})
+        cached_data_connector = data_connectors.get(connector_name)
         if account_name is not None:
             # Account-scoped cleanup must never fall back to a connector owned by
             # another account (or to a shared data connector).
@@ -672,7 +747,23 @@ class UnifiedConnectorService:
                 pass
 
         # Reject pairs the exchange doesn't list before registering them anywhere
-        if not await self._is_trading_pair_supported(connector, trading_pair):
+        approved_capabilities = self._validate_instance_capabilities(
+            connector_name, connector
+        )
+        try:
+            pair_is_supported = await self._is_trading_pair_supported(
+                connector_name, connector, trading_pair
+            )
+        except ConnectorCapabilityError:
+            if (
+                cached_data_connector is None
+                and data_connectors.get(connector_name) is connector
+            ):
+                await self._discard_invalid_public_declaration(
+                    connector_name, connector, approved_capabilities
+                )
+            raise
+        if not pair_is_supported:
             logger.error(
                 f"Trading pair {trading_pair} is not listed on {connector_name} - "
                 f"refusing to register it (check the quote asset)"
@@ -681,7 +772,13 @@ class UnifiedConnectorService:
 
         # Lazy symbol/instrument discovery may replace api_capabilities. Validate
         # that loaded declaration before any pair, book, or tracker state changes.
-        self._validate_instance_capabilities(connector_name, connector)
+        try:
+            self._validate_instance_capabilities(connector_name, connector)
+        except ConnectorCapabilityError:
+            await self._discard_invalid_public_declaration(
+                connector_name, connector, approved_capabilities
+            )
+            raise
 
         # For data connectors, ensure network is started
         if connector_name in self._data_connectors:
@@ -1407,14 +1504,8 @@ class UnifiedConnectorService:
     # =========================================================================
 
     async def _start_connector_network(self, connector: ConnectorBase):
-        """Start connector network tasks."""
+        """Start one freshly constructed connector's network tasks."""
         try:
-            await self._stop_connector_network(
-                connector,
-                getattr(connector, "_api_cleanup_account", "__unscoped__"),
-                getattr(connector, "_api_cleanup_connector", "__unscoped__"),
-            )
-
             # Gateway/AMM connectors use start_network() instead of individual polling tasks
             if hasattr(connector, '_trading_rules_polling_loop'):
                 connector._trading_rules_polling_task = safe_ensure_future(
@@ -1596,30 +1687,8 @@ class UnifiedConnectorService:
             if isinstance(task, asyncio.Task):
                 setattr(connector, task_name, None)
 
-        # Stop the order book tracker (if connector has one - AMM/Gateway connectors don't)
-        if hasattr(connector, 'order_book_tracker') and connector.order_book_tracker:
-            try:
-                await self._run_owner_operation(
-                    owner_key,
-                    "tracker_stop",
-                    connector.order_book_tracker.stop,
-                )
-            except asyncio.CancelledError:
-                raise
-            except BaseException as exc:
-                code = exc.args[0] if isinstance(exc, RuntimeError) and exc.args else None
-                cleanup_codes.append(
-                    code
-                    if code in {
-                        "tracker_stop_pending",
-                        "tracker_stop_cancelled",
-                        "tracker_stop_raised",
-                        "tracker_stop_returned_false",
-                    }
-                    else "tracker_stop_failed"
-                )
-
-        # For gateway connectors, call stop_network()
+        # Connector lifecycle owns tracker stop/drain; the service invokes only
+        # the connector boundary and drains the task handles it invalidates.
         if hasattr(connector, 'stop_network'):
             try:
                 await self._run_owner_operation(
