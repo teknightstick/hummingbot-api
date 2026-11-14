@@ -408,6 +408,22 @@ class UnifiedConnectorService:
             existing = self._trading_connectors.get(account_name, {}).get(connector_name)
             if existing is not None:
                 return existing
+            if self._connector_has_private_state(connector_key):
+                detail = CapabilityErrorDetail(
+                    code="connector_cleanup_residual",
+                    message=(
+                        f"Connector cleanup is incomplete for "
+                        f"'{account_name}:{connector_name}'"
+                    ),
+                    connector=connector_name,
+                    feature="connector_cleanup",
+                    reason="cleanup_incomplete",
+                    cleanup_scope="connector",
+                    cleanup_code="owner_cleanup_incomplete",
+                )
+                residual = detail.model_dump(exclude_none=True)
+                self._connector_creation_residuals[connector_key] = residual
+                raise ConnectorCapabilityError(detail)
 
             try:
                 connector = await self._create_and_initialize_trading_connector(
@@ -2921,6 +2937,98 @@ class UnifiedConnectorService:
         self._connector_residual_tasks.pop(owner_key, None)
         self._connector_cleanup_owners.pop(owner_key, None)
 
+    @staticmethod
+    def _orphan_phase_is_terminal_success(
+        phase_name: str, phase: Mapping[str, Any]
+    ) -> bool:
+        """Inspect retained phase truth without replaying an owner operation."""
+        if not isinstance(phase, dict):
+            return False
+
+        tasks = []
+        task = phase.get("task")
+        if task is not None:
+            tasks.append(task)
+        phase_tasks = phase.get("tasks", ())
+        if isinstance(phase_tasks, (tuple, list, set)):
+            tasks.extend(item for item in phase_tasks if item not in tasks)
+
+        for retained_task in tasks:
+            done = getattr(retained_task, "done", None)
+            result = getattr(retained_task, "result", None)
+            if not callable(done) or not callable(result) or not done():
+                return False
+            try:
+                task_result = result()
+            except asyncio.CancelledError:
+                phase["complete"] = True
+                phase["error_code"] = f"{phase_name}_cancelled"
+                return False
+            except Exception:
+                phase["complete"] = True
+                phase["error_code"] = f"{phase_name}_raised"
+                return False
+            if task_result is False:
+                phase["complete"] = True
+                phase["result"] = False
+                phase["error_code"] = f"{phase_name}_returned_false"
+                return False
+            phase["result"] = task_result
+
+        if tasks:
+            phase["complete"] = True
+            if str(phase.get("error_code", "")).endswith("_pending"):
+                phase["error_code"] = None
+
+        if phase.get("error_code") is not None:
+            return False
+        if phase.get("complete"):
+            return phase.get("result") is not False
+        if phase.get("result") is not None or phase.get("cancel_requested"):
+            return False
+        return not tasks
+
+    def _reconcile_orphan_connector_phases(
+        self, connector_key: Tuple[str, str]
+    ) -> list[str]:
+        """Consume authority-free terminal phase markers and retain real work."""
+        cleanup_codes = []
+        owners = self._connector_cleanup_owners
+        residual_tasks = self._connector_residual_tasks
+        phases = self._connector_cleanup_phases
+        market_owners = getattr(self, "_market_cleanup_owners", {})
+        has_connector_authority = (
+            self._cached_public_connector(connector_key) is not None
+            or any(key[:2] == connector_key for key in owners)
+            or any(key[:2] == connector_key for key in market_owners)
+        )
+
+        for owner_key in list(phases):
+            if owner_key[:2] != connector_key or owner_key in owners:
+                continue
+            owner_phases = phases.get(owner_key)
+            terminal = (
+                not has_connector_authority
+                and owner_key not in residual_tasks
+                and isinstance(owner_phases, dict)
+                and all(
+                    self._orphan_phase_is_terminal_success(name, phase)
+                    for name, phase in owner_phases.items()
+                )
+            )
+            if not terminal:
+                cleanup_codes.append(f"{owner_key[2]}_cleanup_incomplete")
+                continue
+            phases.pop(owner_key, None)
+            logger.info(
+                "Connector cleanup audit code=orphan_terminal_phase_consumed "
+                "account=%s connector=%s owner=%s",
+                owner_key[0],
+                owner_key[1],
+                owner_key[2],
+            )
+        return cleanup_codes
+
     async def _stop_owned_index(
         self,
         account_name: str,
@@ -4175,22 +4283,24 @@ class UnifiedConnectorService:
             if account_name == "__data__"
             else None
         )
-        data_owner = (
-            self._connector_cleanup_owners.get(
-                self._owner_key("__data__", connector_name, "data_network")
-            )
-            if account_name == "__data__"
-            else None
+        network_owner_key = self._owner_key(
+            account_name,
+            connector_name,
+            "data_network" if account_name == "__data__" else "network",
         )
-        connector = data_connector if data_connector is not None else data_owner
+        retained_network_owner = self._connector_cleanup_owners.get(
+            network_owner_key
+        )
+        data_owner = (
+            retained_network_owner if account_name == "__data__" else None
+        )
+        connector = retained_network_owner
+        if connector is None:
+            connector = data_connector
         if connector is None and account_connectors:
             connector = account_connectors.get(connector_name)
         stopped_connectors = []
         network_cleanup_failed = restart_phase_failed
-        if connector is None:
-            connector = self._connector_cleanup_owners.get(
-                self._owner_key(account_name, connector_name, "network")
-            )
         if connector is not None and not restart_phase_failed:
             stopping_published_data = (
                 account_name == "__data__" and connector is data_connector
@@ -4355,6 +4465,10 @@ class UnifiedConnectorService:
             for pair_key in list(market_pair_owners):
                 if pair_key[:2] == connector_key:
                     market_pair_owners.pop(pair_key, None)
+
+        cleanup_codes.extend(
+            self._reconcile_orphan_connector_phases(connector_key)
+        )
 
         residuals = self._connector_creation_residuals
         remaining_private = any(

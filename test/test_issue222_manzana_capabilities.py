@@ -7653,13 +7653,20 @@ async def test_issue224_data_discard_reconciles_restart_before_one_successor(
     CHECK.assertEqual(1, factory_calls)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("connector_type", ["data", "trading"])
 @pytest.mark.parametrize("private_state", ["owner", "phase", "residual"])
-def test_issue224_data_factory_rejects_old_generation_private_state(private_state):
-    module, service, old_connector, _ = _issue224_repair_service()
-    connector_key = ("__data__", "manzana")
-    owner_key = ("__data__", "manzana", "data_network")
-    service._data_connectors = {}
-    service._data_connectors_started = {}
+async def test_issue224_orphan_private_state_recovers_before_one_successor(
+    caplog, connector_type, private_state
+):
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    old_connector = Issue224RepairConnector()
+    successor = Issue224RepairConnector()
+    account_name = "__data__" if connector_type == "data" else "acct"
+    owner_kind = "data_network" if connector_type == "data" else "network"
+    connector_key = (account_name, "manzana")
+    owner_key = (*connector_key, owner_kind)
 
     if private_state == "owner":
         service._connector_cleanup_owners[owner_key] = old_connector
@@ -7689,16 +7696,132 @@ def test_issue224_data_factory_rejects_old_generation_private_state(private_stat
     def create_successor(connector_name):
         nonlocal factory_calls
         factory_calls += 1
-        return Issue224RepairConnector()
+        return successor
 
-    service._create_data_connector = create_successor
+    async def create_trading_successor(account, connector_name):
+        CHECK.assertEqual(account_name, account)
+        return create_successor(connector_name)
+
+    async def get_connector():
+        if connector_type == "data":
+            return service.get_data_connector("manzana")
+        return await service.get_trading_connector(account_name, "manzana")
+
+    if connector_type == "data":
+        service._create_data_connector = create_successor
+    else:
+        service._create_and_initialize_trading_connector = create_trading_successor
     with pytest.raises(module.ConnectorCapabilityError) as blocked:
-        service.get_data_connector("manzana")
+        await get_connector()
 
     CHECK.assertEqual("connector_cleanup_residual", blocked.value.detail["code"])
     CHECK.assertEqual(0, factory_calls)
-    CHECK.assertEqual({}, service._data_connectors)
     CHECK.assertIn(connector_key, service._connector_creation_residuals)
+
+    caplog.set_level("INFO")
+    await service.stop_all()
+    await service.stop_all()
+
+    CHECK.assertEqual(1 if private_state == "owner" else 0, old_connector.stop_calls)
+    CHECK.assertEqual(
+        private_state == "phase",
+        "orphan_terminal_phase_consumed" in caplog.text,
+    )
+    CHECK.assertEqual({}, service._connector_creation_residuals)
+    CHECK.assertEqual({}, service._connector_cleanup_owners)
+    CHECK.assertEqual({}, service._connector_cleanup_indices)
+    CHECK.assertEqual({}, service._connector_residual_tasks)
+    CHECK.assertEqual({}, service._connector_cleanup_phases)
+
+    CHECK.assertIs(successor, await get_connector())
+    CHECK.assertIs(successor, await get_connector())
+    CHECK.assertEqual(1, factory_calls)
+    CHECK.assertEqual({}, service._connector_creation_residuals)
+    CHECK.assertEqual({}, service._connector_cleanup_owners)
+    CHECK.assertEqual({}, service._connector_residual_tasks)
+    CHECK.assertEqual({}, service._connector_cleanup_phases)
+
+    await service.stop_all()
+    await service.stop_all()
+    CHECK.assertEqual(1, successor.stop_calls)
+    CHECK.assertEqual({}, service._trading_connectors)
+    CHECK.assertEqual({}, service._data_connectors)
+    CHECK.assertEqual({}, service._connector_creation_residuals)
+    CHECK.assertEqual({}, service._connector_cleanup_owners)
+    CHECK.assertEqual({}, service._connector_cleanup_indices)
+    CHECK.assertEqual({}, service._connector_residual_tasks)
+    CHECK.assertEqual({}, service._connector_cleanup_phases)
+    CHECK.assertEqual({}, service._connector_incarnations)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_result", [True, False])
+async def test_issue224_orphan_phase_inspects_terminal_task_result(terminal_result):
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    connector_key = ("acct", "manzana")
+    owner_key = (*connector_key, "network")
+    task = asyncio.create_task(asyncio.sleep(0, result=terminal_result))
+    await task
+    service._connector_cleanup_phases[owner_key] = {
+        "connector_stop": {
+            "task": task,
+            "complete": False,
+            "result": None,
+            "error_code": None,
+            "cancel_requested": False,
+        }
+    }
+    service._connector_residual_tasks[owner_key] = {task}
+
+    if terminal_result:
+        await service.stop_all()
+        CHECK.assertEqual({}, service._connector_creation_residuals)
+        CHECK.assertEqual({}, service._connector_residual_tasks)
+        CHECK.assertEqual({}, service._connector_cleanup_phases)
+    else:
+        with pytest.raises(module.ConnectorCapabilityError) as incomplete:
+            await service.stop_all()
+        CHECK.assertEqual(
+            "network_cleanup_incomplete", incomplete.value.detail["cleanup_code"]
+        )
+        CHECK.assertEqual({}, service._connector_residual_tasks)
+        CHECK.assertIn(owner_key, service._connector_cleanup_phases)
+        phase = service._connector_cleanup_phases[owner_key]["connector_stop"]
+        CHECK.assertIs(phase["complete"], True)
+        CHECK.assertIs(phase["result"], False)
+        CHECK.assertEqual("connector_stop_returned_false", phase["error_code"])
+
+
+@pytest.mark.asyncio
+async def test_issue224_orphan_phase_retains_live_operation():
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    owner_key = ("acct", "manzana", "network")
+    release = asyncio.Event()
+    task = asyncio.create_task(release.wait())
+    service._connector_cleanup_phases[owner_key] = {
+        "connector_stop": {
+            "task": task,
+            "complete": False,
+            "result": None,
+            "error_code": None,
+            "cancel_requested": False,
+        }
+    }
+
+    try:
+        with pytest.raises(module.ConnectorCapabilityError) as incomplete:
+            await service.stop_all()
+        CHECK.assertEqual(
+            "network_cleanup_incomplete", incomplete.value.detail["cleanup_code"]
+        )
+        phase = service._connector_cleanup_phases[owner_key]["connector_stop"]
+        CHECK.assertIs(phase["task"], task)
+        CHECK.assertFalse(task.done())
+    finally:
+        release.set()
+        await task
 
 
 @pytest.mark.asyncio
@@ -8045,7 +8168,7 @@ async def test_issue224_pair_raise_is_typed_and_sanitized_through_public_callers
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
-    from models.connectors import CapabilityErrorDetail
+    from models.connectors import CapabilityErrorDetail, CapabilityErrorResponse
 
     deps = sys.modules.get("deps")
     if deps is not None:
@@ -8091,6 +8214,12 @@ async def test_issue224_pair_raise_is_typed_and_sanitized_through_public_callers
         "connector_pair_registration_failed", response.json()["detail"]["code"]
     )
     CHECK.assertNotIn(secret, response.text)
+    CapabilityErrorResponse.model_validate(response.json())
+    responses = app.openapi()["paths"]["/executors/"]["post"]["responses"]
+    CHECK.assertEqual(
+        "#/components/schemas/CapabilityErrorResponse",
+        responses["400"]["content"]["application/json"]["schema"]["$ref"],
+    )
 
 
 @pytest.mark.asyncio

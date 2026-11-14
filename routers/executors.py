@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from starlette import status
 
 from deps import get_executor_service, get_market_data_service
+from models.connectors import CapabilityErrorResponse
 from models.executors import (
     CreateExecutorRequest,
     CreateExecutorResponse,
@@ -35,7 +36,12 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Executors"], prefix="/executors")
 
 
-@router.post("/", response_model=CreateExecutorResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/",
+    response_model=CreateExecutorResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses={400: {"model": CapabilityErrorResponse}},
+)
 async def create_executor(
     request: CreateExecutorRequest,
     executor_service: ExecutorService = Depends(get_executor_service)
