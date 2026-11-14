@@ -485,6 +485,44 @@ def test_loaded_manzana_capabilities_narrow_pairs_and_mismatch_fails_closed():
     CHECK.assertIs(registry.supports_pair("manzana", "ETH-USD", discovered), True)
     CHECK.assertIs(registry.supports_pair("manzana", "SOL-USD", discovered), False)
 
+    truthful_addition = _shift_successor_capabilities(
+        supported_pairs={"BTC-USD"}
+    )
+    truthful_addition["features"] = {
+        *truthful_addition["features"],
+        ConnectorFeature.ORDER_SUBMISSION,
+    }
+    loaded_with_addition = registry.get(
+        "manzana",
+        types.SimpleNamespace(
+            api_capabilities=truthful_addition,
+            buy=lambda **kwargs: "buy-id",
+            sell=lambda **kwargs: "sell-id",
+            cancel=lambda **kwargs: "cancel-id",
+        ),
+    )
+    CHECK.assertEqual(frozenset({"BTC-USD"}), loaded_with_addition.supported_pairs)
+    CHECK.assertIn(
+        ConnectorFeature.ORDER_SUBMISSION.value,
+        loaded_with_addition.features,
+    )
+
+    for required_feature in _shift_successor_capabilities()["features"]:
+        missing_required = _shift_successor_capabilities(
+            supported_pairs={"BTC-USD"}
+        )
+        missing_required["features"].remove(required_feature)
+        if required_feature == ConnectorFeature.DYNAMIC_SUBSCRIPTION:
+            missing_required["dynamic_subscription"] = False
+        with pytest.raises(ConnectorCapabilityError) as missing:
+            registry.get(
+                "manzana",
+                types.SimpleNamespace(api_capabilities=missing_required),
+            )
+        CHECK.assertEqual(
+            "connector_capability_mismatch", missing.value.detail["code"]
+        )
+
     mismatched = types.SimpleNamespace(
         api_capabilities=_shift_successor_capabilities(dynamic_subscription=False)
     )
@@ -642,6 +680,60 @@ def test_mismatched_constructed_connector_is_not_published():
         "connector_capability_mismatch", mismatch.value.detail["code"]
     )
     CHECK.assertEqual({}, service._data_connectors)
+
+
+def test_instance_only_order_submission_requires_complete_chain_before_publication():
+    from services.connector_capabilities import (
+        ConnectorCapabilityError,
+        ConnectorCapabilityRegistry,
+        ConnectorFeature,
+    )
+
+    module, _ = _load_unified_service_module()
+
+    def loaded_connector(**members):
+        declaration = _shift_successor_capabilities(
+            supported_pairs={"BTC-USD"}
+        )
+        declaration["features"] = {
+            *declaration["features"],
+            ConnectorFeature.ORDER_SUBMISSION,
+        }
+        return types.SimpleNamespace(api_capabilities=declaration, **members)
+
+    complete = loaded_connector(
+        buy=lambda **kwargs: "buy-id",
+        sell=lambda **kwargs: "sell-id",
+        cancel=lambda **kwargs: "cancel-id",
+    )
+    accepted_service = object.__new__(module.UnifiedConnectorService)
+    accepted_service._capability_registry = ConnectorCapabilityRegistry()
+    accepted_service._data_connectors = {}
+    accepted_service._trading_connectors = {}
+    accepted_service._create_data_connector = lambda connector_name: complete
+
+    CHECK.assertIs(
+        complete, accepted_service.get_data_connector("manzana")
+    )
+    CHECK.assertIs(complete, accepted_service._data_connectors["manzana"])
+
+    incomplete = loaded_connector(
+        buy=lambda **kwargs: "buy-id",
+        sell=lambda **kwargs: "sell-id",
+    )
+    rejected_service = object.__new__(module.UnifiedConnectorService)
+    rejected_service._capability_registry = ConnectorCapabilityRegistry()
+    rejected_service._data_connectors = {}
+    rejected_service._trading_connectors = {}
+    rejected_service._create_data_connector = lambda connector_name: incomplete
+
+    with pytest.raises(ConnectorCapabilityError) as mismatch:
+        rejected_service.get_data_connector("manzana")
+
+    CHECK.assertEqual(
+        "connector_capability_mismatch", mismatch.value.detail["code"]
+    )
+    CHECK.assertEqual({}, rejected_service._data_connectors)
 
 
 @pytest.mark.asyncio

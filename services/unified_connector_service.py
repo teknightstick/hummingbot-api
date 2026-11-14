@@ -16,6 +16,7 @@ import logging
 import time
 from contextlib import asynccontextmanager
 from decimal import Decimal
+from types import MappingProxyType
 from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 from hummingbot.client.config.config_crypt import ETHKeyFileSecretManger
@@ -44,6 +45,11 @@ logger = logging.getLogger(__name__)
 
 _CONNECTOR_CLEANUP_TIMEOUT = 0.05
 _TASK_DRAIN_TIMEOUT = 0.01
+_INSTANCE_FEATURE_CALLABLE_CHAINS = MappingProxyType(
+    {
+        ConnectorFeature.ORDER_SUBMISSION.value: ("buy", "sell", "cancel"),
+    }
+)
 
 
 class UnknownConnectorError(ValueError):
@@ -147,6 +153,24 @@ class UnifiedConnectorService:
         if connector is None:
             connector = self._get_cached_connector(connector_name)
         self._capability_registry.require(connector_name, feature, trading_pair, connector)
+
+    def _validate_instance_capabilities(
+        self, connector_name: str, connector: ConnectorBase
+    ) -> None:
+        """Validate instance-only feature chains before publishing the connector."""
+        validated_features = frozenset(
+            feature
+            for feature, member_names in _INSTANCE_FEATURE_CALLABLE_CHAINS.items()
+            if all(
+                callable(getattr(connector, member_name, None))
+                for member_name in member_names
+            )
+        )
+        self._capability_registry.validate_instance(
+            connector_name,
+            connector,
+            validated_features=validated_features,
+        )
 
     def _is_perpetual_connector(self, connector: ConnectorBase) -> bool:
         """Check if connector is a perpetual derivative connector.
@@ -343,9 +367,7 @@ class UnifiedConnectorService:
         """
         if connector_name not in self._data_connectors:
             connector = self._create_data_connector(connector_name)
-            self._capability_registry.validate_instance(
-                connector_name, connector
-            )
+            self._validate_instance_capabilities(connector_name, connector)
             self._data_connectors[connector_name] = connector
         return self._data_connectors[connector_name]
 
@@ -934,7 +956,7 @@ class UnifiedConnectorService:
         # Authenticate and create connector
         connector = self._create_trading_connector(account_name, connector_name)
         creation_owner["connector"] = connector
-        self._capability_registry.validate_instance(connector_name, connector)
+        self._validate_instance_capabilities(connector_name, connector)
         setattr(connector, "_api_cleanup_account", account_name)
         setattr(connector, "_api_cleanup_connector", connector_name)
 

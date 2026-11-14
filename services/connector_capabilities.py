@@ -2,8 +2,8 @@
 
 Bootstrap declarations let gates answer before connector construction. Connector
 implementations can then expose an ``api_capabilities`` class or instance attribute using
-the same schema. A loaded instance may narrow discovered pairs, but it may not silently
-change the bootstrap feature contract.
+the same schema. A loaded instance may narrow discovered pairs or add service-validated
+features, but it may not remove the bootstrap feature contract.
 """
 
 from enum import Enum
@@ -118,7 +118,9 @@ class ConnectorCapabilityRegistry:
         bootstrap: ConnectorCapabilities,
         instance: ConnectorCapabilities,
     ) -> bool:
-        if cls._semantic_features(bootstrap) != cls._semantic_features(instance):
+        if not cls._semantic_features(bootstrap).issubset(
+            cls._semantic_features(instance)
+        ):
             return False
         if bootstrap.supported_pairs is None:
             return True
@@ -169,9 +171,24 @@ class ConnectorCapabilityRegistry:
             return instance
         return ConnectorCapabilities()
 
-    def validate_instance(self, connector_name: str, connector: Any) -> None:
-        """Fail closed before a constructed connector is published in a cache."""
-        self.get(connector_name, connector)
+    def validate_instance(
+        self,
+        connector_name: str,
+        connector: Any,
+        validated_features: Optional[frozenset[str]] = None,
+    ) -> None:
+        """Fail closed unless instance-only truth has a validated service chain."""
+        instance = self.get(connector_name, connector)
+        bootstrap = self._bootstrap_declarations.get(connector_name)
+        if bootstrap is None:
+            return
+        instance_only_features = self._semantic_features(instance).difference(
+            self._semantic_features(bootstrap)
+        )
+        if not instance_only_features.issubset(
+            validated_features or frozenset()
+        ):
+            self._raise_mismatch(connector_name)
 
     @staticmethod
     def _supports_pair(
