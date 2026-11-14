@@ -105,11 +105,12 @@ async def test_real_order_book_tracker_task_inventory_is_collected():
     async def pending():
         await asyncio.Event().wait()
 
-    tasks = [asyncio.create_task(pending()) for _ in range(len(task_names) + 1)]
+    tasks = [asyncio.create_task(pending()) for _ in range(len(task_names) + 2)]
     await asyncio.sleep(0)
     for name, task in zip(task_names, tasks):
         setattr(tracker, name, task)
-    tracker._tracking_tasks["BTC-USD"] = tasks[-1]
+    tracker._tracking_tasks["BTC-USD"] = tasks[-2]
+    tracker._in_flight_transactions.add(tasks[-1])
 
     try:
         collected = unified_module.UnifiedConnectorService._collect_tracker_tasks(
@@ -120,3 +121,96 @@ async def test_real_order_book_tracker_task_inventory_is_collected():
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_real_tracker_preloaded_owned_delta_rollback_keeps_connector_cached():
+    _, _, tracker_module, unified_module = _load_real_core()
+    from services.connector_capabilities import ConnectorCapabilityRegistry
+
+    service = object.__new__(unified_module.UnifiedConnectorService)
+    service._trading_connectors = {}
+    service._data_connectors = {}
+    service._data_connectors_started = {}
+    service._connector_locks = {}
+    service._connector_lock_users = {}
+    service._connector_locks_guard = asyncio.Lock()
+    service._connector_creation_residuals = {}
+    service._connector_creation_failures = {}
+    service._connector_cleanup_owners = {}
+    service._connector_cleanup_indices = {}
+    service._connector_residual_tasks = {}
+    service._connector_cleanup_phases = {}
+    service._connector_incarnations = {}
+    service._connector_incarnation_sequence = 0
+    service._orders_recorders = {}
+    service._funding_recorders = {}
+    service._metrics_collectors = {}
+    service._capability_registry = ConnectorCapabilityRegistry()
+
+    tracker = tracker_module.OrderBookTracker(None, ["BASE-USD"])
+    baseline_book = object()
+    tracker.order_books["BASE-USD"] = baseline_book
+
+    class Connector:
+        def __init__(self):
+            self.api_capabilities = {
+                "supported_pairs": None,
+                "features": {
+                    "order_book",
+                    "order_book_query",
+                    "live_order_book",
+                    "trading_rules",
+                    "best_bid_ask",
+                    "dynamic_subscription",
+                },
+                "dynamic_subscription": True,
+                "perpetual": False,
+                "candles": False,
+                "last_trade": False,
+            }
+            self._trading_pairs = ["BASE-USD"]
+            self.order_book_tracker = tracker
+            self.stop_calls = 0
+
+        async def exchange_symbol_associated_to_pair(self, trading_pair):
+            return trading_pair.replace("-", "")
+
+        async def stop_network(self):
+            self.stop_calls += 1
+
+    connector = Connector()
+    service._data_connectors["manzana"] = connector
+    service._data_connectors_started["manzana"] = True
+    created_tasks = []
+
+    async def pending():
+        await asyncio.Event().wait()
+
+    async def add_pair(connector_arg, trading_pair):
+        connector_arg._trading_pairs.append(trading_pair)
+        tracker._trading_pairs.append(trading_pair)
+        tracker.order_books[trading_pair] = object()
+        task = asyncio.create_task(pending())
+        created_tasks.append(task)
+        tracker._tracking_tasks[trading_pair] = task
+        await asyncio.sleep(0)
+        return False
+
+    service._add_trading_pair_to_tracker = add_pair
+    try:
+        ready = await service.initialize_order_book("manzana", "BTC-USD", timeout=0)
+        CHECK.assertIs(ready, False)
+        CHECK.assertIs(connector, service._data_connectors["manzana"])
+        CHECK.assertEqual(0, connector.stop_calls)
+        CHECK.assertEqual(["BASE-USD"], connector._trading_pairs)
+        CHECK.assertEqual(["BASE-USD"], tracker._trading_pairs)
+        CHECK.assertEqual({"BASE-USD": baseline_book}, tracker.order_books)
+        CHECK.assertEqual({}, tracker._tracking_tasks)
+        CHECK.assertTrue(created_tasks[0].done())
+        CHECK.assertTrue(created_tasks[0].cancelled())
+    finally:
+        for task in created_tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*created_tasks, return_exceptions=True)

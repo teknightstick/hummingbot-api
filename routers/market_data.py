@@ -63,6 +63,7 @@ _PUBLIC_ERROR_MESSAGES = {
     "order_book_fetch_failed": "Order book data could not be fetched",
     "order_book_query_failed": "Order book query failed",
     "order_book_diagnostics_failed": "Order book diagnostics are unavailable",
+    "connector_pair_registration_failed": "Connector pair registration failed",
 }
 
 
@@ -1091,7 +1092,7 @@ async def get_vwap_for_volume(
 @router.post(
     "/trading-pair/add",
     response_model=TradingPairResponse,
-    responses=CAPABILITY_ERROR_RESPONSES,
+    responses=ORDER_BOOK_ERROR_RESPONSES,
 )
 async def add_trading_pair(
         request: AddTradingPairRequest,
@@ -1135,9 +1136,20 @@ async def add_trading_pair(
         else:
             raise HTTPException(
                 status_code=500,
-                detail=f"Failed to initialize order book for {request.trading_pair}"
+                detail=PublicErrorDetail(
+                    code="connector_pair_registration_failed",
+                    message="Connector pair registration failed",
+                ).model_dump(),
             )
 
+    except ConnectorCapabilityError as exc:
+        if exc.detail.get("code") == "connector_pair_registration_failed":
+            raise _sanitized_http_error(
+                "connector_pair_registration_failed",
+                "Connector pair registration failed",
+                exc,
+            )
+        raise
     except HTTPException:
         raise
     except Exception as exc:

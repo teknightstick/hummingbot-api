@@ -3424,25 +3424,39 @@ async def test_public_transaction_rolls_back_every_adverse_boundary(
     CHECK.assertEqual({}, service._data_connectors)
     CHECK.assertEqual({}, service._data_connectors_started)
     CHECK.assertEqual({}, service._connector_incarnations)
-    CHECK.assertIs(original_declaration, connector.api_capabilities)
-    CHECK.assertEqual(original_capabilities, connector.api_capabilities)
-    CHECK.assertEqual(original_connector_pairs, connector._trading_pairs)
+    CHECK.assertIsNot(original_declaration, connector.api_capabilities)
+    CHECK.assertNotEqual(original_capabilities, connector.api_capabilities)
     CHECK.assertEqual(
-        original_tracker_pairs, connector.order_book_tracker._trading_pairs
+        [
+            *original_connector_pairs,
+            *(["BTC-USD"] if boundary == "start" else []),
+            "DIRTY-PAIR",
+        ],
+        connector._trading_pairs,
     )
-    CHECK.assertEqual(original_books, connector.order_book_tracker.order_books)
-    CHECK.assertEqual({}, connector.order_book_tracker._tracking_tasks)
+    CHECK.assertEqual(
+        [*original_tracker_pairs, "DIRTY-PAIR"],
+        connector.order_book_tracker._trading_pairs,
+    )
+    CHECK.assertEqual(
+        {*original_books, "DIRTY-PAIR"},
+        set(connector.order_book_tracker.order_books),
+    )
+    CHECK.assertIs(
+        spawned_tasks[0],
+        connector.order_book_tracker._tracking_tasks["DIRTY-PAIR"],
+    )
     CHECK.assertTrue(spawned_tasks)
     CHECK.assertTrue(all(task.done() for task in spawned_tasks))
     CHECK.assertTrue(all(task.cancelled() for task in spawned_tasks))
-    CHECK.assertNotIn("DIRTY-PAIR", connector._trading_pairs)
+    CHECK.assertIn("DIRTY-PAIR", connector._trading_pairs)
     CHECK.assertEqual({}, service._connector_cleanup_owners)
     CHECK.assertEqual({}, service._connector_residual_tasks)
     CHECK.assertEqual({}, service._connector_cleanup_phases)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("boundary", ["start", "book_wait"])
+@pytest.mark.parametrize("boundary", ["start", "pair"])
 @pytest.mark.parametrize("outcome", ["cancel", "false", "raise"])
 async def test_public_transaction_restores_exact_preloaded_owned_deltas(
     boundary,
@@ -3487,15 +3501,17 @@ async def test_public_transaction_restores_exact_preloaded_owned_deltas(
         ("__data__", "manzana")
     )
     service._data_connectors_started = (
-        {"manzana": True} if boundary == "book_wait" else {}
+        {"manzana": True} if boundary == "pair" else {}
     )
     service._add_trading_pair_to_tracker = lambda *args: asyncio.sleep(
         0, result=True
     )
 
     async def mutate_then_finish(tracker, trading_pair, timeout):
-        connector._trading_pairs.append(trading_pair)
-        tracker._trading_pairs.append(trading_pair)
+        if trading_pair not in connector._trading_pairs:
+            connector._trading_pairs.append(trading_pair)
+        if trading_pair not in tracker._trading_pairs:
+            tracker._trading_pairs.append(trading_pair)
         tracker.order_books[trading_pair] = ReadyBook()
         spawned = asyncio.create_task(asyncio.Event().wait())
         spawned_tasks.append(spawned)
@@ -3507,8 +3523,11 @@ async def test_public_transaction_restores_exact_preloaded_owned_deltas(
             raise RuntimeError("private-preloaded-rollback-value")
         return False
 
-    if boundary == "book_wait":
-        service._wait_for_order_book = mutate_then_finish
+    if boundary == "pair":
+        service._add_trading_pair_to_tracker = lambda connector_arg, pair: (
+            mutate_then_finish(connector_arg.order_book_tracker, pair, 0)
+        )
+        service._wait_for_order_book = lambda *args: asyncio.sleep(0, result=True)
     if outcome == "cancel":
         task = asyncio.create_task(
             service.initialize_order_book("manzana", "BTC-USD", timeout=0)
@@ -3518,11 +3537,11 @@ async def test_public_transaction_restores_exact_preloaded_owned_deltas(
         with pytest.raises(asyncio.CancelledError) as cancelled:
             await task
         CHECK.assertEqual((("retain-my-exact-args", 224),), cancelled.value.args)
-    elif boundary == "book_wait" and outcome == "raise":
+    elif boundary == "pair" and outcome == "raise":
         with pytest.raises(module.ConnectorCapabilityError) as failure:
             await service.initialize_order_book("manzana", "BTC-USD", timeout=0)
         CHECK.assertEqual(
-            "connector_order_book_wait_failed", failure.value.detail["code"]
+            "connector_pair_registration_failed", failure.value.detail["code"]
         )
         CHECK.assertNotIn(
             "private-preloaded-rollback-value", json.dumps(failure.value.detail)
@@ -3538,7 +3557,7 @@ async def test_public_transaction_restores_exact_preloaded_owned_deltas(
         original_incarnation,
         service._connector_incarnations[("__data__", "manzana")],
     )
-    if boundary == "book_wait":
+    if boundary == "pair":
         CHECK.assertIs(service._data_connectors_started["manzana"], True)
     else:
         CHECK.assertNotIn("manzana", service._data_connectors_started)
@@ -4222,6 +4241,7 @@ async def test_closure_b3_public_service_seams_gate_before_resolution():
     unified._capability_registry = registry_type()
 
     class StaticConnector:
+        api_capabilities = _shift_successor_capabilities()
         order_book_tracker = None
 
     def resolve(*args, **kwargs):
@@ -7106,3 +7126,410 @@ async def test_lifecycle_b6_interface_cleanup_releases_tokens_and_records_sole_o
     CHECK.assertIn(residual_key, sole._cleanup_owners)
     CHECK.assertIs(connector, sole._cleanup_owners[residual_key]["connector"])
     CHECK.assertEqual(1, len(remove_calls))
+
+
+class Issue224RepairBook:
+    snapshot = ([1], [1])
+
+
+class Issue224RepairTracker:
+    def __init__(self):
+        self._trading_pairs = ["BASE-USD"]
+        self.order_books = {"BASE-USD": Issue224RepairBook()}
+        self._tracking_tasks = {}
+        self._in_flight_transactions = set()
+        self._order_book_stream_listener_task = object()
+
+
+class Issue224RepairConnector:
+    def __init__(self, tracker=None):
+        self.api_capabilities = _shift_successor_capabilities()
+        self._trading_pairs = ["BASE-USD"]
+        self.order_book_tracker = tracker or Issue224RepairTracker()
+        self.stop_calls = 0
+
+    async def exchange_symbol_associated_to_pair(self, trading_pair):
+        return trading_pair.replace("-", "")
+
+    async def stop_network(self):
+        self.stop_calls += 1
+
+
+def _issue224_repair_service():
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    tracker = Issue224RepairTracker()
+    connector = Issue224RepairConnector(tracker)
+    service._data_connectors = {"manzana": connector}
+    service._data_connectors_started = {"manzana": True}
+    return module, service, connector, tracker
+
+
+@pytest.mark.asyncio
+async def test_issue224_owned_delta_rollback_preserves_concurrent_unrelated_state():
+    _, service, connector, tracker = _issue224_repair_service()
+    pair_mutated = asyncio.Event()
+    release_pair = asyncio.Event()
+
+    async def add_pair(connector_arg, trading_pair):
+        connector_arg._trading_pairs.append(trading_pair)
+        tracker._trading_pairs.append(trading_pair)
+        tracker.order_books[trading_pair] = Issue224RepairBook()
+        pair_mutated.set()
+        await release_pair.wait()
+        return False
+
+    service._add_trading_pair_to_tracker = add_pair
+    request = asyncio.create_task(
+        service.initialize_order_book("manzana", "BTC-USD", timeout=0)
+    )
+    await pair_mutated.wait()
+    connector._trading_pairs.append("ETH-USD")
+    tracker._trading_pairs.append("ETH-USD")
+    eth_book = Issue224RepairBook()
+    tracker.order_books["ETH-USD"] = eth_book
+    release_pair.set()
+
+    CHECK.assertIs(await request, False)
+    CHECK.assertIs(connector, service._data_connectors["manzana"])
+    CHECK.assertEqual(["BASE-USD", "ETH-USD"], connector._trading_pairs)
+    CHECK.assertEqual(["BASE-USD", "ETH-USD"], tracker._trading_pairs)
+    CHECK.assertEqual({"BASE-USD", "ETH-USD"}, set(tracker.order_books))
+    CHECK.assertIs(eth_book, tracker.order_books["ETH-USD"])
+    CHECK.assertEqual(0, connector.stop_calls)
+
+
+@pytest.mark.asyncio
+async def test_issue224_owned_pair_and_book_removals_are_restored_in_place():
+    _, service, connector, tracker = _issue224_repair_service()
+    baseline_book = object()
+    connector._trading_pairs.append("BTC-USD")
+    tracker._trading_pairs.append("BTC-USD")
+    tracker.order_books["BTC-USD"] = baseline_book
+
+    async def remove_pair(connector_arg, trading_pair):
+        connector_arg._trading_pairs.remove(trading_pair)
+        tracker._trading_pairs.remove(trading_pair)
+        tracker.order_books.pop(trading_pair)
+        return False
+
+    service._add_trading_pair_to_tracker = remove_pair
+
+    CHECK.assertIs(
+        await service.initialize_order_book("manzana", "BTC-USD", timeout=0),
+        False,
+    )
+    CHECK.assertIs(connector, service._data_connectors["manzana"])
+    CHECK.assertIn("BTC-USD", connector._trading_pairs)
+    CHECK.assertIn("BTC-USD", tracker._trading_pairs)
+    CHECK.assertIs(baseline_book, tracker.order_books["BTC-USD"])
+    CHECK.assertEqual(0, connector.stop_calls)
+
+
+@pytest.mark.asyncio
+async def test_issue224_uninstrumented_book_wait_mutation_is_unpublished_not_rewound():
+    _, service, connector, tracker = _issue224_repair_service()
+    hidden_task = None
+
+    async def hidden_book_wait(*args):
+        nonlocal hidden_task
+        connector._trading_pairs.append("HIDDEN-USD")
+        tracker._trading_pairs.append("HIDDEN-USD")
+        tracker.order_books["HIDDEN-USD"] = Issue224RepairBook()
+        hidden_task = asyncio.create_task(asyncio.Event().wait())
+        tracker._tracking_tasks["HIDDEN-USD"] = hidden_task
+        await asyncio.sleep(0)
+        return False
+
+    service._add_trading_pair_to_tracker = lambda *args: asyncio.sleep(
+        0, result=True
+    )
+    service._wait_for_order_book = hidden_book_wait
+
+    CHECK.assertIs(
+        await service.initialize_order_book("manzana", "BTC-USD", timeout=0),
+        False,
+    )
+    CHECK.assertEqual({}, service._data_connectors)
+    CHECK.assertEqual({}, service._data_connectors_started)
+    CHECK.assertEqual(1, connector.stop_calls)
+    CHECK.assertIn("HIDDEN-USD", connector._trading_pairs)
+    CHECK.assertIn("HIDDEN-USD", tracker._trading_pairs)
+    CHECK.assertIn("HIDDEN-USD", tracker.order_books)
+    CHECK.assertIs(hidden_task, tracker._tracking_tasks["HIDDEN-USD"])
+    CHECK.assertTrue(hidden_task.done())
+    CHECK.assertTrue(hidden_task.cancelled())
+
+
+@pytest.mark.asyncio
+async def test_issue224_task_ledger_cancels_owned_handle_not_replacement():
+    _, service, connector, tracker = _issue224_repair_service()
+    owned_published = asyncio.Event()
+    release_pair = asyncio.Event()
+
+    async def pending():
+        await asyncio.Event().wait()
+
+    owned_task = None
+    set_task = None
+
+    async def add_pair(connector_arg, trading_pair):
+        nonlocal owned_task, set_task
+        owned_task = asyncio.create_task(pending())
+        set_task = asyncio.create_task(pending())
+        tracker._tracking_tasks[trading_pair] = owned_task
+        tracker._in_flight_transactions.add(set_task)
+        owned_published.set()
+        await release_pair.wait()
+        return False
+
+    service._add_trading_pair_to_tracker = add_pair
+    request = asyncio.create_task(
+        service.initialize_order_book("manzana", "BTC-USD", timeout=0)
+    )
+    await owned_published.wait()
+    replacement_task = asyncio.create_task(pending())
+    tracker._tracking_tasks["BTC-USD"] = replacement_task
+    release_pair.set()
+
+    try:
+        CHECK.assertIs(await request, False)
+        CHECK.assertTrue(owned_task.done())
+        CHECK.assertTrue(owned_task.cancelled())
+        CHECK.assertTrue(set_task.done())
+        CHECK.assertTrue(set_task.cancelled())
+        CHECK.assertNotIn(set_task, tracker._in_flight_transactions)
+        CHECK.assertFalse(replacement_task.done())
+        CHECK.assertIs(replacement_task, tracker._tracking_tasks["BTC-USD"])
+        CHECK.assertIs(connector, service._data_connectors["manzana"])
+    finally:
+        for task in (owned_task, set_task, replacement_task):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(
+                task
+                for task in (owned_task, set_task, replacement_task)
+                if task is not None
+            ),
+            return_exceptions=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_issue224_cancellation_resistant_owned_task_is_retained_and_retried():
+    module, service, connector, tracker = _issue224_repair_service()
+    release_owned = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+    owned_task = None
+
+    async def resistant():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancellation_seen.set()
+            await release_owned.wait()
+
+    async def add_pair(connector_arg, trading_pair):
+        nonlocal owned_task
+        owned_task = asyncio.create_task(resistant())
+        tracker._tracking_tasks[trading_pair] = owned_task
+        await asyncio.sleep(0)
+        return False
+
+    service._add_trading_pair_to_tracker = add_pair
+    with pytest.raises(module.ConnectorCapabilityError) as pending:
+        await service.initialize_order_book("manzana", "BTC-USD", timeout=0)
+
+    await cancellation_seen.wait()
+    owner_key = ("__data__", "manzana", "public_transaction")
+    CHECK.assertEqual(
+        "connector_capability_cleanup_residual", pending.value.detail["code"]
+    )
+    CHECK.assertIs(connector, service._data_connectors["manzana"])
+    CHECK.assertIn(owner_key, service._connector_cleanup_owners)
+    CHECK.assertIn(owned_task, service._connector_residual_tasks[owner_key])
+    CHECK.assertIn(owner_key, service._connector_cleanup_phases)
+    CHECK.assertFalse(owned_task.done())
+
+    with pytest.raises(module.ConnectorCapabilityError) as retry_pending:
+        await service.initialize_order_book("manzana", "BTC-USD", timeout=0)
+    CHECK.assertEqual(
+        "connector_capability_cleanup_residual",
+        retry_pending.value.detail["code"],
+    )
+    CHECK.assertIn(owned_task, service._connector_residual_tasks[owner_key])
+    CHECK.assertFalse(owned_task.done())
+
+    release_owned.set()
+    await owned_task
+
+    async def successful_retry(connector_arg, trading_pair):
+        connector_arg._trading_pairs.append(trading_pair)
+        tracker._trading_pairs.append(trading_pair)
+        tracker.order_books[trading_pair] = Issue224RepairBook()
+        return True
+
+    service._add_trading_pair_to_tracker = successful_retry
+    service._wait_for_order_book = lambda *args: asyncio.sleep(0, result=True)
+
+    CHECK.assertIs(
+        await service.initialize_order_book("manzana", "BTC-USD", timeout=0),
+        True,
+    )
+    CHECK.assertEqual({}, service._connector_creation_residuals)
+    CHECK.assertEqual({}, service._connector_cleanup_owners)
+    CHECK.assertEqual({}, service._connector_residual_tasks)
+    CHECK.assertEqual({}, service._connector_cleanup_phases)
+
+
+@pytest.mark.asyncio
+async def test_issue224_pair_raise_is_typed_and_sanitized_through_public_callers():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from models.connectors import CapabilityErrorDetail
+
+    deps = sys.modules.get("deps")
+    if deps is not None:
+        deps.get_executor_service = lambda: None
+        deps.get_market_data_service = lambda: None
+    executor_service_module = _module("services.executor_service")
+    executor_service_module.ExecutorService = type("ExecutorService", (), {})
+    from routers import executors as executors_router
+
+    module, service, _, _ = _issue224_repair_service()
+    secret = "PRIVATE-PAIR-SECRET"
+
+    async def raise_pair(connector, trading_pair):
+        raise RuntimeError(secret)
+
+    service._add_trading_pair_to_tracker = raise_pair
+    with pytest.raises(module.ConnectorCapabilityError) as failure:
+        await service.initialize_order_book("manzana", "BTC-USD", timeout=0)
+
+    CHECK.assertEqual(
+        "connector_pair_registration_failed", failure.value.detail["code"]
+    )
+    CHECK.assertNotIn(secret, json.dumps(failure.value.detail))
+
+    class ExecutorService:
+        async def create_executor(self, **kwargs):
+            try:
+                raise RuntimeError(secret)
+            except RuntimeError as cause:
+                raise module.ConnectorCapabilityError(
+                    CapabilityErrorDetail.model_validate(failure.value.detail)
+                ) from cause
+
+    app = FastAPI()
+    app.include_router(executors_router.router)
+    app.dependency_overrides[executors_router.get_executor_service] = ExecutorService
+    response = TestClient(app).post(
+        "/executors/",
+        json={"executor_config": {"type": "position_executor"}},
+    )
+    CHECK.assertEqual(400, response.status_code, response.text)
+    CHECK.assertEqual(
+        "connector_pair_registration_failed", response.json()["detail"]["code"]
+    )
+    CHECK.assertNotIn(secret, response.text)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["initialize", "ensure_started"])
+async def test_issue224_invalid_preloaded_truth_is_cleaned_before_early_success(operation):
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    declaration = _shift_successor_capabilities()
+    declaration["features"] = set(declaration["features"]) - {
+        module.ConnectorFeature.LIVE_ORDER_BOOK
+    }
+
+    class Connector:
+        order_book_tracker = None
+
+        def __init__(self):
+            self.api_capabilities = declaration
+            self._trading_pairs = []
+            self.stop_calls = 0
+
+        async def stop_network(self):
+            self.stop_calls += 1
+
+    connector = Connector()
+    service._data_connectors = {"manzana": connector}
+    service._data_connectors_started = {"manzana": True}
+
+    with pytest.raises(module.ConnectorCapabilityError) as mismatch:
+        if operation == "initialize":
+            await service.initialize_order_book("manzana", "BTC-USD", timeout=0)
+        else:
+            await service.ensure_data_connector_started("manzana", "BTC-USD")
+
+    CHECK.assertEqual("connector_capability_mismatch", mismatch.value.detail["code"])
+    CHECK.assertEqual(1, connector.stop_calls)
+    CHECK.assertEqual({}, service._data_connectors)
+    CHECK.assertEqual({}, service._data_connectors_started)
+
+
+@pytest.mark.parametrize("outcome", ["false", "raise"])
+def test_issue224_add_pair_failure_has_one_typed_500_contract(outcome):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from models.connectors import CapabilityErrorDetail, PublicErrorResponse
+    from routers import market_data as market_data_router
+    from services.connector_capabilities import ConnectorCapabilityError
+
+    secret = "PRIVATE-PAIR-HTTP-SECRET"
+
+    class Service:
+        def require_capability(self, *args, **kwargs):
+            return None
+
+        async def initialize_order_book(self, **kwargs):
+            if outcome == "raise":
+                raise ConnectorCapabilityError(
+                    CapabilityErrorDetail(
+                        code="connector_pair_registration_failed",
+                        message="Connector pair registration failed",
+                        connector=kwargs["connector_name"],
+                        feature="live_order_book",
+                        trading_pair=kwargs["trading_pair"],
+                        reason="pair_registration_failed",
+                    )
+                ) from RuntimeError(secret)
+            return False
+
+    app = FastAPI()
+    app.include_router(market_data_router.router)
+    app.dependency_overrides[market_data_router.get_market_data_service] = Service
+    response = TestClient(app).post(
+        "/market-data/trading-pair/add",
+        json={
+            "connector_name": "manzana",
+            "trading_pair": "BTC-USD",
+            "timeout": 1,
+        },
+    )
+
+    CHECK.assertEqual(500, response.status_code, response.text)
+    PublicErrorResponse.model_validate(response.json())
+    CHECK.assertEqual(
+        {
+            "detail": {
+                "code": "connector_pair_registration_failed",
+                "message": "Connector pair registration failed",
+            }
+        },
+        response.json(),
+    )
+    CHECK.assertNotIn(secret, response.text)
+    responses = app.openapi()["paths"]["/market-data/trading-pair/add"]["post"][
+        "responses"
+    ]
+    CHECK.assertEqual(
+        "#/components/schemas/PublicErrorResponse",
+        responses["500"]["content"]["application/json"]["schema"]["$ref"],
+    )
