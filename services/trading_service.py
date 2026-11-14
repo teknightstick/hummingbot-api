@@ -368,7 +368,7 @@ class AccountTradingInterface:
             connector_name, ConnectorFeature.ORDER_SUBMISSION, trading_pair
         )
 
-        async with self._market_transaction(connector_name):
+        async with self._market_transaction(connector_name, trading_pair):
             await self._retry_market_cleanup_residual(connector_name, trading_pair)
             connector_preexisting = connector_name in self.connectors
             connector = self.connectors.get(connector_name)
@@ -457,14 +457,18 @@ class AccountTradingInterface:
                 raise
 
     @asynccontextmanager
-    async def _market_transaction(self, connector_name: str):
+    async def _market_transaction(
+        self,
+        connector_name: str,
+        trading_pair: Optional[str] = None,
+    ):
         """Serialize connector-wide mutations and prune the caller-controlled lock key."""
         transaction_key = (self._account_name, connector_name)
         shared_transaction = getattr(
             self._connector_service, "_market_transaction_lock", None
         )
         if callable(shared_transaction):
-            async with shared_transaction(transaction_key):
+            async with shared_transaction(transaction_key, trading_pair):
                 yield
             return
         async with self._market_locks_guard:
@@ -719,24 +723,38 @@ class AccountTradingInterface:
             if cleanup_task is None:
                 if connector_preexisting:
                     cleanup = getattr(
-                        self._market_data_service, "remove_trading_pair", None
+                        self._connector_service,
+                        "_remove_trading_pair_already_locked",
+                        None,
                     )
-                    if cleanup is None:
-                        phase["complete"] = True
-                        phase["error_code"] = "pair_cleanup_unavailable"
-                        return phase["error_code"]
-                    awaitable = cleanup(
-                        connector_name=connector_name,
-                        trading_pair=trading_pair,
-                        account_name=self._account_name,
-                    )
+                    if cleanup is not None:
+                        awaitable = cleanup(
+                            connector_name,
+                            trading_pair,
+                            (self._account_name, connector_name),
+                        )
+                    else:
+                        cleanup = getattr(
+                            self._market_data_service,
+                            "remove_trading_pair",
+                            None,
+                        )
+                        if cleanup is None:
+                            phase["complete"] = True
+                            phase["error_code"] = "pair_cleanup_unavailable"
+                            return phase["error_code"]
+                        awaitable = cleanup(
+                            connector_name=connector_name,
+                            trading_pair=trading_pair,
+                            account_name=self._account_name,
+                        )
                 else:
                     cleanup = getattr(
                         self._connector_service,
                         "_stop_trading_connector_already_locked",
                         None,
                     )
-                    cleanup_is_internal = cleanup is not None
+                    cleanup_returns_detail = cleanup is not None
                     if cleanup is None:
                         cleanup = getattr(
                             self._connector_service,
@@ -747,18 +765,8 @@ class AccountTradingInterface:
                         phase["complete"] = True
                         phase["error_code"] = "connector_cleanup_unavailable"
                         return phase["error_code"]
-
-                    async def stop_new_connector():
-                        result = await cleanup(
-                            self._account_name, connector_name
-                        )
-                        if cleanup_is_internal:
-                            if result is not None:
-                                raise ConnectorCapabilityError(result)
-                            return True
-                        return result
-
-                    awaitable = stop_new_connector()
+                    phase["returns_detail"] = cleanup_returns_detail
+                    awaitable = cleanup(self._account_name, connector_name)
                 cleanup_task = asyncio.ensure_future(awaitable)
                 phase["task"] = cleanup_task
                 retained = self._retain_market_transaction_descendant(
@@ -801,6 +809,16 @@ class AccountTradingInterface:
             try:
                 result = cleanup_task.result()
             except asyncio.CancelledError:
+                if not connector_preexisting:
+                    # The wrapper was cancelled at the public deadline. UCS owns
+                    # the exact physical task/result, so reconcile that canonical
+                    # phase instead of making wrapper cancellation permanent.
+                    self._cleanup_phases.pop(task_key, None)
+                    return await self._remote_cleanup_reason(
+                        connector_name,
+                        trading_pair,
+                        connector_preexisting,
+                    )
                 phase["complete"] = True
                 phase["error_code"] = "cleanup_cancelled"
                 return phase["error_code"]
@@ -810,6 +828,20 @@ class AccountTradingInterface:
                 return phase["error_code"]
             phase["complete"] = True
             phase["result"] = result
+            if (
+                not connector_preexisting
+                and phase.get("returns_detail", False)
+                and result is not None
+            ):
+                detail = (
+                    result
+                    if isinstance(result, CapabilityErrorDetail)
+                    else CapabilityErrorDetail.model_validate(result)
+                )
+                phase["error_code"] = (
+                    detail.cleanup_code or "connector_cleanup_incomplete"
+                )
+                return phase["error_code"]
             if result is False:
                 phase["error_code"] = "cleanup_returned_false"
                 return phase["error_code"]
@@ -1059,7 +1091,7 @@ class AccountTradingInterface:
             # Executor cleanup is command-style: return a typed rejection while
             # preserving membership so callers can surface it without ambiguity.
             return CapabilityErrorDetail.model_validate(exc.detail)
-        async with self._market_transaction(connector_name):
+        async with self._market_transaction(connector_name, trading_pair):
             if (
                 trading_pair not in self._markets.get(connector_name, set())
                 or not self._owns_market_pair(connector_name, trading_pair)

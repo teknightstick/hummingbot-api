@@ -5,6 +5,7 @@ from starlette import status
 
 from deps import get_accounts_service, require_gateway_online
 from models import GatewayWalletCredential, SetDefaultWalletRequest
+from models.connectors import CapabilityErrorResponse
 from services.accounts_service import AccountsService, validate_safe_name
 
 router = APIRouter(tags=["Accounts"], prefix="/accounts")
@@ -68,7 +69,10 @@ async def add_account(account_name: str, accounts_service: AccountsService = Dep
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.post("/delete-account")
+@router.post(
+    "/delete-account",
+    responses={400: {"model": CapabilityErrorResponse}},
+)
 async def delete_account(account_name: str, accounts_service: AccountsService = Depends(get_accounts_service)):
     """
     Delete an account and all its associated credentials.
@@ -92,7 +96,10 @@ async def delete_account(account_name: str, accounts_service: AccountsService = 
         raise HTTPException(status_code=404, detail=str(e))
 
 
-@router.post("/delete-credential/{account_name}/{connector_name}")
+@router.post(
+    "/delete-credential/{account_name}/{connector_name}",
+    responses={400: {"model": CapabilityErrorResponse}},
+)
 async def delete_credential(
     account_name: str,
     connector_name: str,
@@ -118,7 +125,11 @@ async def delete_credential(
         raise HTTPException(status_code=404, detail=str(e))
 
 
-@router.post("/add-credential/{account_name}/{connector_name}", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/add-credential/{account_name}/{connector_name}",
+    status_code=status.HTTP_201_CREATED,
+    responses={400: {"model": CapabilityErrorResponse}},
+)
 async def add_credential(
     account_name: str,
     connector_name: str,
@@ -142,6 +153,8 @@ async def add_credential(
     try:
         await accounts_service.add_credentials(account_name, connector_name, credentials)
         return {"message": "Connector credentials added successfully."}
+    except HTTPException:
+        raise
     except Exception as e:
         # Rollback is handled inside add_credentials, which only deletes the file for a
         # brand-new creation and preserves pre-existing credentials on a failed update.

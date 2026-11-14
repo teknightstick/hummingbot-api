@@ -487,7 +487,13 @@ class AccountsService:
                     gateway_meta.append((account_name, connector_name))
                     continue
 
-                tasks.append(self._get_connector_tokens_info(connector, connector_name))
+                tasks.append(
+                    self._get_connector_tokens_info(
+                        connector,
+                        connector_name,
+                        account_name=account_name,
+                    )
+                )
                 task_meta.append((account_name, connector_name))
 
         # Execute connectors + gateway in parallel (unless skip_gateway is True)
@@ -531,7 +537,13 @@ class AccountsService:
             if connector_name in master_state:
                 self.accounts_state[account_name][connector_name] = master_state[connector_name]
 
-    async def _get_connector_tokens_info(self, connector, connector_name: str, skip_balance_refresh: bool = False) -> List[Dict]:
+    async def _get_connector_tokens_info(
+        self,
+        connector,
+        connector_name: str,
+        skip_balance_refresh: bool = False,
+        account_name: Optional[str] = None,
+    ) -> List[Dict]:
         """Get token info from a connector instance using the ticker pool prices.
 
         Fetches fresh balances from the exchange, then tries the ticker pool (instant, in-memory
@@ -550,7 +562,12 @@ class AccountsService:
         # Fetch fresh balances from the exchange unless caller already did
         if not skip_balance_refresh and hasattr(connector, '_update_balances'):
             try:
-                await connector._update_balances()
+                if account_name is not None:
+                    await self._connector_service.refresh_connector_state(
+                        connector, connector_name, account_name
+                    )
+                else:
+                    await connector._update_balances()
             except Exception as e:
                 logger.warning(f"Failed to refresh balances for {connector_name}, using cached data: {e}")
 
@@ -688,7 +705,11 @@ class AccountsService:
             # update, update_connector_keys overwrote the previous (valid) credentials in-place, so
             # we restore the captured original content to keep the file byte-for-byte intact.
             if not credentials_existed:
-                await self.delete_credentials(account_name, connector_name)
+                if fs_util.path_exists(credentials_path):
+                    fs_util.delete_file(
+                        directory=f"credentials/{account_name}/connectors",
+                        file_name=f"{connector_name}.yml",
+                    )
             elif original_content is not None:
                 fs_util.ensure_file_and_dump_text(credentials_path, original_content)
             raise e
@@ -724,13 +745,17 @@ class AccountsService:
         """
         validate_safe_name(account_name, "account name")
         validate_safe_name(connector_name, "connector name")
-        # Delete credentials file if it exists
-        if fs_util.path_exists(f"credentials/{account_name}/connectors/{connector_name}.yml"):
-            fs_util.delete_file(directory=f"credentials/{account_name}/connectors", file_name=f"{connector_name}.yml")
-
-        # Always perform cleanup regardless of file existence
-        # Stop the connector if it's running
+        # Physical connector truth commits first. A bounded residual leaves the
+        # credential file, connector cache, and account state byte-for-byte intact.
         await self._connector_service.stop_trading_connector(account_name, connector_name)
+
+        credentials_path = f"credentials/{account_name}/connectors/{connector_name}.yml"
+        if fs_util.path_exists(credentials_path):
+            fs_util.delete_file(
+                directory=f"credentials/{account_name}/connectors",
+                file_name=f"{connector_name}.yml",
+            )
+
         # Clear the connector from cache
         self._connector_service.clear_trading_connector(account_name, connector_name)
 

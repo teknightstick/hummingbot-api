@@ -134,6 +134,13 @@ class _MarketTransactionLease:
         self.frames.pop(completed_task, None)
         self._request_release_if_terminal()
 
+    def reap_terminal_frames(self) -> None:
+        """Synchronously close the terminal handoff before a new caller queues."""
+        for task in tuple(self.frames):
+            if task.done():
+                self.frames.pop(task, None)
+        self._request_release_if_terminal()
+
     def _request_release_if_terminal(self) -> None:
         if self.root_exited and not self.frames:
             self.release_requested.set()
@@ -230,7 +237,15 @@ class UnifiedConnectorService:
         self._connector_incarnation_sequence = 0
         self._market_locks: Dict[Tuple[str, str], asyncio.Lock] = {}
         self._market_lock_users: Dict[Tuple[str, str], int] = {}
+        self._market_leases: Dict[
+            Tuple[str, str], _MarketTransactionLease
+        ] = {}
         self._market_locks_guard = asyncio.Lock()
+        self._market_pair_owners: Dict[Tuple[str, str, str], Set[object]] = {}
+        self._market_cleanup_residuals: Dict[Tuple[str, ...], Dict[str, Any]] = {}
+        self._market_cleanup_owners: Dict[Tuple[str, ...], Dict[str, Any]] = {}
+        self._market_residual_tasks: Dict[Tuple[str, ...], Set[asyncio.Task]] = {}
+        self._market_cleanup_phases: Dict[Tuple[str, ...], Dict[str, Any]] = {}
 
         # Connector settings cache
         self._conn_settings = AllConnectorSettings.get_connector_settings()
@@ -393,8 +408,20 @@ class UnifiedConnectorService:
             self._market_locks = {}
         if not hasattr(self, "_market_lock_users"):
             self._market_lock_users = {}
+        if not hasattr(self, "_market_leases"):
+            self._market_leases = {}
         if not hasattr(self, "_market_locks_guard"):
             self._market_locks_guard = asyncio.Lock()
+        market_defaults = (
+            ("_market_pair_owners", {}),
+            ("_market_cleanup_residuals", {}),
+            ("_market_cleanup_owners", {}),
+            ("_market_residual_tasks", {}),
+            ("_market_cleanup_phases", {}),
+        )
+        for name, value in market_defaults:
+            if not hasattr(self, name):
+                setattr(self, name, value)
 
     def _connector_incarnation(
         self, connector_key: Tuple[str, str]
@@ -488,7 +515,18 @@ class UnifiedConnectorService:
             Initialized trading connector
         """
         connector_key = self._connector_key(account_name, connector_name)
+        async with self._market_transaction_lock(connector_key):
+            return await self._get_trading_connector_already_locked(
+                account_name, connector_name
+            )
 
+    async def _get_trading_connector_already_locked(
+        self,
+        account_name: str,
+        connector_name: str,
+    ) -> ConnectorBase:
+        """Create or return a connector under exact-root market authority."""
+        connector_key = self._connector_key(account_name, connector_name)
         async with self._connector_creation_lock(connector_key):
             self._ensure_connector_cleanup_state()
             residual = self._connector_creation_residuals.get(connector_key)
@@ -537,9 +575,113 @@ class UnifiedConnectorService:
             self._connector_creation_residuals.pop(connector_key, None)
             return connector
 
+    @staticmethod
+    def _tasks_have_live_work(task_registry, connector_key: Tuple[str, str]) -> bool:
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
+        return any(
+            task is not current_task and not task.done()
+            for owner_key, tasks in task_registry.items()
+            if isinstance(owner_key, tuple) and owner_key[:2] == connector_key
+            for task in tasks
+        )
+
+    def _market_mutation_preflight_detail(
+        self,
+        connector_key: Tuple[str, str],
+        trading_pair: Optional[str] = None,
+        *,
+        current_lease: Optional[_MarketTransactionLease] = None,
+    ) -> Optional[CapabilityErrorDetail]:
+        """Return same-key live cleanup truth before another mutator can queue."""
+        self._ensure_connector_cleanup_state()
+        lease = self._market_leases.get(connector_key)
+        if lease is not None and lease.active:
+            lease.reap_terminal_frames()
+        retained_lease = bool(
+            lease is not None
+            and lease is not current_lease
+            and lease.active
+            and any(not task.done() for task in lease.frames)
+        )
+        live_tasks = self._tasks_have_live_work(
+            self._connector_residual_tasks, connector_key
+        ) or self._tasks_have_live_work(
+            self._market_residual_tasks, connector_key
+        )
+        if not retained_lease and not live_tasks:
+            return None
+
+        market_residuals = self._market_cleanup_residuals
+        preferred_keys = []
+        if trading_pair is not None:
+            preferred_keys.append((*connector_key, "pair", trading_pair))
+        preferred_keys.append((*connector_key, "connector"))
+        for residual_key in preferred_keys:
+            residual = market_residuals.get(residual_key)
+            if residual is not None:
+                return CapabilityErrorDetail.model_validate(residual)
+        for residual_key, residual in market_residuals.items():
+            if (
+                isinstance(residual_key, tuple)
+                and residual_key[:2] == connector_key
+            ):
+                return CapabilityErrorDetail.model_validate(residual)
+
+        residual = self._connector_creation_residuals.get(connector_key)
+        if residual is not None:
+            return CapabilityErrorDetail.model_validate(residual)
+
+        account_name, connector_name = connector_key
+        live_owner_kinds = {
+            owner_key[2]
+            for owner_key, tasks in self._connector_residual_tasks.items()
+            if (
+                isinstance(owner_key, tuple)
+                and owner_key[:2] == connector_key
+                and any(not task.done() for task in tasks)
+            )
+        }
+        cleanup_code = (
+            "restart_cleanup_incomplete"
+            if "restart" in live_owner_kinds
+            else "market_transaction_retained"
+        )
+        return CapabilityErrorDetail(
+            code="connector_cleanup_residual",
+            message=(
+                f"Connector cleanup is incomplete for "
+                f"'{account_name}:{connector_name}'"
+            ),
+            connector=connector_name,
+            feature="connector_cleanup",
+            reason="cleanup_incomplete",
+            cleanup_scope="connector",
+            cleanup_code=cleanup_code,
+        )
+
+    def _raise_market_mutation_preflight(
+        self,
+        connector_key: Tuple[str, str],
+        trading_pair: Optional[str] = None,
+        *,
+        current_lease: Optional[_MarketTransactionLease] = None,
+    ) -> None:
+        detail = self._market_mutation_preflight_detail(
+            connector_key,
+            trading_pair,
+            current_lease=current_lease,
+        )
+        if detail is not None:
+            raise ConnectorCapabilityError(detail)
+
     @asynccontextmanager
     async def _market_transaction_lock(
-        self, connector_key: Tuple[str, str]
+        self,
+        connector_key: Tuple[str, str],
+        trading_pair: Optional[str] = None,
     ):
         """Serialize mutation while a guardian retains live physical descendants."""
         self._ensure_connector_cleanup_state()
@@ -557,6 +699,7 @@ class UnifiedConnectorService:
                 return
             raise RuntimeError("market_transaction_authority_unavailable")
 
+        self._raise_market_mutation_preflight(connector_key, trading_pair)
         async with self._market_locks_guard:
             lock = self._market_locks.setdefault(connector_key, asyncio.Lock())
             self._market_lock_users[connector_key] = (
@@ -575,12 +718,20 @@ class UnifiedConnectorService:
             context_token = _MARKET_TRANSACTION_CONTEXT.set(
                 (*inherited, (scope, transaction_token))
             )
+            self._raise_market_mutation_preflight(
+                connector_key,
+                trading_pair,
+                current_lease=lease,
+            )
             yield transaction_token
         finally:
             if context_token is not None:
                 _MARKET_TRANSACTION_CONTEXT.reset(context_token)
             lease.exit_root()
-            if transaction_token is not None and not lease.frames:
+            if transaction_token is None:
+                guardian_task.cancel()
+                await asyncio.gather(guardian_task, return_exceptions=True)
+            elif not lease.frames:
                 try:
                     await asyncio.shield(guardian_task)
                 except asyncio.CancelledError:
@@ -598,9 +749,15 @@ class UnifiedConnectorService:
         try:
             await lock.acquire()
             acquired = True
+            async with self._market_locks_guard:
+                self._market_leases[connector_key] = lease
             if not lease.acquired.done():
                 lease.acquired.set_result(None)
             await lease.release_requested.wait()
+        except asyncio.CancelledError:
+            if not lease.acquired.done():
+                lease.acquired.cancel()
+            raise
         except BaseException as exc:
             if not lease.acquired.done():
                 lease.acquired.set_exception(exc)
@@ -610,6 +767,8 @@ class UnifiedConnectorService:
             if acquired:
                 lock.release()
             async with self._market_locks_guard:
+                if self._market_leases.get(connector_key) is lease:
+                    self._market_leases.pop(connector_key, None)
                 users = self._market_lock_users.get(connector_key, 1) - 1
                 if users:
                     self._market_lock_users[connector_key] = users
@@ -657,9 +816,7 @@ class UnifiedConnectorService:
         current_task = asyncio.current_task()
         if lease is None or current_task is None:
             return False
-        if lease.root_task is current_task:
-            return not lease.frames
-        return set(lease.frames) == {current_task}
+        return lease.root_task is current_task and not lease.frames
 
     def _market_transaction_has_live_descendant(
         self, connector_key: Tuple[str, str]
@@ -702,9 +859,10 @@ class UnifiedConnectorService:
                     self._connector_lock_users.pop(connector_key, None)
                     if self._connector_locks.get(connector_key) is lock:
                         self._connector_locks.pop(connector_key, None)
-                    getattr(self, "_connector_creation_failures", {}).pop(
-                        connector_key, None
-                    )
+                    if self._market_lock_users.get(connector_key, 0) <= 1:
+                        getattr(self, "_connector_creation_failures", {}).pop(
+                            connector_key, None
+                        )
                     self._prune_connector_incarnation(connector_key)
 
     def get_all_trading_connectors(self) -> Dict[str, Dict[str, ConnectorBase]]:
@@ -770,6 +928,12 @@ class UnifiedConnectorService:
         if connector_name not in self._data_connectors:
             self._ensure_connector_cleanup_state()
             connector_key = self._connector_key("__data__", connector_name)
+            self._raise_market_mutation_preflight(connector_key)
+            lease = self._active_market_transaction_lease(connector_key)
+            if lease is not None and not self._is_market_transaction_participant(
+                connector_key
+            ):
+                raise RuntimeError("market_transaction_authority_unavailable")
             residual = self._connector_creation_residuals.get(connector_key)
             if residual is None and self._connector_has_private_state(connector_key):
                 detail = CapabilityErrorDetail(
@@ -816,6 +980,18 @@ class UnifiedConnectorService:
             True if started successfully
         """
         connector_key = self._connector_key("__data__", connector_name)
+        async with self._market_transaction_lock(connector_key, trading_pair):
+            return await self._ensure_data_connector_started_already_locked(
+                connector_name, trading_pair, connector_key
+            )
+
+    async def _ensure_data_connector_started_already_locked(
+        self,
+        connector_name: str,
+        trading_pair: str,
+        connector_key: Tuple[str, str],
+    ) -> bool:
+        """Start a data connector under exact-root market authority."""
         async with self._connector_creation_lock(connector_key):
             await self._retry_public_transaction_cleanup(connector_key)
             residual = self._connector_creation_residuals.get(connector_key)
@@ -1939,6 +2115,35 @@ class UnifiedConnectorService:
         self, connector_key: Tuple[str, str]
     ) -> None:
         owner_key = self._owner_key(*connector_key, "public_transaction")
+        restart_owner_key = self._owner_key(*connector_key, "restart")
+        if (
+            owner_key not in self._connector_cleanup_owners
+            and any(
+                restart_owner_key in registry
+                for registry in (
+                    self._connector_cleanup_owners,
+                    self._connector_residual_tasks,
+                    self._connector_cleanup_phases,
+                )
+            )
+        ):
+            account_name, connector_name = connector_key
+            cached_connector = self._cached_public_connector(connector_key)
+            if cached_connector is not None:
+                try:
+                    self._validate_instance_capabilities(
+                        connector_name, cached_connector
+                    )
+                except ConnectorCapabilityError:
+                    return
+            if account_name == "__data__":
+                detail = await self._finalize_stop_data_connector(connector_name)
+            else:
+                detail = await self._finalize_stop_trading_connector(
+                    account_name, connector_name
+                )
+            if detail is not None:
+                raise ConnectorCapabilityError(detail)
         if owner_key not in self._connector_cleanup_owners:
             return
         if not await self._drain_owner_tasks(owner_key):
@@ -2036,6 +2241,14 @@ class UnifiedConnectorService:
                 snapshot, force_discard=force_discard
             )
         )
+        connector_key = snapshot["connector_key"]
+        lease = self._active_market_transaction_lease(connector_key)
+        if lease is not None and not self._retain_market_transaction_descendant(
+            connector_key, cleanup_task
+        ):
+            cleanup_task.cancel()
+            await asyncio.gather(cleanup_task, return_exceptions=True)
+            raise RuntimeError("public_cleanup_authority_unavailable")
         preserved_args = cancellation_args
         while not cleanup_task.done():
             try:
@@ -2462,24 +2675,29 @@ class UnifiedConnectorService:
             connector_key = self._resolve_public_connector_key(
                 connector_name, account_name
             )
-            async with self._connector_creation_lock(connector_key):
-                if (
-                    self._resolve_public_connector_key(connector_name, account_name)
-                    != connector_key
-                ):
-                    continue
-                await self._retry_public_transaction_cleanup(connector_key)
-                residual = self._connector_creation_residuals.get(connector_key)
-                if residual is not None:
-                    raise ConnectorCapabilityError(
-                        CapabilityErrorDetail.model_validate(residual)
+            async with self._market_transaction_lock(
+                connector_key, trading_pair
+            ):
+                async with self._connector_creation_lock(connector_key):
+                    if (
+                        self._resolve_public_connector_key(
+                            connector_name, account_name
+                        )
+                        != connector_key
+                    ):
+                        continue
+                    await self._retry_public_transaction_cleanup(connector_key)
+                    residual = self._connector_creation_residuals.get(connector_key)
+                    if residual is not None:
+                        raise ConnectorCapabilityError(
+                            CapabilityErrorDetail.model_validate(residual)
+                        )
+                    return await self._initialize_order_book_locked(
+                        connector_name,
+                        trading_pair,
+                        connector_key,
+                        timeout,
                     )
-                return await self._initialize_order_book_locked(
-                    connector_name,
-                    trading_pair,
-                    connector_key,
-                    timeout,
-                )
 
     async def _initialize_order_book_locked(
         self,
@@ -2763,7 +2981,9 @@ class UnifiedConnectorService:
             connector_key = self._resolve_public_connector_key(
                 connector_name, account_name
             )
-            async with self._connector_creation_lock(connector_key):
+            async with self._market_transaction_lock(
+                connector_key, trading_pair
+            ):
                 if (
                     self._resolve_public_connector_key(
                         connector_name, account_name
@@ -2771,39 +2991,51 @@ class UnifiedConnectorService:
                     != connector_key
                 ):
                     continue
-                await self._retry_public_transaction_cleanup(connector_key)
-                residual = self._connector_creation_residuals.get(connector_key)
-                if residual is not None:
-                    raise ConnectorCapabilityError(
-                        CapabilityErrorDetail.model_validate(residual)
-                    )
-                connector = self._connector_for_public_key(connector_key)
-                if not connector:
-                    logger.warning(
-                        "No connector available for %s to remove %s",
-                        connector_name,
-                        trading_pair,
-                    )
-                    return False
-                if self._connector_incarnation(connector_key) is None:
-                    self._advance_connector_incarnation(connector_key)
-                incarnation = self._connector_incarnation(connector_key)
-                result = await self._remove_trading_pair_from_tracker(
-                    connector, trading_pair
+                return await self._remove_trading_pair_already_locked(
+                    connector_name, trading_pair, connector_key
                 )
-                if not result:
-                    return False
-                if (
-                    self._connector_incarnation(connector_key) != incarnation
-                    or self._cached_public_connector(connector_key) is not connector
-                ):
-                    logger.warning(
-                        "Connector lifecycle changed while removing %s from %s",
-                        trading_pair,
-                        connector_name,
-                    )
-                    return False
-                return True
+
+    async def _remove_trading_pair_already_locked(
+        self,
+        connector_name: str,
+        trading_pair: str,
+        connector_key: Tuple[str, str],
+    ) -> bool:
+        """Remove one pair under an existing exact-root or retained physical lease."""
+        async with self._connector_creation_lock(connector_key):
+            await self._retry_public_transaction_cleanup(connector_key)
+            residual = self._connector_creation_residuals.get(connector_key)
+            if residual is not None:
+                raise ConnectorCapabilityError(
+                    CapabilityErrorDetail.model_validate(residual)
+                )
+            connector = self._connector_for_public_key(connector_key)
+            if not connector:
+                logger.warning(
+                    "No connector available for %s to remove %s",
+                    connector_name,
+                    trading_pair,
+                )
+                return False
+            if self._connector_incarnation(connector_key) is None:
+                self._advance_connector_incarnation(connector_key)
+            incarnation = self._connector_incarnation(connector_key)
+            result = await self._remove_trading_pair_from_tracker(
+                connector, trading_pair
+            )
+            if not result:
+                return False
+            if (
+                self._connector_incarnation(connector_key) != incarnation
+                or self._cached_public_connector(connector_key) is not connector
+            ):
+                logger.warning(
+                    "Connector lifecycle changed while removing %s from %s",
+                    trading_pair,
+                    connector_name,
+                )
+                return False
+            return True
 
     async def _remove_trading_pair_from_tracker(
         self,
@@ -3155,6 +3387,13 @@ class UnifiedConnectorService:
             try:
                 _, pending = await asyncio.wait({task}, timeout=timeout)
             except asyncio.CancelledError:
+                if (
+                    phase_name == "connector_stop"
+                    and not phase["cancel_requested"]
+                    and task.cancelling() == 0
+                ):
+                    task.cancel()
+                    phase["cancel_requested"] = True
                 self._connector_residual_tasks.setdefault(owner_key, set()).add(task)
                 raise
             if pending:
@@ -3419,6 +3658,14 @@ class UnifiedConnectorService:
                 missing,
             )
         )
+        connector_key = self._connector_key(account_name, connector_name)
+        lease = self._active_market_transaction_lease(connector_key)
+        if lease is not None and not self._retain_market_transaction_descendant(
+            connector_key, cleanup_task
+        ):
+            cleanup_task.cancel()
+            await asyncio.gather(cleanup_task, return_exceptions=True)
+            raise RuntimeError("connector_creation_cleanup_authority_unavailable")
         cancelled = False
         while not cleanup_task.done():
             try:
@@ -3804,7 +4051,27 @@ class UnifiedConnectorService:
         Delegates to the internal _update_connector_state implementation so callers
         in sibling services don't depend on the underscore-prefixed helper.
         """
-        await self._update_connector_state(connector, connector_name, account_name)
+        connector_key = self._connector_key(
+            account_name or "__data__", connector_name
+        )
+        async with self._market_transaction_lock(connector_key):
+            async with self._connector_creation_lock(connector_key):
+                if self._cached_public_connector(connector_key) is not connector:
+                    raise ConnectorCapabilityError(
+                        CapabilityErrorDetail(
+                            code="connector_incarnation_changed",
+                            message=(
+                                f"Connector '{connector_name}' changed while "
+                                "refreshing state"
+                            ),
+                            connector=connector_name,
+                            feature="connector_state",
+                            reason="connector_incarnation_changed",
+                        )
+                    )
+                await self._update_connector_state(
+                    connector, connector_name, account_name
+                )
 
     async def _update_connector_state(
         self,
@@ -3934,7 +4201,11 @@ class UnifiedConnectorService:
         task_keys = []
         for account_name, connectors in self._trading_connectors.items():
             for connector_name, connector in connectors.items():
-                tasks.append(self._update_connector_state(connector, connector_name, account_name))
+                tasks.append(
+                    self.refresh_connector_state(
+                        connector, connector_name, account_name
+                    )
+                )
                 task_keys.append(f"{account_name}/{connector_name}")
         if tasks:
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -4350,24 +4621,42 @@ class UnifiedConnectorService:
 
         connector_key = self._connector_key(account_name, connector_name)
         async with self._market_transaction_lock(connector_key):
-            BackendAPISecurity.update_connector_keys(account_name, connector_config)
-            BackendAPISecurity.decrypt_all(account_name=account_name)
-
-            # Stop and recreate under one market transaction without asking a
-            # child to reenter the physical market lock.
+            # Reconcile the old physical connector before committing credential
+            # bytes. A bounded residual must leave both file and cache truth intact.
             detail = await self._stop_trading_connector_already_locked(
                 account_name, connector_name
             )
             if detail is not None:
                 raise ConnectorCapabilityError(detail)
-            return await self.get_trading_connector(account_name, connector_name)
+
+            BackendAPISecurity.update_connector_keys(account_name, connector_config)
+            BackendAPISecurity.decrypt_all(account_name=account_name)
+            return await self._get_trading_connector_already_locked(
+                account_name, connector_name
+            )
 
     def clear_trading_connector(
         self,
         account_name: Optional[str] = None,
         connector_name: Optional[str] = None
     ):
-        """Clear trading connector from cache."""
+        """Clear terminal cache state; live physical owners reject the mutation."""
+        keys = []
+        if account_name and connector_name:
+            keys.append((account_name, connector_name))
+        elif account_name:
+            keys.extend(
+                (account_name, name)
+                for name in self._trading_connectors.get(account_name, {})
+            )
+        else:
+            keys.extend(
+                (owner_account, name)
+                for owner_account, connectors in self._trading_connectors.items()
+                for name in connectors
+            )
+        for connector_key in keys:
+            self._raise_market_mutation_preflight(connector_key)
         if account_name and connector_name:
             if account_name in self._trading_connectors:
                 self._trading_connectors[account_name].pop(connector_name, None)
@@ -4473,33 +4762,9 @@ class UnifiedConnectorService:
         """Stop a trading connector, exposing any residual instead of hiding it."""
         connector_key = self._connector_key(account_name, connector_name)
         self._ensure_connector_cleanup_state()
-        retained_detail = self._connector_creation_residuals.get(connector_key)
-        has_live_residual = any(
-            task is not asyncio.current_task() and not task.done()
-            for owner_key, tasks in self._connector_residual_tasks.items()
-            if owner_key[:2] == connector_key
-            for task in tasks
+        detail = await self._locked_stop_trading_connector(
+            account_name, connector_name
         )
-        if retained_detail is not None and has_live_residual:
-            raise ConnectorCapabilityError(
-                CapabilityErrorDetail.model_validate(retained_detail)
-            )
-        lease = self._active_market_transaction_lease(connector_key)
-        if lease is not None:
-            if not self._is_market_transaction_participant(connector_key):
-                raise RuntimeError("market_transaction_authority_unavailable")
-            detail = await self._stop_trading_connector_already_locked(
-                account_name, connector_name
-            )
-            if detail is not None:
-                raise ConnectorCapabilityError(detail)
-            return True
-
-        cleanup_task = asyncio.create_task(
-            self._locked_stop_trading_connector(account_name, connector_name)
-        )
-        cleanup_task.add_done_callback(self._consume_background_task_result)
-        detail = await asyncio.shield(cleanup_task)
         if detail is not None:
             raise ConnectorCapabilityError(detail)
         return True
@@ -4577,6 +4842,8 @@ class UnifiedConnectorService:
                 await self._stop_owned_index(
                     account_name, connector_name, label, value
                 )
+            except asyncio.CancelledError:
+                raise
             except BaseException:
                 cleanup_codes.append(f"{label}_cleanup_incomplete")
                 retained_for_key[label] = value
@@ -4649,6 +4916,8 @@ class UnifiedConnectorService:
                     await self._stop_connector_network(
                         connector, account_name, connector_name
                     )
+            except asyncio.CancelledError:
+                raise
             except BaseException:
                 cleanup_codes.append("connector_cleanup_incomplete")
                 network_cleanup_failed = True
@@ -4724,6 +4993,8 @@ class UnifiedConnectorService:
                         connector_name,
                         authority_incarnation=market_incarnation,
                     )
+                except asyncio.CancelledError:
+                    raise
                 except BaseException:
                     cleanup_codes.append("market_owner_cleanup_incomplete")
                     network_cleanup_failed = True
@@ -5073,10 +5344,9 @@ class UnifiedConnectorService:
             owner_key = self._owner_key(
                 owner_account, connector_name, "restart"
             )
-            async with self._connector_creation_lock(
-                (owner_account, connector_name)
-            ):
-                if account_name is None:
+            connector_key = (owner_account, connector_name)
+            async with self._market_transaction_lock(connector_key):
+                async with self._connector_creation_lock(connector_key):
                     current_owner, current_connector, current_error = (
                         self._resolve_restart_connector_owner(
                             connector_name, account_name
@@ -5089,9 +5359,9 @@ class UnifiedConnectorService:
                         or current_connector is not connector
                     ):
                         continue
-                return await self._restart_order_book_tracker_locked(
-                    connector_name, connector, owner_key
-                )
+                    return await self._restart_order_book_tracker_locked(
+                        connector_name, connector, owner_key
+                    )
 
     async def _restart_order_book_tracker_locked(
         self,

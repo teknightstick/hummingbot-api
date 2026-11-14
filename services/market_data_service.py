@@ -280,16 +280,38 @@ class MarketDataService:
             connector_name, ConnectorFeature.DYNAMIC_SUBSCRIPTION, trading_pair
         )
 
-        # Clean up our local tracking for this feed
         feed_key = self._generate_feed_key(FeedType.ORDER_BOOK, connector_name, trading_pair)
-        self._last_access_times.pop(feed_key, None)
-        self._feed_configs.pop(feed_key, None)
+        transaction = getattr(
+            self._connector_service, "_market_transaction_lock", None
+        )
+        resolve_key = getattr(
+            self._connector_service, "_resolve_public_connector_key", None
+        )
+        if callable(transaction) and callable(resolve_key):
+            while True:
+                connector_key = resolve_key(connector_name, account_name)
+                async with transaction(connector_key, trading_pair):
+                    if resolve_key(connector_name, account_name) != connector_key:
+                        continue
+                    result = await self._connector_service.remove_trading_pair(
+                        connector_name=connector_name,
+                        trading_pair=trading_pair,
+                        account_name=account_name,
+                    )
+                    if result:
+                        self._last_access_times.pop(feed_key, None)
+                        self._feed_configs.pop(feed_key, None)
+                    return result
 
-        return await self._connector_service.remove_trading_pair(
+        result = await self._connector_service.remove_trading_pair(
             connector_name=connector_name,
             trading_pair=trading_pair,
-            account_name=account_name
+            account_name=account_name,
         )
+        if result:
+            self._last_access_times.pop(feed_key, None)
+            self._feed_configs.pop(feed_key, None)
+        return result
 
     def get_order_book(self, connector_name: str, trading_pair: str, account_name: Optional[str] = None):
         """

@@ -2398,7 +2398,7 @@ async def test_final_declaration_boundary_rejects_concurrent_waiters_transaction
     second = asyncio.create_task(
         service.get_trading_connector("master", "manzana")
     )
-    while service._connector_lock_users.get(("master", "manzana"), 0) < 2:
+    while service._market_lock_users.get(("master", "manzana"), 0) < 2:
         await asyncio.sleep(0)
     release_symbol_map.set()
     results = await asyncio.gather(first, second, return_exceptions=True)
@@ -2991,7 +2991,7 @@ async def test_declaration_access_failures_are_typed_and_shared_by_waiters(
     second = asyncio.create_task(
         service.get_trading_connector("master", "manzana")
     )
-    while service._connector_lock_users.get(("master", "manzana"), 0) < 2:
+    while service._market_lock_users.get(("master", "manzana"), 0) < 2:
         await asyncio.sleep(0)
     release_symbol_map.set()
     results = await asyncio.gather(first, second, return_exceptions=True)
@@ -5637,8 +5637,12 @@ async def test_adjacent_b3_restart_retry_does_not_recancel_retained_task():
     CHECK.assertEqual(1, task.cancelling())
     CHECK.assertIn(task, service._connector_residual_tasks[owner_key])
 
-    second = await service.restart_order_book_tracker("generic", "master")
-    CHECK.assertEqual("tracker_cleanup_pending", second["error"])
+    with pytest.raises(module.ConnectorCapabilityError) as second:
+        await service.restart_order_book_tracker("generic", "master")
+    CHECK.assertEqual("connector_cleanup_residual", second.value.detail["code"])
+    CHECK.assertEqual(
+        "restart_cleanup_incomplete", second.value.detail["cleanup_code"]
+    )
     CHECK.assertEqual(1, task.cancelling())
 
     release.set()
@@ -6241,12 +6245,16 @@ async def test_final_adjacent_b2_cancelled_restart_retains_exact_stop_task():
     retained_exact_task = stop_tasks[0] in service._connector_residual_tasks.get(
         owner_key, set()
     )
-    retry = await service.restart_order_book_tracker("generic", "master")
+    with pytest.raises(module.ConnectorCapabilityError) as retry:
+        await service.restart_order_book_tracker("generic", "master")
     calls_before_release = tracker.stop_calls
     release.set()
     await asyncio.gather(*stop_tasks, return_exceptions=True)
 
-    CHECK.assertEqual("tracker_cleanup_pending", retry["error"])
+    CHECK.assertEqual("connector_cleanup_residual", retry.value.detail["code"])
+    CHECK.assertEqual(
+        "restart_cleanup_incomplete", retry.value.detail["cleanup_code"]
+    )
     CHECK.assertTrue(retained_exact_task)
     CHECK.assertEqual(1, calls_before_release)
 
@@ -6635,11 +6643,13 @@ async def test_lifecycle_b1_unscoped_restart_uses_physical_owner_lock_and_reject
     release_first_stop.set()
     results = await asyncio.gather(restart, stopping, return_exceptions=True)
 
-    CHECK.assertFalse(
-        any(isinstance(result, BaseException) for result in results), results
+    CHECK.assertIs(True, results[0]["success"])
+    CHECK.assertIsInstance(results[1], module.ConnectorCapabilityError)
+    CHECK.assertEqual(
+        "restart_cleanup_incomplete", results[1].detail["cleanup_code"]
     )
     CHECK.assertEqual(1, tracker.max_active_stops)
-    CHECK.assertEqual(2, tracker.stop_calls)
+    CHECK.assertEqual(1, tracker.stop_calls)
 
     ambiguous = _adjacent_unified_service(module, registry_type)
 
@@ -6823,8 +6833,15 @@ async def test_lifecycle_b3_cancelled_async_start_is_stopped_after_activation():
     shutdown = asyncio.create_task(service.stop_all())
     await asyncio.sleep(0)
     await asyncio.sleep(0)
+    with pytest.raises(module.ConnectorCapabilityError) as blocked:
+        await shutdown
+    CHECK.assertEqual("connector_cleanup_residual", blocked.value.detail["code"])
+    CHECK.assertEqual(
+        "restart_cleanup_incomplete", blocked.value.detail["cleanup_code"]
+    )
     release_start.set()
-    await shutdown
+    await start_task
+    await service.stop_all()
 
     CHECK.assertFalse(tracker.active)
     CHECK.assertEqual(2, tracker.stop_calls)
@@ -7607,8 +7624,8 @@ async def test_issue224_data_discard_reconciles_restart_before_one_successor(
         CHECK.assertIs(old_connector, service._data_connectors["manzana"])
         CHECK.assertEqual(0, old_connector.stop_calls)
         CHECK.assertIn(restart_owner, service._connector_cleanup_owners)
-        CHECK.assertIn(public_owner, service._connector_cleanup_owners)
-        CHECK.assertIn(connector_key, service._connector_creation_residuals)
+        CHECK.assertNotIn(public_owner, service._connector_cleanup_owners)
+        CHECK.assertNotIn(connector_key, service._connector_creation_residuals)
 
         with pytest.raises(module.ConnectorCapabilityError):
             await service.initialize_order_book("manzana", "BTC-USD", timeout=0)
@@ -7623,15 +7640,14 @@ async def test_issue224_data_discard_reconciles_restart_before_one_successor(
     else:
         CHECK.assertIs(
             await service.initialize_order_book("manzana", "BTC-USD", timeout=0),
-            False,
+            True,
         )
         CHECK.assertEqual(1, old_connector.stop_calls)
         CHECK.assertNotIn(restart_owner, service._connector_cleanup_owners)
         CHECK.assertNotIn(public_owner, service._connector_cleanup_owners)
         CHECK.assertNotIn(connector_key, service._connector_creation_residuals)
-        await service._retry_public_transaction_cleanup(connector_key)
-        CHECK.assertEqual(1, old_connector.stop_calls)
-        CHECK.assertEqual(0, factory_calls)
+        CHECK.assertEqual(1, tracker.stop_calls)
+        CHECK.assertEqual(1, factory_calls)
 
     CHECK.assertIs(
         await service.initialize_order_book("manzana", "BTC-USD", timeout=0),
@@ -8647,7 +8663,7 @@ async def test_issue224_nested_lease_survives_out_of_order_error_cancel_and_gc()
         grandchild_release = asyncio.Event()
         grandchild_ready = asyncio.Event()
         grandchild_holder = {}
-        contender_entered = asyncio.Event()
+        contender_detail = {}
 
         async def grandchild_operation():
             await grandchild_release.wait()
@@ -8666,8 +8682,10 @@ async def test_issue224_nested_lease_survives_out_of_order_error_cancel_and_gc()
             await child_release.wait()
 
         async def contender():
-            async with service._market_transaction_lock(connector_key):
-                contender_entered.set()
+            with pytest.raises(module.ConnectorCapabilityError) as blocked:
+                async with service._market_transaction_lock(connector_key):
+                    CHECK.fail("a retained lease admitted another mutator")
+            contender_detail.update(blocked.value.detail)
 
         async with service._market_transaction_lock(connector_key) as token:
             child = asyncio.create_task(child_operation())
@@ -8696,14 +8714,21 @@ async def test_issue224_nested_lease_survives_out_of_order_error_cancel_and_gc()
         CHECK.assertTrue(token.active)
         CHECK.assertIsNone(token.owner_task)
         contender_task = asyncio.create_task(contender())
-        await asyncio.sleep(0.01)
-        CHECK.assertFalse(contender_entered.is_set())
+        await asyncio.wait_for(contender_task, 1)
+        CHECK.assertEqual(
+            "connector_cleanup_residual", contender_detail["code"]
+        )
         CHECK.assertTrue(service._market_locks[connector_key].locked())
+        CHECK.assertEqual(1, service._market_lock_users[connector_key])
 
         grandchild_release.set()
-        await asyncio.wait_for(contender_task, 1)
-        CHECK.assertTrue(contender_entered.is_set())
+        for _ in range(20):
+            if not token.active:
+                break
+            await asyncio.sleep(0)
         CHECK.assertFalse(token.active)
+        async with service._market_transaction_lock(connector_key):
+            pass
         CHECK.assertEqual({}, service._market_lock_users)
         CHECK.assertEqual({}, service._market_locks)
         del child
@@ -8721,18 +8746,16 @@ async def test_issue224_cancelled_public_stop_retains_lease_against_contender():
     connector_key = ("acct", "manzana")
     connector = Issue224RepairConnector()
     stop_entered = asyncio.Event()
-    stop_cancelled = asyncio.Event()
     stop_release = asyncio.Event()
     stop_terminal = asyncio.Event()
-    contender_entered = asyncio.Event()
+    contender_detail = {}
 
     async def stop_network():
         connector.stop_calls += 1
         stop_entered.set()
         try:
-            await asyncio.Event().wait()
+            await stop_release.wait()
         except asyncio.CancelledError:
-            stop_cancelled.set()
             await stop_release.wait()
         finally:
             stop_terminal.set()
@@ -8742,8 +8765,10 @@ async def test_issue224_cancelled_public_stop_retains_lease_against_contender():
     service._advance_connector_incarnation(connector_key)
 
     async def contender():
-        async with service._market_transaction_lock(connector_key):
-            contender_entered.set()
+        with pytest.raises(module.ConnectorCapabilityError) as blocked:
+            async with service._market_transaction_lock(connector_key):
+                CHECK.fail("a retained stop admitted another mutator")
+        contender_detail.update(blocked.value.detail)
 
     parent_task = asyncio.create_task(
         service.stop_trading_connector("acct", "manzana")
@@ -8753,19 +8778,22 @@ async def test_issue224_cancelled_public_stop_retains_lease_against_contender():
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(parent_task, 0.2)
 
-    await asyncio.wait_for(stop_cancelled.wait(), 0.3)
     contender_task = asyncio.create_task(contender())
-    await asyncio.sleep(0.02)
+    await asyncio.wait_for(contender_task, 1)
     CHECK.assertFalse(stop_terminal.is_set())
-    CHECK.assertFalse(contender_entered.is_set())
+    CHECK.assertEqual(
+        "connector_cleanup_residual", contender_detail["code"]
+    )
     CHECK.assertTrue(service._market_locks[connector_key].locked())
-    CHECK.assertEqual(2, service._market_lock_users[connector_key])
+    CHECK.assertEqual(1, service._market_lock_users[connector_key])
 
     stop_release.set()
     await asyncio.wait_for(stop_terminal.wait(), 1)
-    await asyncio.wait_for(contender_task, 1)
     CHECK.assertEqual(1, connector.stop_calls)
-    CHECK.assertTrue(contender_entered.is_set())
+    for _ in range(20):
+        if not service._market_locks:
+            break
+        await asyncio.sleep(0)
     CHECK.assertEqual({}, service._market_lock_users)
     CHECK.assertEqual({}, service._market_locks)
 
@@ -8789,6 +8817,8 @@ async def test_issue224_cleanup_deadline_skips_local_mutation_until_physical_ter
         connector.stop_calls += 1
         try:
             stop_entered.set()
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
             await stop_release.wait()
         finally:
             stop_terminal.set()
@@ -8889,3 +8919,424 @@ async def test_issue224_retention_failure_is_owned_and_fails_closed():
     CHECK.assertEqual(0, failed_connector.stop_calls)
     CHECK.assertEqual({}, failed_service._market_locks)
     CHECK.assertEqual({}, failed_service._market_lock_users)
+
+
+@pytest.mark.asyncio
+async def test_issue224_live_residual_preflight_is_bounded_for_add_stop_and_keys(
+    monkeypatch,
+):
+    from services.trading_service import AccountTradingInterface
+
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    service.secrets_manager = object()
+    connector_key = ("acct", "manzana")
+    residual_key = (*connector_key, "pair", "BTC-USD")
+    residual = {
+        "code": "market_cleanup_residual",
+        "message": "Cleanup is incomplete for 'manzana/BTC-USD'",
+        "connector": "manzana",
+        "feature": "live_order_book",
+        "trading_pair": "BTC-USD",
+        "reason": "cleanup_incomplete",
+        "cleanup_scope": "pair",
+        "cleanup_code": "cleanup_deadline_exceeded",
+    }
+    release = asyncio.Event()
+
+    async def physical_owner():
+        await release.wait()
+
+    async with service._market_transaction_lock(connector_key):
+        physical_task = asyncio.create_task(physical_owner())
+        CHECK.assertTrue(
+            service._retain_market_transaction_descendant(
+                connector_key, physical_task
+            )
+        )
+        service._market_cleanup_residuals[residual_key] = residual
+
+    market_data = types.SimpleNamespace()
+    interface = AccountTradingInterface(service, market_data, "acct")
+    interface._require_capability = lambda *args, **kwargs: None
+
+    writes = []
+    monkeypatch.setattr(
+        module.BackendAPISecurity,
+        "login_account",
+        staticmethod(lambda **kwargs: True),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module.BackendAPISecurity,
+        "update_connector_keys",
+        staticmethod(lambda *args: writes.append(args)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module.AllConnectorSettings,
+        "get_connector_config_keys",
+        staticmethod(lambda connector_name: object()),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module,
+        "HummingbotAPIConfigAdapter",
+        lambda config: types.SimpleNamespace(),
+    )
+
+    for operation in (
+        interface.add_market("manzana", "BTC-USD"),
+        service.stop_trading_connector("acct", "manzana"),
+        service.update_connector_keys(
+            "acct", "manzana", {"api_key": "NEW"}
+        ),
+    ):
+        with pytest.raises(module.ConnectorCapabilityError) as blocked:
+            await asyncio.wait_for(operation, 0.2)
+        CHECK.assertEqual("market_cleanup_residual", blocked.value.detail["code"])
+        CHECK.assertEqual(1, service._market_lock_users[connector_key])
+
+    CHECK.assertEqual([], writes)
+    release.set()
+    await physical_task
+    for _ in range(20):
+        if not service._market_locks:
+            break
+        await asyncio.sleep(0)
+    CHECK.assertEqual({}, service._market_locks)
+    CHECK.assertEqual({}, service._market_leases)
+
+
+@pytest.mark.asyncio
+async def test_issue224_retained_frame_never_receives_public_stop_authority():
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    connector_key = ("acct", "manzana")
+    connector = Issue224RepairConnector()
+    service._trading_connectors = {"acct": {"manzana": connector}}
+    service._advance_connector_incarnation(connector_key)
+    invoke = asyncio.Event()
+
+    async def retained_public_call():
+        await invoke.wait()
+        with pytest.raises(
+            RuntimeError, match="market_transaction_authority_unavailable"
+        ):
+            await service.stop_trading_connector("acct", "manzana")
+
+    async with service._market_transaction_lock(connector_key):
+        retained_task = asyncio.create_task(retained_public_call())
+        CHECK.assertTrue(
+            service._retain_market_transaction_descendant(
+                connector_key, retained_task
+            )
+        )
+        invoke.set()
+        await retained_task
+
+    CHECK.assertEqual(0, connector.stop_calls)
+    CHECK.assertIs(connector, service._trading_connectors["acct"]["manzana"])
+    CHECK.assertEqual({}, service._market_locks)
+
+
+@pytest.mark.asyncio
+async def test_issue224_preacquire_cancellation_reaps_guardians_and_users():
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    connector_key = ("acct", "manzana")
+    contenders_started = asyncio.Event()
+    holder_entered = asyncio.Event()
+    holder_release = asyncio.Event()
+
+    async def holder():
+        async with service._market_transaction_lock(connector_key):
+            holder_entered.set()
+            await holder_release.wait()
+
+    async def contender():
+        contenders_started.set()
+        async with service._market_transaction_lock(connector_key):
+            CHECK.fail("a queued contender acquired before cancellation")
+
+    holder_task = asyncio.create_task(holder())
+    await holder_entered.wait()
+    try:
+        contenders = [asyncio.create_task(contender()) for _ in range(5)]
+        await contenders_started.wait()
+        for _ in range(50):
+            if service._market_lock_users.get(connector_key) == 6:
+                break
+            await asyncio.sleep(0)
+        CHECK.assertEqual(6, service._market_lock_users[connector_key])
+        for task in contenders:
+            task.cancel()
+        await asyncio.gather(*contenders, return_exceptions=True)
+        CHECK.assertEqual(1, service._market_lock_users[connector_key])
+        CHECK.assertEqual(
+            [connector_key], list(service._market_leases)
+        )
+        CHECK.assertTrue(service._market_locks[connector_key].locked())
+    finally:
+        holder_release.set()
+        await holder_task
+
+    CHECK.assertEqual({}, service._market_lock_users)
+    CHECK.assertEqual({}, service._market_locks)
+    CHECK.assertEqual({}, service._market_leases)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_outcome", ["success", "false", "raise"])
+async def test_issue224_connector_cleanup_retry_uses_physical_terminal_truth(
+    terminal_outcome,
+):
+    from services.trading_service import AccountTradingInterface
+
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    connector_key = ("acct", "manzana")
+    connector = Issue224RepairConnector()
+    service._trading_connectors = {"acct": {"manzana": connector}}
+    incarnation = service._advance_connector_incarnation(connector_key)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    terminal = asyncio.Event()
+
+    async def stop_network():
+        connector.stop_calls += 1
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release.wait()
+        finally:
+            terminal.set()
+        if terminal_outcome == "false":
+            return False
+        if terminal_outcome == "raise":
+            raise RuntimeError("PRIVATE-PHYSICAL-STOP")
+        return True
+
+    connector.stop_network = stop_network
+    interface = AccountTradingInterface(
+        service, types.SimpleNamespace(), "acct"
+    )
+
+    async with service._market_transaction_lock(connector_key):
+        first = await interface._complete_market_cleanup(
+            "manzana", "BTC-USD", connector, False, incarnation
+        )
+    await entered.wait()
+    CHECK.assertEqual("cleanup_deadline_exceeded", first.cleanup_code)
+    CHECK.assertTrue(service._market_locks[connector_key].locked())
+
+    release.set()
+    await terminal.wait()
+    for _ in range(50):
+        if not service._market_locks:
+            break
+        await asyncio.sleep(0)
+
+    if terminal_outcome == "success":
+        async with interface._market_transaction("manzana", "BTC-USD"):
+            await interface._retry_market_cleanup_residual(
+                "manzana", "BTC-USD"
+            )
+        CHECK.assertEqual({}, interface._cleanup_residuals)
+        CHECK.assertEqual({}, interface._cleanup_phases)
+        CHECK.assertEqual({}, interface._residual_tasks)
+    else:
+        async with interface._market_transaction("manzana", "BTC-USD"):
+            with pytest.raises(module.ConnectorCapabilityError):
+                await interface._retry_market_cleanup_residual(
+                    "manzana", "BTC-USD"
+                )
+        CHECK.assertTrue(interface._cleanup_residuals)
+        CHECK.assertTrue(service._connector_cleanup_phases)
+    CHECK.assertEqual(1, connector.stop_calls)
+
+
+@pytest.mark.asyncio
+async def test_issue224_pair_cache_and_balance_mutators_reject_retained_lease():
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    connector_key = ("acct", "manzana")
+    connector = Issue224RepairConnector()
+    connector._trading_pairs.append("BTC-USD")
+    connector.order_book_tracker._trading_pairs.append("BTC-USD")
+    connector.order_book_tracker.order_books["BTC-USD"] = Issue224RepairBook()
+    service._trading_connectors = {"acct": {"manzana": connector}}
+    service._advance_connector_incarnation(connector_key)
+    release = asyncio.Event()
+    balance_calls = 0
+
+    async def physical_owner():
+        await release.wait()
+
+    async def update_balances():
+        nonlocal balance_calls
+        balance_calls += 1
+
+    connector._update_balances = update_balances
+    async with service._market_transaction_lock(connector_key):
+        physical_task = asyncio.create_task(physical_owner())
+        CHECK.assertTrue(
+            service._retain_market_transaction_descendant(
+                connector_key, physical_task
+            )
+        )
+
+    before_pairs = list(connector._trading_pairs)
+    for operation in (
+        service.initialize_order_book(
+            "manzana", "ETH-USD", account_name="acct", timeout=0
+        ),
+        service.remove_trading_pair(
+            "manzana", "BTC-USD", account_name="acct"
+        ),
+        service.refresh_connector_state(connector, "manzana", "acct"),
+    ):
+        with pytest.raises(module.ConnectorCapabilityError):
+            await asyncio.wait_for(operation, 0.2)
+    with pytest.raises(module.ConnectorCapabilityError):
+        service.clear_trading_connector("acct", "manzana")
+
+    CHECK.assertEqual(before_pairs, connector._trading_pairs)
+    CHECK.assertEqual(0, balance_calls)
+    CHECK.assertIs(connector, service._trading_connectors["acct"]["manzana"])
+    CHECK.assertEqual(1, service._market_lock_users[connector_key])
+
+    release.set()
+    await physical_task
+
+
+def test_issue224_account_routes_preserve_typed_capability_residuals():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from models.connectors import (
+        CapabilityErrorDetail,
+        CapabilityErrorResponse,
+    )
+    from routers import accounts as accounts_router
+    from services.connector_capabilities import ConnectorCapabilityError
+
+    detail = CapabilityErrorDetail(
+        code="connector_cleanup_residual",
+        message="Connector cleanup is incomplete for 'acct:manzana'",
+        connector="manzana",
+        feature="connector_cleanup",
+        reason="cleanup_incomplete",
+        cleanup_scope="connector",
+        cleanup_code="cleanup_deadline_exceeded",
+    )
+
+    class Accounts:
+        async def add_credentials(self, *args, **kwargs):
+            raise ConnectorCapabilityError(detail)
+
+        async def delete_credentials(self, *args, **kwargs):
+            raise ConnectorCapabilityError(detail)
+
+        async def delete_account(self, *args, **kwargs):
+            raise ConnectorCapabilityError(detail)
+
+    app = FastAPI()
+    app.include_router(accounts_router.router)
+    app.dependency_overrides[accounts_router.get_accounts_service] = Accounts
+    client = TestClient(app)
+    responses = (
+        client.post(
+            "/accounts/add-credential/acct/manzana",
+            json={"api_key": "SECRET"},
+        ),
+        client.post("/accounts/delete-credential/acct/manzana"),
+        client.post("/accounts/delete-account", params={"account_name": "acct"}),
+    )
+    for response in responses:
+        CHECK.assertEqual(400, response.status_code, response.text)
+        CHECK.assertEqual(detail.model_dump(exclude_none=True), response.json()["detail"])
+        CapabilityErrorResponse.model_validate(response.json())
+
+    paths = app.openapi()["paths"]
+    for path in (
+        "/accounts/add-credential/{account_name}/{connector_name}",
+        "/accounts/delete-credential/{account_name}/{connector_name}",
+        "/accounts/delete-account",
+    ):
+        response_schema = paths[path]["post"]["responses"]["400"][
+            "content"
+        ]["application/json"]["schema"]
+        CHECK.assertEqual(
+            "#/components/schemas/CapabilityErrorResponse",
+            response_schema["$ref"],
+        )
+
+
+@pytest.mark.asyncio
+async def test_issue224_delete_credentials_commits_only_after_terminal_stop(
+    monkeypatch,
+):
+    from models.connectors import CapabilityErrorDetail
+    from services.connector_capabilities import ConnectorCapabilityError
+
+    accounts_module = _load_accounts_service_module()
+    events = []
+    file_state = {"exists": True}
+    detail = CapabilityErrorDetail(
+        code="connector_cleanup_residual",
+        message="Connector cleanup is incomplete for 'acct:manzana'",
+        connector="manzana",
+        feature="connector_cleanup",
+        reason="cleanup_incomplete",
+        cleanup_scope="connector",
+        cleanup_code="cleanup_deadline_exceeded",
+    )
+
+    class ConnectorService:
+        fail = True
+
+        async def stop_trading_connector(self, account_name, connector_name):
+            events.append("stop")
+            if self.fail:
+                raise ConnectorCapabilityError(detail)
+            return True
+
+        def clear_trading_connector(self, account_name, connector_name):
+            events.append("clear")
+
+    connector_service = ConnectorService()
+    service = object.__new__(accounts_module.AccountsService)
+    service._connector_service = connector_service
+    service.accounts_state = {"acct": {"manzana": ["balance"]}}
+
+    monkeypatch.setattr(
+        accounts_module.fs_util,
+        "path_exists",
+        lambda path: file_state["exists"],
+        raising=False,
+    )
+
+    def delete_file(**kwargs):
+        events.append("delete")
+        file_state["exists"] = False
+
+    monkeypatch.setattr(
+        accounts_module.fs_util,
+        "delete_file",
+        delete_file,
+        raising=False,
+    )
+
+    with pytest.raises(ConnectorCapabilityError):
+        await service.delete_credentials("acct", "manzana")
+    CHECK.assertEqual(["stop"], events)
+    CHECK.assertTrue(file_state["exists"])
+    CHECK.assertEqual(["balance"], service.accounts_state["acct"]["manzana"])
+
+    connector_service.fail = False
+    await service.delete_credentials("acct", "manzana")
+    CHECK.assertEqual(["stop", "stop", "delete", "clear"], events)
+    CHECK.assertFalse(file_state["exists"])
+    CHECK.assertNotIn("manzana", service.accounts_state["acct"])
