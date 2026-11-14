@@ -18,6 +18,7 @@ import time
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from decimal import Decimal
+from itertools import count
 from types import MappingProxyType
 from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
@@ -65,6 +66,17 @@ _PUBLIC_TRANSACTION_CONTEXT = ContextVar(
     "public_transaction_context", default=None
 )
 _PUBLIC_TASK_FACTORY_STATES: Dict[Any, Dict[str, Any]] = {}
+_PUBLIC_TRANSACTION_TOKEN_IDS = count(1)
+
+
+class _PublicTransactionToken:
+    """Lightweight context payload whose snapshot exists only in an active service map."""
+
+    __slots__ = ("id", "active")
+
+    def __init__(self, token_id: int):
+        self.id = token_id
+        self.active = True
 
 
 class UnknownConnectorError(ValueError):
@@ -127,6 +139,7 @@ class UnifiedConnectorService:
         self._connector_cleanup_phases: Dict[
             Tuple[str, str, str], Dict[str, Dict[str, Any]]
         ] = {}
+        self._active_public_transaction_tokens: Dict[int, Dict[str, Any]] = {}
         self._connector_incarnations: Dict[Tuple[str, str], int] = {}
         self._connector_incarnation_sequence = 0
 
@@ -1059,46 +1072,84 @@ class UnifiedConnectorService:
     ):
         """Tag tasks created by the awaited connector operation without polling."""
         loop = asyncio.get_running_loop()
+        active_tokens = getattr(self, "_active_public_transaction_tokens", None)
+        if active_tokens is None:
+            active_tokens = {}
+            self._active_public_transaction_tokens = active_tokens
         state = _PUBLIC_TASK_FACTORY_STATES.get(loop)
         if state is None:
             previous = loop.get_task_factory()
+            state = {
+                "previous": previous,
+                "factory": None,
+                "users": 0,
+                "active_maps": {},
+                "active_map_users": {},
+            }
 
             def task_factory(factory_loop, coroutine, **kwargs):
                 context = kwargs.get("context")
-                transaction = (
+                transaction_token = (
                     context.get(_PUBLIC_TRANSACTION_CONTEXT)
                     if context is not None
                     else _PUBLIC_TRANSACTION_CONTEXT.get()
                 )
+                transaction = None
+                if (
+                    isinstance(transaction_token, _PublicTransactionToken)
+                    and transaction_token.active
+                ):
+                    for active_map in tuple(state["active_maps"].values()):
+                        transaction = active_map.get(transaction_token.id)
+                        if transaction is not None:
+                            break
                 if previous is None:
                     task = asyncio.Task(
                         coroutine, loop=factory_loop, **kwargs
                     )
                 else:
                     task = previous(factory_loop, coroutine, **kwargs)
-                if transaction is not None and isinstance(task, asyncio.Task):
+                if (
+                    isinstance(transaction_token, _PublicTransactionToken)
+                    and transaction_token.active
+                    and transaction is not None
+                    and isinstance(task, asyncio.Task)
+                ):
                     transaction["provenance_tasks"].add(task)
                     transaction["owned_tasks"].add(task)
                 return task
 
-            state = {
-                "previous": previous,
-                "factory": task_factory,
-                "users": 0,
-            }
+            state["factory"] = task_factory
             _PUBLIC_TASK_FACTORY_STATES[loop] = state
             loop.set_task_factory(task_factory)
+        service_id = id(self)
+        state["active_maps"][service_id] = active_tokens
+        state["active_map_users"][service_id] = (
+            state["active_map_users"].get(service_id, 0) + 1
+        )
         state["users"] += 1
-        token = _PUBLIC_TRANSACTION_CONTEXT.set(snapshot)
+        transaction_token = _PublicTransactionToken(
+            next(_PUBLIC_TRANSACTION_TOKEN_IDS)
+        )
+        active_tokens[transaction_token.id] = snapshot
+        context_token = _PUBLIC_TRANSACTION_CONTEXT.set(transaction_token)
         try:
             yield
         finally:
-            _PUBLIC_TRANSACTION_CONTEXT.reset(token)
-            state["users"] -= 1
-            if state["users"] == 0:
-                if loop.get_task_factory() is state["factory"]:
-                    loop.set_task_factory(state["previous"])
-                _PUBLIC_TASK_FACTORY_STATES.pop(loop, None)
+            transaction_token.active = False
+            active_tokens.pop(transaction_token.id, None)
+            try:
+                _PUBLIC_TRANSACTION_CONTEXT.reset(context_token)
+            finally:
+                state["users"] -= 1
+                state["active_map_users"][service_id] -= 1
+                if state["active_map_users"][service_id] == 0:
+                    state["active_map_users"].pop(service_id, None)
+                    state["active_maps"].pop(service_id, None)
+                if state["users"] == 0:
+                    if loop.get_task_factory() is state["factory"]:
+                        loop.set_task_factory(state["previous"])
+                    _PUBLIC_TASK_FACTORY_STATES.pop(loop, None)
 
     def _record_public_pair_deltas(self, snapshot: Dict[str, Any]) -> None:
         trading_pair = snapshot["trading_pair"]
@@ -1569,7 +1620,9 @@ class UnifiedConnectorService:
         if account_name != "__data__":
             if self._public_connector_is_owned(snapshot):
                 detail = await self._finalize_stop_trading_connector(
-                    account_name, connector_name
+                    account_name,
+                    connector_name,
+                    invoking_owner_key=owner_key,
                 )
                 if detail is not None:
                     raise ConnectorCapabilityError(detail)
@@ -4028,7 +4081,11 @@ class UnifiedConnectorService:
             )
 
     async def _finalize_stop_trading_connector(
-        self, account_name: str, connector_name: str
+        self,
+        account_name: str,
+        connector_name: str,
+        *,
+        invoking_owner_key: Optional[Tuple[str, str, str]] = None,
     ) -> Optional[CapabilityErrorDetail]:
         """Run bounded connector cleanup and retain failed indices for an explicit retry."""
         self._ensure_connector_cleanup_state()
@@ -4133,6 +4190,34 @@ class UnifiedConnectorService:
                     account_connectors.pop(connector_name, None)
                 if account_connectors is not None and not account_connectors:
                     self._trading_connectors.pop(account_name, None)
+
+        # The invoking public transaction is part of this stop, not a residual
+        # that should block it. Commit its disposition as soon as its exact
+        # connector has stopped and been unpublished; other owners remain below.
+        expected_public_owner = self._owner_key(
+            account_name, connector_name, "public_transaction"
+        )
+        if (
+            invoking_owner_key == expected_public_owner
+            and connector is not None
+            and any(connector is stopped for stopped in stopped_connectors)
+        ):
+            invoking_owner = self._connector_cleanup_owners.get(
+                invoking_owner_key
+            )
+            invoking_phase = self._connector_cleanup_phases.get(
+                invoking_owner_key, {}
+            ).get("disposition")
+            if (
+                isinstance(invoking_owner, dict)
+                and invoking_owner.get("connector") is connector
+                and invoking_owner.get("disposition") == "discard"
+                and invoking_phase is not None
+            ):
+                invoking_phase["complete"] = True
+                invoking_phase["result"] = "discard"
+                invoking_phase["error_code"] = None
+                self._finish_owner_cleanup(invoking_owner_key)
 
         # Failed market transactions can be the sole authority retaining an
         # unpublished connector. Explicit connector stop consumes those private

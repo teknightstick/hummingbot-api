@@ -7466,6 +7466,141 @@ async def test_issue224_task_ledger_retains_all_explicit_owned_generations():
 
 
 @pytest.mark.asyncio
+async def test_issue224_trading_unsafe_discard_commits_owner_with_one_stop():
+    _, service, connector, _ = _issue224_repair_service()
+    service._data_connectors = {}
+    service._data_connectors_started = {}
+    service._trading_connectors = {"acct": {"manzana": connector}}
+
+    async def replace_pairs(connector_arg, trading_pair):
+        connector_arg._trading_pairs = ["POISON-USD"]
+        return False
+
+    service._add_trading_pair_to_tracker = replace_pairs
+
+    CHECK.assertIs(
+        await service.initialize_order_book(
+            "manzana", "BTC-USD", account_name="acct", timeout=0
+        ),
+        False,
+    )
+    owner_key = ("acct", "manzana", "public_transaction")
+    CHECK.assertEqual(1, connector.stop_calls)
+    CHECK.assertEqual({}, service._trading_connectors)
+    CHECK.assertNotIn(owner_key, service._connector_cleanup_owners)
+    CHECK.assertNotIn(owner_key, service._connector_residual_tasks)
+    CHECK.assertNotIn(owner_key, service._connector_cleanup_phases)
+    CHECK.assertEqual({}, service._connector_creation_residuals)
+
+    await service._retry_public_transaction_cleanup(("acct", "manzana"))
+    CHECK.assertEqual(1, connector.stop_calls)
+
+
+@pytest.mark.asyncio
+async def test_issue224_trading_discard_preserves_other_private_residuals():
+    module, service, connector, _ = _issue224_repair_service()
+    service._data_connectors = {}
+    service._data_connectors_started = {}
+    service._trading_connectors = {"acct": {"manzana": connector}}
+    other_owner_key = ("acct", "manzana", "other_private")
+    other_owner = object()
+    service._connector_cleanup_owners[other_owner_key] = other_owner
+
+    async def replace_pairs(connector_arg, trading_pair):
+        connector_arg._trading_pairs = ["POISON-USD"]
+        return False
+
+    service._add_trading_pair_to_tracker = replace_pairs
+
+    with pytest.raises(module.ConnectorCapabilityError) as blocked:
+        await service.initialize_order_book(
+            "manzana", "BTC-USD", account_name="acct", timeout=0
+        )
+
+    public_owner_key = ("acct", "manzana", "public_transaction")
+    CHECK.assertEqual("connector_cleanup_residual", blocked.value.detail["code"])
+    CHECK.assertEqual("owner_cleanup_incomplete", blocked.value.detail["cleanup_code"])
+    CHECK.assertEqual(1, connector.stop_calls)
+    CHECK.assertIs(other_owner, service._connector_cleanup_owners[other_owner_key])
+    CHECK.assertNotIn(public_owner_key, service._connector_cleanup_owners)
+    CHECK.assertNotIn(public_owner_key, service._connector_cleanup_phases)
+
+    await service._retry_public_transaction_cleanup(("acct", "manzana"))
+    CHECK.assertEqual(1, connector.stop_calls)
+
+
+@pytest.mark.asyncio
+async def test_issue224_revoked_task_token_cannot_retain_or_mutate_old_snapshot():
+    import gc
+    import weakref
+
+    module, service, connector, _ = _issue224_repair_service()
+    first_snapshot = service._snapshot_public_connector_state(
+        "manzana",
+        connector,
+        ("__data__", "manzana"),
+        service._capability_registry.get("manzana"),
+        trading_pair="BTC-USD",
+    )
+
+    class RetentionProbe:
+        pass
+
+    probe = RetentionProbe()
+    probe_ref = weakref.ref(probe)
+    first_snapshot["retention_probe"] = probe
+    release_child = asyncio.Event()
+    inherited_token = asyncio.get_running_loop().create_future()
+    nested_task_created = asyncio.get_running_loop().create_future()
+
+    async def long_lived_child():
+        inherited_token.set_result(module._PUBLIC_TRANSACTION_CONTEXT.get())
+        await release_child.wait()
+        nested = asyncio.create_task(asyncio.sleep(0))
+        nested_task_created.set_result(nested)
+        await nested
+
+    async with service._capture_public_task_provenance(first_snapshot):
+        child = asyncio.create_task(long_lived_child())
+        token = await inherited_token
+
+    first_provenance = first_snapshot["provenance_tasks"]
+    first_owned = first_snapshot["owned_tasks"]
+    CHECK.assertIsNot(first_snapshot, token)
+    CHECK.assertTrue(hasattr(token, "id"))
+    CHECK.assertTrue(hasattr(token, "active"))
+    CHECK.assertEqual({"id", "active"}, set(type(token).__slots__))
+    CHECK.assertIs(token.active, False)
+    CHECK.assertEqual({}, service._active_public_transaction_tokens)
+    CHECK.assertIsNone(module._PUBLIC_TRANSACTION_CONTEXT.get())
+    CHECK.assertEqual({child}, first_provenance)
+    CHECK.assertEqual({child}, first_owned)
+
+    del first_snapshot
+    del probe
+    gc.collect()
+    CHECK.assertIsNone(probe_ref())
+
+    second_snapshot = service._snapshot_public_connector_state(
+        "manzana",
+        connector,
+        ("__data__", "manzana"),
+        service._capability_registry.get("manzana"),
+        trading_pair="ETH-USD",
+    )
+    async with service._capture_public_task_provenance(second_snapshot):
+        release_child.set()
+        nested = await nested_task_created
+        await nested
+    await child
+
+    CHECK.assertEqual({child}, first_provenance)
+    CHECK.assertEqual({child}, first_owned)
+    CHECK.assertNotIn(nested, second_snapshot["provenance_tasks"])
+    CHECK.assertEqual({}, service._active_public_transaction_tokens)
+
+
+@pytest.mark.asyncio
 async def test_issue224_unsafe_discard_survives_resistant_task_retry():
     module, service, connector, tracker = _issue224_repair_service()
     cancellation_seen = asyncio.Event()
