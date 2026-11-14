@@ -11,6 +11,7 @@ Key features:
 - get_best_connector_for_market(): prefers trading connector (has order book tracker)
 """
 import asyncio
+import copy
 import inspect
 import logging
 import time
@@ -113,6 +114,7 @@ class UnifiedConnectorService:
             Tuple[str, str, str], Dict[str, Dict[str, Any]]
         ] = {}
         self._connector_incarnations: Dict[Tuple[str, str], int] = {}
+        self._connector_incarnation_sequence = 0
 
         # Connector settings cache
         self._conn_settings = AllConnectorSettings.get_connector_settings()
@@ -268,17 +270,77 @@ class UnifiedConnectorService:
             if not hasattr(self, name):
                 setattr(self, name, value)
 
-    def _connector_incarnation(self, connector_key: Tuple[str, str]) -> int:
+        if not hasattr(self, "_connector_incarnation_sequence"):
+            self._connector_incarnation_sequence = 0
+
+    def _connector_incarnation(
+        self, connector_key: Tuple[str, str]
+    ) -> Optional[int]:
         self._ensure_connector_cleanup_state()
-        return self._connector_incarnations.get(connector_key, 0)
+        return self._connector_incarnations.get(connector_key)
 
     def _advance_connector_incarnation(
         self, connector_key: Tuple[str, str]
     ) -> int:
-        """Invalidate every in-flight ownership token for one physical owner."""
-        incarnation = self._connector_incarnation(connector_key) + 1
+        """Publish a globally unique token for one active physical owner."""
+        self._ensure_connector_cleanup_state()
+        self._connector_incarnation_sequence += 1
+        incarnation = self._connector_incarnation_sequence
         self._connector_incarnations[connector_key] = incarnation
         return incarnation
+
+    def _cached_public_connector(
+        self, connector_key: Tuple[str, str]
+    ) -> Optional[ConnectorBase]:
+        """Read the current cache without constructing a data connector."""
+        account_name, connector_name = connector_key
+        if account_name == "__data__":
+            return getattr(self, "_data_connectors", {}).get(connector_name)
+        return getattr(self, "_trading_connectors", {}).get(
+            account_name, {}
+        ).get(connector_name)
+
+    def _connector_has_private_state(
+        self, connector_key: Tuple[str, str]
+    ) -> bool:
+        registries = (
+            getattr(self, "_connector_creation_residuals", {}),
+            getattr(self, "_connector_creation_failures", {}),
+            getattr(self, "_connector_cleanup_indices", {}),
+            getattr(self, "_connector_cleanup_owners", {}),
+            getattr(self, "_connector_residual_tasks", {}),
+            getattr(self, "_connector_cleanup_phases", {}),
+            getattr(self, "_market_cleanup_residuals", {}),
+            getattr(self, "_market_cleanup_owners", {}),
+            getattr(self, "_market_pair_owners", {}),
+            getattr(self, "_market_residual_tasks", {}),
+            getattr(self, "_market_cleanup_phases", {}),
+        )
+        return any(
+            (
+                raw_key == connector_key
+                or (
+                    isinstance(raw_key, tuple)
+                    and len(raw_key) >= 2
+                    and raw_key[:2] == connector_key
+                )
+            )
+            for registry in registries
+            for raw_key in registry
+        )
+
+    def _prune_connector_incarnation(
+        self, connector_key: Tuple[str, str]
+    ) -> None:
+        """Forget terminal owners; uniqueness lives in the global sequence."""
+        self._ensure_connector_cleanup_state()
+        if self._cached_public_connector(connector_key) is not None:
+            return
+        if self._connector_lock_users.get(connector_key, 0):
+            return
+        if self._connector_has_private_state(connector_key):
+            return
+        self._connector_incarnations.pop(connector_key, None)
 
     async def get_trading_connector(
         self,
@@ -366,6 +428,7 @@ class UnifiedConnectorService:
                     getattr(self, "_connector_creation_failures", {}).pop(
                         connector_key, None
                     )
+                    self._prune_connector_incarnation(connector_key)
 
     def get_all_trading_connectors(self) -> Dict[str, Dict[str, ConnectorBase]]:
         """
@@ -460,6 +523,7 @@ class UnifiedConnectorService:
                 raise ConnectorCapabilityError(
                     CapabilityErrorDetail.model_validate(residual)
                 )
+            initial_cache_state = self._capture_public_cache_state(connector_key)
             connector = self.get_data_connector(connector_name)
             approved_capabilities = self._validate_instance_capabilities(
                 connector_name, connector
@@ -469,9 +533,15 @@ class UnifiedConnectorService:
                 connector,
                 connector_key,
                 approved_capabilities,
+                initial_cache_state=initial_cache_state,
+                trading_pair=trading_pair,
             )
-            return await self._ensure_data_connector_started_locked(
-                connector_name, trading_pair, connector, snapshot
+            return await self._run_public_initialization_boundary(
+                snapshot,
+                "start",
+                self._ensure_data_connector_started_locked(
+                    connector_name, trading_pair, connector, snapshot
+                ),
             )
 
     async def _ensure_data_connector_started_locked(
@@ -486,62 +556,49 @@ class UnifiedConnectorService:
         if self._data_connectors_started.get(connector_name, False):
             return True
 
-        try:
-            if trading_pair not in connector._trading_pairs:
-                connector._trading_pairs.append(trading_pair)
+        if trading_pair not in connector._trading_pairs:
+            connector._trading_pairs.append(trading_pair)
 
-            await connector.start_network()
-            self._require_public_connector_ownership(snapshot)
-
-            max_wait = 30
-            waited = 0
-            tracker = connector.order_book_tracker
-            while waited < max_wait:
-                if tracker._order_book_stream_listener_task is not None:
-                    await asyncio.sleep(2.0)
-                    self._require_public_connector_ownership(snapshot)
-                    break
-                await asyncio.sleep(0.5)
-                self._require_public_connector_ownership(snapshot)
-                waited += 0.5
-
-            final_capabilities = self._validate_instance_capabilities(
-                connector_name, connector
-            )
-            self._capability_registry.require_resolved(
-                connector_name,
-                final_capabilities,
-                ConnectorFeature.DYNAMIC_SUBSCRIPTION,
-                trading_pair,
-            )
-            self._capability_registry.require_resolved(
-                connector_name,
-                final_capabilities,
-                ConnectorFeature.LIVE_ORDER_BOOK,
-                trading_pair,
-            )
-            self._require_public_connector_ownership(snapshot)
-            self._data_connectors_started[connector_name] = True
-            logger.info(
-                "Started data connector: %s with pair %s",
-                connector_name,
-                trading_pair,
-            )
-            return True
-        except ConnectorCapabilityError:
-            self._purge_trading_pair_registration(connector, trading_pair)
-            await self._discard_invalid_public_declaration(
-                connector_name, connector, snapshot
-            )
-            raise
-        except Exception as exc:
-            logger.error(
-                "Error starting data connector %s (%s)",
-                connector_name,
-                type(exc).__name__,
-            )
-            self._purge_trading_pair_registration(connector, trading_pair)
+        start_result = await connector.start_network()
+        if start_result is False:
             return False
+        self._require_public_connector_ownership(snapshot)
+
+        max_wait = 30
+        waited = 0
+        tracker = connector.order_book_tracker
+        while waited < max_wait:
+            if tracker._order_book_stream_listener_task is not None:
+                await asyncio.sleep(2.0)
+                self._require_public_connector_ownership(snapshot)
+                break
+            await asyncio.sleep(0.5)
+            self._require_public_connector_ownership(snapshot)
+            waited += 0.5
+
+        final_capabilities = self._validate_instance_capabilities(
+            connector_name, connector
+        )
+        self._capability_registry.require_resolved(
+            connector_name,
+            final_capabilities,
+            ConnectorFeature.DYNAMIC_SUBSCRIPTION,
+            trading_pair,
+        )
+        self._capability_registry.require_resolved(
+            connector_name,
+            final_capabilities,
+            ConnectorFeature.LIVE_ORDER_BOOK,
+            trading_pair,
+        )
+        self._require_public_connector_ownership(snapshot)
+        self._data_connectors_started[connector_name] = True
+        logger.info(
+            "Started data connector: %s with pair %s",
+            connector_name,
+            trading_pair,
+        )
+        return True
 
     def _resolve_public_connector_key(
         self, connector_name: str, account_name: Optional[str]
@@ -567,26 +624,472 @@ class UnifiedConnectorService:
             account_name, {}
         ).get(connector_name)
 
+    def _capture_public_cache_state(
+        self, connector_key: Tuple[str, str]
+    ) -> Dict[str, Any]:
+        """Capture the cache/token/start state before first-touch construction."""
+        self._ensure_connector_cleanup_state()
+        connector = self._cached_public_connector(connector_key)
+        incarnation = self._connector_incarnation(connector_key)
+        if connector is not None and incarnation is None:
+            incarnation = self._advance_connector_incarnation(connector_key)
+        account_name, connector_name = connector_key
+        started = getattr(self, "_data_connectors_started", {})
+        return {
+            "cache_present": connector is not None,
+            "cache_connector": connector,
+            "incarnation": incarnation,
+            "data_started_present": (
+                account_name == "__data__" and connector_name in started
+            ),
+            "data_started": (
+                started.get(connector_name) if account_name == "__data__" else None
+            ),
+        }
+
+    @staticmethod
+    def _snapshot_container(owner, attribute: str) -> Optional[Dict[str, Any]]:
+        try:
+            value = getattr(owner, attribute)
+        except BaseException:
+            return None
+        if isinstance(value, dict):
+            contents = dict(value)
+            kind = "dict"
+        elif isinstance(value, list):
+            contents = list(value)
+            kind = "list"
+        elif isinstance(value, set):
+            contents = set(value)
+            kind = "set"
+        else:
+            return None
+        return {
+            "owner": owner,
+            "attribute": attribute,
+            "value": value,
+            "contents": contents,
+            "kind": kind,
+        }
+
+    @staticmethod
+    def _snapshot_task_attributes(owner) -> Dict[str, Tuple[bool, Any]]:
+        attributes = {}
+        for name, value in getattr(owner, "__dict__", {}).items():
+            if "task" in name:
+                attributes[name] = (True, value)
+        return attributes
+
     def _snapshot_public_connector_state(
         self,
         connector_name: str,
         connector: ConnectorBase,
         connector_key: Tuple[str, str],
         approved_capabilities: ConnectorCapabilities,
+        *,
+        initial_cache_state: Optional[Mapping[str, Any]] = None,
+        trading_pair: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Capture immutable truth and ownership before untrusted discovery awaits."""
+        """Capture all public mutable state before the first collaborator await."""
+        if initial_cache_state is None:
+            initial_cache_state = self._capture_public_cache_state(connector_key)
+        if self._connector_incarnation(connector_key) is None:
+            self._advance_connector_incarnation(connector_key)
+        tracker = getattr(connector, "order_book_tracker", None)
+        containers = []
+        for owner, attribute in (
+            (connector, "_trading_pairs"),
+            (tracker, "_trading_pairs"),
+            (tracker, "order_books"),
+            (tracker, "_tracking_tasks"),
+            (tracker, "_generation_tasks"),
+            (tracker, "_draining_tasks"),
+            (tracker, "_generation_drain_tasks"),
+        ):
+            if owner is None:
+                continue
+            state = self._snapshot_container(owner, attribute)
+            if state is not None:
+                containers.append(state)
+        raw_capabilities = getattr(connector, "api_capabilities", None)
+        try:
+            raw_capabilities_contents = copy.deepcopy(raw_capabilities)
+            raw_capabilities_copied = True
+        except BaseException:
+            raw_capabilities_contents = raw_capabilities
+            raw_capabilities_copied = False
+        tasks = self._collect_connector_tasks(connector)
         return {
             "connector_name": connector_name,
             "connector_key": connector_key,
             "connector": connector,
             "incarnation": self._connector_incarnation(connector_key),
             "approved_capabilities": approved_capabilities,
+            "raw_capabilities": raw_capabilities,
+            "raw_capabilities_contents": raw_capabilities_contents,
+            "raw_capabilities_copied": raw_capabilities_copied,
+            "initial_cache_state": dict(initial_cache_state),
+            "trading_pair": trading_pair,
+            "tracker": tracker,
+            "containers": containers,
+            "connector_task_attributes": self._snapshot_task_attributes(connector),
+            "tracker_task_attributes": (
+                self._snapshot_task_attributes(tracker)
+                if tracker is not None
+                else {}
+            ),
+            "tasks": tasks,
+            "task_states": {
+                task: (task.done(), task.cancelled(), task.cancelling())
+                for task in tasks
+            },
             "data_started_present": connector_name
             in getattr(self, "_data_connectors_started", {}),
             "data_started": getattr(self, "_data_connectors_started", {}).get(
                 connector_name
             ),
         }
+
+    @staticmethod
+    def _container_matches_snapshot(state: Mapping[str, Any]) -> bool:
+        try:
+            current = getattr(state["owner"], state["attribute"])
+        except BaseException:
+            return False
+        if current is not state["value"]:
+            return False
+        if state["kind"] == "dict":
+            return dict(current) == state["contents"]
+        if state["kind"] == "list":
+            return list(current) == state["contents"]
+        return set(current) == state["contents"]
+
+    def _public_transaction_changed(self, snapshot: Mapping[str, Any]) -> bool:
+        initial = snapshot["initial_cache_state"]
+        if not snapshot["raw_capabilities_copied"]:
+            return True
+        if self._cached_public_connector(snapshot["connector_key"]) is not initial[
+            "cache_connector"
+        ]:
+            return True
+        try:
+            current_capabilities = getattr(snapshot["connector"], "api_capabilities")
+            if current_capabilities != snapshot["raw_capabilities_contents"]:
+                return True
+        except BaseException:
+            return True
+        if any(
+            not self._container_matches_snapshot(state)
+            for state in snapshot["containers"]
+        ):
+            return True
+        if self._collect_connector_tasks(snapshot["connector"]) != snapshot["tasks"]:
+            return True
+        connector_name = snapshot["connector_name"]
+        started = getattr(self, "_data_connectors_started", {})
+        return (
+            (connector_name in started) != initial["data_started_present"]
+            or started.get(connector_name) != initial["data_started"]
+        )
+
+    def _public_transaction_can_restore(
+        self, snapshot: Mapping[str, Any]
+    ) -> bool:
+        initial = snapshot["initial_cache_state"]
+        if not snapshot["raw_capabilities_copied"]:
+            return False
+        if not initial["cache_present"]:
+            return False
+        if initial["cache_connector"] is not snapshot["connector"]:
+            return False
+        if not self._public_connector_is_owned(snapshot):
+            return False
+        if getattr(snapshot["connector"], "order_book_tracker", None) is not snapshot[
+            "tracker"
+        ]:
+            return False
+        for state in snapshot["containers"]:
+            try:
+                if getattr(state["owner"], state["attribute"]) is not state["value"]:
+                    return False
+            except BaseException:
+                return False
+        for task, state in snapshot["task_states"].items():
+            if (task.done(), task.cancelled(), task.cancelling()) != state:
+                return False
+            # A still-running pre-existing generation can mutate books or task
+            # maps outside this lock, so its deltas cannot be attributed safely.
+            if not state[0]:
+                return False
+        return True
+
+    async def _cancel_public_transaction_tasks(
+        self, snapshot: Mapping[str, Any]
+    ) -> bool:
+        current = self._collect_connector_tasks(snapshot["connector"])
+        created = current - snapshot["tasks"]
+        for task in created:
+            if not task.done() and task.cancelling() == 0:
+                task.cancel()
+        pending = {task for task in created if not task.done()}
+        if pending:
+            _, pending = await asyncio.wait(
+                pending, timeout=_CONNECTOR_CLEANUP_TIMEOUT
+            )
+        for task in created - pending:
+            try:
+                task.exception()
+            except (asyncio.CancelledError, Exception):
+                pass
+        return not pending
+
+    def _restore_public_transaction_state(
+        self, snapshot: Mapping[str, Any]
+    ) -> bool:
+        connector = snapshot["connector"]
+        restored = True
+        try:
+            raw_capabilities = snapshot["raw_capabilities"]
+            raw_contents = snapshot["raw_capabilities_contents"]
+            if not snapshot["raw_capabilities_copied"]:
+                restored = False
+            if isinstance(raw_capabilities, dict) and isinstance(raw_contents, dict):
+                raw_capabilities.clear()
+                raw_capabilities.update(copy.deepcopy(raw_contents))
+            setattr(connector, "api_capabilities", raw_capabilities)
+        except BaseException:
+            restored = False
+        for state in snapshot["containers"]:
+            value = state["value"]
+            try:
+                if state["kind"] == "dict":
+                    value.clear()
+                    value.update(state["contents"])
+                elif state["kind"] == "list":
+                    value[:] = state["contents"]
+                else:
+                    value.clear()
+                    value.update(state["contents"])
+                setattr(state["owner"], state["attribute"], value)
+            except BaseException:
+                restored = False
+        for owner, attributes in (
+            (connector, snapshot["connector_task_attributes"]),
+            (snapshot["tracker"], snapshot["tracker_task_attributes"]),
+        ):
+            if owner is None:
+                continue
+            current_names = {
+                name
+                for name in getattr(owner, "__dict__", {})
+                if "task" in name
+            }
+            for name in current_names - set(attributes):
+                try:
+                    delattr(owner, name)
+                except BaseException:
+                    restored = False
+            for name, (_, value) in attributes.items():
+                try:
+                    setattr(owner, name, value)
+                except BaseException:
+                    restored = False
+        initial = snapshot["initial_cache_state"]
+        connector_name = snapshot["connector_name"]
+        started = self._data_connectors_started
+        if initial["data_started_present"]:
+            started[connector_name] = initial["data_started"]
+        else:
+            started.pop(connector_name, None)
+        return restored
+
+    def _validate_public_transaction_state(
+        self, snapshot: Mapping[str, Any]
+    ) -> None:
+        self._require_public_connector_ownership(snapshot)
+        self._validate_public_data_capabilities(
+            snapshot["connector_name"],
+            snapshot["connector"],
+            snapshot["trading_pair"],
+        )
+
+    async def _cleanup_public_transaction(
+        self,
+        snapshot: Mapping[str, Any],
+        *,
+        force_discard: bool,
+    ) -> None:
+        changed = self._public_transaction_changed(snapshot)
+        if not changed and not force_discard:
+            return
+        tasks_drained = await self._cancel_public_transaction_tasks(snapshot)
+        can_restore = (
+            not force_discard
+            and tasks_drained
+            and self._public_transaction_can_restore(snapshot)
+        )
+        restored = self._restore_public_transaction_state(snapshot)
+        if can_restore and restored:
+            return
+        if self._public_connector_is_owned(snapshot):
+            await self._discard_invalid_public_declaration(
+                snapshot["connector_name"], snapshot["connector"], snapshot
+            )
+            return
+        if changed:
+            account_name, connector_name = snapshot["connector_key"]
+            try:
+                await self._stop_connector_network(
+                    snapshot["connector"], account_name, connector_name
+                )
+            except BaseException:
+                detail = CapabilityErrorDetail(
+                    code="connector_capability_cleanup_residual",
+                    message=(
+                        f"Rejected capability cleanup is incomplete for "
+                        f"'{connector_name}'"
+                    ),
+                    connector=connector_name,
+                    feature="capabilities",
+                    reason="cleanup_incomplete",
+                    cleanup_scope="connector",
+                    cleanup_code="connector_stop_failed",
+                )
+                self._connector_creation_residuals[snapshot["connector_key"]] = (
+                    detail.model_dump(exclude_none=True)
+                )
+                raise ConnectorCapabilityError(detail) from None
+
+    async def _await_public_transaction_cleanup(
+        self,
+        snapshot: Mapping[str, Any],
+        *,
+        force_discard: bool,
+        cancellation_args: Optional[Tuple[Any, ...]] = None,
+    ) -> None:
+        """Finish rollback under shield and then reproduce caller cancellation."""
+        cleanup_task = asyncio.create_task(
+            self._cleanup_public_transaction(
+                snapshot, force_discard=force_discard
+            )
+        )
+        preserved_args = cancellation_args
+        while not cleanup_task.done():
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError as cancellation:
+                if cleanup_task.done():
+                    break
+                if preserved_args is None:
+                    preserved_args = cancellation.args
+            except BaseException:
+                break
+        cleanup_error = None
+        try:
+            cleanup_task.result()
+        except BaseException as exc:
+            cleanup_error = exc
+        if preserved_args is not None:
+            raise asyncio.CancelledError(*preserved_args)
+        if cleanup_error is not None:
+            raise cleanup_error
+
+    @staticmethod
+    def _public_boundary_error(
+        snapshot: Mapping[str, Any], boundary: str
+    ) -> ConnectorCapabilityError:
+        connector_name = snapshot["connector_name"]
+        trading_pair = snapshot["trading_pair"]
+        if boundary == "book_wait":
+            code = "connector_order_book_wait_failed"
+            message = (
+                f"Connector '{connector_name}' could not initialize order book "
+                f"for '{trading_pair}'"
+            )
+            reason = "order_book_wait_failed"
+        else:
+            code = "connector_symbol_discovery_failed"
+            message = (
+                f"Connector '{connector_name}' could not validate trading pair "
+                f"'{trading_pair}'"
+            )
+            reason = "symbol_discovery_failed"
+        return ConnectorCapabilityError(
+            CapabilityErrorDetail(
+                code=code,
+                message=message,
+                connector=connector_name,
+                feature=ConnectorFeature.LIVE_ORDER_BOOK.value,
+                trading_pair=trading_pair,
+                reason=reason,
+            )
+        )
+
+    async def _run_public_initialization_boundary(
+        self,
+        snapshot: Mapping[str, Any],
+        boundary: str,
+        operation,
+    ):
+        """Validate and roll back every await outcome, including cancellation."""
+        try:
+            result = await operation
+        except asyncio.CancelledError as cancellation:
+            validation_error = None
+            try:
+                self._validate_public_transaction_state(snapshot)
+            except ConnectorCapabilityError as exc:
+                validation_error = exc
+            await self._await_public_transaction_cleanup(
+                snapshot,
+                force_discard=validation_error is not None,
+                cancellation_args=cancellation.args,
+            )
+            raise AssertionError("cancellation cleanup must re-raise")
+        except BaseException as exc:
+            validation_error = None
+            try:
+                self._validate_public_transaction_state(snapshot)
+            except ConnectorCapabilityError as invalid:
+                validation_error = invalid
+            await self._await_public_transaction_cleanup(
+                snapshot,
+                force_discard=(
+                    validation_error is not None or boundary == "discovery"
+                ),
+            )
+            if boundary == "book_wait" and isinstance(exc, Exception):
+                raise self._public_boundary_error(snapshot, boundary) from None
+            if isinstance(exc, ConnectorCapabilityError):
+                raise exc
+            if validation_error is not None:
+                raise validation_error
+            if boundary == "discovery" and isinstance(exc, Exception):
+                raise self._public_boundary_error(snapshot, boundary) from None
+            if boundary == "start" and isinstance(exc, Exception):
+                logger.error(
+                    "Error starting data connector %s (%s)",
+                    snapshot["connector_name"],
+                    type(exc).__name__,
+                )
+                return False
+            raise
+
+        validation_error = None
+        try:
+            self._validate_public_transaction_state(snapshot)
+        except ConnectorCapabilityError as exc:
+            validation_error = exc
+        if validation_error is not None:
+            await self._await_public_transaction_cleanup(
+                snapshot, force_discard=True
+            )
+            raise validation_error
+        if result is False:
+            await self._await_public_transaction_cleanup(
+                snapshot, force_discard=False
+            )
+        return result
 
     def _validate_public_data_capabilities(
         self,
@@ -714,7 +1217,6 @@ class UnifiedConnectorService:
         if account_name == "__data__":
             self._data_connectors.pop(connector_name, None)
             self._data_connectors_started.pop(connector_name, None)
-            self._advance_connector_incarnation(connector_key)
             try:
                 await self._stop_data_connector_network(connector, connector_name)
             except asyncio.CancelledError:
@@ -736,6 +1238,7 @@ class UnifiedConnectorService:
                     detail.model_dump(exclude_none=True)
                 )
                 raise ConnectorCapabilityError(detail) from None
+            self._prune_connector_incarnation(connector_key)
             return
 
         cleanup_detail = await self._finalize_stop_trading_connector(
@@ -952,6 +1455,7 @@ class UnifiedConnectorService:
                 connector_name, bootstrap_capabilities, feature, trading_pair
             )
 
+        initial_cache_state = self._capture_public_cache_state(connector_key)
         connector = self._connector_for_public_key(connector_key)
 
         if not connector:
@@ -981,6 +1485,8 @@ class UnifiedConnectorService:
                 connector,
                 connector_key,
                 bootstrap_capabilities,
+                initial_cache_state=initial_cache_state,
+                trading_pair=trading_pair,
             )
             await self._discard_invalid_public_declaration(
                 connector_name, connector, rejected_snapshot
@@ -992,6 +1498,8 @@ class UnifiedConnectorService:
             connector,
             connector_key,
             approved_capabilities,
+            initial_cache_state=initial_cache_state,
+            trading_pair=trading_pair,
         )
 
         tracker = connector.order_book_tracker
@@ -1009,16 +1517,13 @@ class UnifiedConnectorService:
                 pass
 
         # Reject pairs the exchange doesn't list before registering them anywhere
-        try:
-            pair_is_supported = await self._is_trading_pair_supported(
+        pair_is_supported = await self._run_public_initialization_boundary(
+            snapshot,
+            "discovery",
+            self._is_trading_pair_supported(
                 connector_name, connector, trading_pair
-            )
-        except ConnectorCapabilityError:
-            await self._discard_invalid_public_declaration(
-                connector_name, connector, snapshot
-            )
-            raise
-        self._require_public_connector_ownership(snapshot)
+            ),
+        )
         if not pair_is_supported:
             logger.error(
                 f"Trading pair {trading_pair} is not listed on {connector_name} - "
@@ -1026,74 +1531,55 @@ class UnifiedConnectorService:
             )
             return False
 
-        # Lazy symbol/instrument discovery may replace api_capabilities. Validate
-        # that loaded declaration before any pair, book, or tracker state changes.
-        try:
-            self._validate_public_data_capabilities(
-                connector_name, connector, trading_pair
-            )
-        except ConnectorCapabilityError:
-            await self._discard_invalid_public_declaration(
-                connector_name, connector, snapshot
-            )
-            raise
-
         # For data connectors, ensure network is started
         if connector_key[0] == "__data__":
             if not self._data_connectors_started.get(connector_name, False):
-                success = await self._ensure_data_connector_started_locked(
-                    connector_name, trading_pair, connector, snapshot
+                success = await self._run_public_initialization_boundary(
+                    snapshot,
+                    "start",
+                    self._ensure_data_connector_started_locked(
+                        connector_name, trading_pair, connector, snapshot
+                    ),
                 )
-                self._require_public_connector_ownership(snapshot)
                 if not success:
                     return False
                 # Wait for order book after starting
-                ready = await self._wait_for_order_book(
-                    tracker, trading_pair, timeout
+                ready = await self._run_public_initialization_boundary(
+                    snapshot,
+                    "book_wait",
+                    self._wait_for_order_book(tracker, trading_pair, timeout),
                 )
-                self._require_public_connector_ownership(snapshot)
                 if not ready:
                     return False
-                try:
-                    self._validate_public_data_capabilities(
-                        connector_name, connector, trading_pair
-                    )
-                except ConnectorCapabilityError:
-                    await self._discard_invalid_public_declaration(
-                        connector_name, connector, snapshot
-                    )
-                    raise
                 return True
             else:
                 # Connector started, dynamically add trading pair
-                success = await self._add_trading_pair_to_tracker(
-                    connector, trading_pair
+                success = await self._run_public_initialization_boundary(
+                    snapshot,
+                    "pair",
+                    self._add_trading_pair_to_tracker(connector, trading_pair),
                 )
-                self._require_public_connector_ownership(snapshot)
                 if not success:
                     return False
 
         # For trading connectors, dynamically add trading pair
         else:
-            success = await self._add_trading_pair_to_tracker(connector, trading_pair)
-            self._require_public_connector_ownership(snapshot)
+            success = await self._run_public_initialization_boundary(
+                snapshot,
+                "pair",
+                self._add_trading_pair_to_tracker(connector, trading_pair),
+            )
             if not success:
                 return False
 
         # Wait for order book to have data
-        ready = await self._wait_for_order_book(tracker, trading_pair, timeout)
-        self._require_public_connector_ownership(snapshot)
+        ready = await self._run_public_initialization_boundary(
+            snapshot,
+            "book_wait",
+            self._wait_for_order_book(tracker, trading_pair, timeout),
+        )
         if not ready:
             return False
-        try:
-            self._validate_public_data_capabilities(
-                connector_name, connector, trading_pair
-            )
-        except ConnectorCapabilityError:
-            await self._discard_invalid_public_declaration(
-                connector_name, connector, snapshot
-            )
-            raise
         return True
 
     def _is_tracker_running(self, tracker) -> bool:
@@ -2855,11 +3341,9 @@ class UnifiedConnectorService:
                 ):
                     if self._data_connectors.get(connector_name) is connector:
                         self._data_connectors.pop(connector_name, None)
-                        self._advance_connector_incarnation(connector_key)
                     self._data_connectors_started.pop(connector_name, None)
                 elif account_connectors and account_connectors.get(connector_name) is connector:
                     account_connectors.pop(connector_name, None)
-                    self._advance_connector_incarnation(connector_key)
                 if account_connectors is not None and not account_connectors:
                     self._trading_connectors.pop(account_name, None)
 
@@ -2985,6 +3469,7 @@ class UnifiedConnectorService:
                     market_residuals.pop(key, None)
                     market_owners.pop(key, None)
             logger.info(f"Stopped trading connector {account_name}/{connector_name}")
+            self._prune_connector_incarnation(connector_key)
             return None
         if retained_for_key:
             retained_indices[connector_key] = retained_for_key
@@ -3025,6 +3510,7 @@ class UnifiedConnectorService:
             self._connector_cleanup_indices,
             self._connector_residual_tasks,
             self._connector_cleanup_phases,
+            self._connector_incarnations,
             getattr(self, "_market_cleanup_residuals", {}),
             getattr(self, "_market_cleanup_owners", {}),
             getattr(self, "_market_pair_owners", {}),
@@ -3054,6 +3540,8 @@ class UnifiedConnectorService:
             raise failures[0]
         self._data_connectors.clear()
         self._data_connectors_started.clear()
+        for connector_key in tuple(self._connector_incarnations):
+            self._prune_connector_incarnation(connector_key)
         logger.info("Stopped all connectors")
 
     # =========================================================================
