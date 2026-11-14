@@ -2398,19 +2398,17 @@ async def test_final_declaration_boundary_rejects_concurrent_waiters_transaction
     second = asyncio.create_task(
         service.get_trading_connector("master", "manzana")
     )
-    while service._market_lock_users.get(("master", "manzana"), 0) < 2:
-        await asyncio.sleep(0)
-    release_symbol_map.set()
-    results = await asyncio.gather(first, second, return_exceptions=True)
-
-    CHECK.assertTrue(
-        all(isinstance(result, module.ConnectorCapabilityError) for result in results),
-        results,
-    )
+    with pytest.raises(module.ConnectorCapabilityError) as active_root:
+        await second
     CHECK.assertEqual(
-        ["connector_capability_mismatch", "connector_capability_mismatch"],
-        [result.detail["code"] for result in results],
+        "market_transaction_retained",
+        active_root.value.detail["cleanup_code"],
     )
+    release_symbol_map.set()
+    first_result = (await asyncio.gather(first, return_exceptions=True))[0]
+
+    CHECK.assertIsInstance(first_result, module.ConnectorCapabilityError)
+    CHECK.assertEqual("connector_capability_mismatch", first_result.detail["code"])
     CHECK.assertEqual(1, constructor_calls)
     CHECK.assertEqual(1, connector.symbol_map_calls)
     CHECK.assertEqual([], post_symbol_calls)
@@ -2991,17 +2989,18 @@ async def test_declaration_access_failures_are_typed_and_shared_by_waiters(
     second = asyncio.create_task(
         service.get_trading_connector("master", "manzana")
     )
-    while service._market_lock_users.get(("master", "manzana"), 0) < 2:
-        await asyncio.sleep(0)
+    with pytest.raises(module.ConnectorCapabilityError) as active_root:
+        await second
     release_symbol_map.set()
-    results = await asyncio.gather(first, second, return_exceptions=True)
+    first_result = (await asyncio.gather(first, return_exceptions=True))[0]
+    results = [first_result, active_root.value]
 
     CHECK.assertTrue(
         all(isinstance(result, module.ConnectorCapabilityError) for result in results),
         results,
     )
     CHECK.assertEqual(
-        ["connector_capability_mismatch", "connector_capability_mismatch"],
+        ["connector_capability_mismatch", "connector_cleanup_residual"],
         [result.detail["code"] for result in results],
     )
     CHECK.assertTrue(all(secret not in json.dumps(result.detail) for result in results))
@@ -3316,13 +3315,16 @@ async def test_public_data_initialization_serializes_paused_a_before_rejecting_b
 
     CHECK.assertIs(result_a, True)
     CHECK.assertIsInstance(result_b, module.ConnectorCapabilityError)
-    CHECK.assertEqual("connector_capability_mismatch", result_b.detail["code"])
-    CHECK.assertLess(events.index("a_pair_mutation"), events.index("b_discovery"))
+    CHECK.assertEqual("connector_cleanup_residual", result_b.detail["code"])
+    CHECK.assertEqual(
+        "market_transaction_retained", result_b.detail["cleanup_code"]
+    )
+    CHECK.assertNotIn("b_discovery", events)
     CHECK.assertIn("a_return_owned", events)
     CHECK.assertNotIn("a_return_unowned", events)
-    CHECK.assertEqual(1, connector.stop_calls)
-    CHECK.assertEqual({}, service._data_connectors)
-    CHECK.assertEqual({}, service._data_connectors_started)
+    CHECK.assertEqual(0, connector.stop_calls)
+    CHECK.assertIs(connector, service._data_connectors["manzana"])
+    CHECK.assertIs(service._data_connectors_started["manzana"], True)
 
 
 @pytest.mark.asyncio
@@ -4825,13 +4827,20 @@ async def test_closure_b11_stop_serializes_with_same_key_creation():
     await creation_paused.wait()
     stopping = asyncio.create_task(service.stop_trading_connector("master", "generic"))
     try:
-        await asyncio.wait({stopping}, timeout=0.1)
-        CHECK.assertFalse(stopping.done())
+        with pytest.raises(module.ConnectorCapabilityError) as active_root:
+            await stopping
+        CHECK.assertEqual(
+            "market_transaction_retained",
+            active_root.value.detail["cleanup_code"],
+        )
     finally:
         creation_release.set()
-        await asyncio.gather(creation, stopping)
+        await creation
     CHECK.assertIs(connector, creation.result())
-    CHECK.assertIs(True, stopping.result())
+    CHECK.assertIs(
+        True,
+        await service.stop_trading_connector("master", "generic"),
+    )
 
     CHECK.assertEqual({}, service._trading_connectors)
     CHECK.assertEqual({}, service._orders_recorders)
@@ -6195,7 +6204,10 @@ async def test_final_adjacent_b2_restart_stop_terminal_retry_is_consumed_once():
     first = await service.restart_order_book_tracker("generic", "master")
     CHECK.assertEqual("tracker_cleanup_pending", first["error"])
     release.set()
-    await asyncio.sleep(0)
+    for _ in range(100):
+        if not service._market_locks:
+            break
+        await asyncio.sleep(0)
     second = await service.restart_order_book_tracker("generic", "master")
 
     CHECK.assertIs(True, second["success"])
@@ -6841,6 +6853,10 @@ async def test_lifecycle_b3_cancelled_async_start_is_stopped_after_activation():
     )
     release_start.set()
     await start_task
+    for _ in range(100):
+        if not service._market_locks:
+            break
+        await asyncio.sleep(0)
     await service.stop_all()
 
     CHECK.assertFalse(tracker.active)
@@ -7637,6 +7653,10 @@ async def test_issue224_data_discard_reconciles_restart_before_one_successor(
         ]["task"]
         release_stop.set()
         await restart_stop_task
+        for _ in range(100):
+            if not service._market_locks:
+                break
+            await asyncio.sleep(0)
     else:
         CHECK.assertIs(
             await service.initialize_order_book("manzana", "BTC-USD", timeout=0),
@@ -7762,6 +7782,7 @@ async def test_issue224_orphan_private_state_recovers_before_one_successor(
 async def test_issue224_orphan_phase_inspects_terminal_task_result(terminal_result):
     module, registry_type = _load_unified_service_module()
     service = _final_boundary_service(module, registry_type)
+    service._ensure_connector_cleanup_state()
     connector_key = ("acct", "manzana")
     owner_key = (*connector_key, "network")
     task = asyncio.create_task(asyncio.sleep(0, result=terminal_result))
@@ -8024,7 +8045,7 @@ async def test_issue224_unsafe_discard_survives_resistant_task_retry():
 
 @pytest.mark.asyncio
 async def test_issue224_remove_pair_uses_initialization_owner_lock():
-    _, service, connector, tracker = _issue224_repair_service()
+    module, service, connector, tracker = _issue224_repair_service()
     tracker.order_books["BTC-USD"] = types.SimpleNamespace(snapshot=([], []))
     connector._trading_pairs.append("BTC-USD")
     tracker._trading_pairs.append("BTC-USD")
@@ -8051,13 +8072,20 @@ async def test_issue224_remove_pair_uses_initialization_owner_lock():
     removal = asyncio.create_task(
         service.remove_trading_pair("manzana", "BTC-USD")
     )
-    await asyncio.sleep(0)
 
     try:
-        CHECK.assertFalse(removal.done())
+        with pytest.raises(module.ConnectorCapabilityError) as active_root:
+            await removal
+        CHECK.assertEqual(
+            "market_transaction_retained",
+            active_root.value.detail["cleanup_code"],
+        )
         release_pair.set()
         CHECK.assertIs(await initialization, False)
-        CHECK.assertIs(await removal, True)
+        CHECK.assertIs(
+            await service.remove_trading_pair("manzana", "BTC-USD"),
+            True,
+        )
         CHECK.assertNotIn("BTC-USD", connector._trading_pairs)
         CHECK.assertNotIn("BTC-USD", tracker._trading_pairs)
         CHECK.assertNotIn("BTC-USD", tracker.order_books)
@@ -8491,10 +8519,7 @@ async def test_issue224_connector_stop_phase_keeps_exact_physical_owner(
         CHECK.assertIs(connector_a, service._connector_cleanup_owners[owner_key])
         CHECK.assertEqual(1, connector_a.stop_calls)
         CHECK.assertEqual(0, connector_b.stop_calls)
-        CHECK.assertIs(
-            connector_a,
-            service._trading_connectors["acct"]["manzana"],
-        )
+        CHECK.assertNotIn("manzana", service._trading_connectors.get("acct", {}))
         CHECK.assertIn(market_key, service._market_cleanup_owners)
 
 
@@ -8572,10 +8597,17 @@ async def test_issue224_market_add_serializes_authenticated_key_replacement(
         lambda config: types.SimpleNamespace(),
     )
 
-    async def create_successor(account_name, connector_name):
-        return connector_b
+    service._create_trading_connector = lambda *args, **kwargs: connector_b
+    async def initialize_candidate(*args, **kwargs):
+        return None
 
-    service._create_and_initialize_trading_connector = create_successor
+    service._initialize_trading_connector_candidate = initialize_candidate
+    service._activate_trading_connector_candidate = initialize_candidate
+    monkeypatch.setattr(
+        module,
+        "api_keys_from_connector_config_map",
+        lambda config: {"api_key": "NEW"},
+    )
     add_task = asyncio.create_task(interface.add_market("manzana", "BTC-USD"))
     await entered_initialize.wait()
     replace_task = asyncio.create_task(
@@ -8585,7 +8617,9 @@ async def test_issue224_market_add_serializes_authenticated_key_replacement(
 
     try:
         CHECK.assertEqual([], key_updates)
-        CHECK.assertFalse(replace_task.done())
+        CHECK.assertTrue(replace_task.done())
+        with pytest.raises(module.ConnectorCapabilityError):
+            await replace_task
         CHECK.assertIs(connector_a, service._trading_connectors["acct"]["manzana"])
         CHECK.assertEqual(
             incarnation_a,
@@ -8594,7 +8628,10 @@ async def test_issue224_market_add_serializes_authenticated_key_replacement(
         release_initialize.set()
         await asyncio.wait_for(add_task, 1)
         CHECK.assertEqual([connector_a], commit_connectors)
-        CHECK.assertIs(connector_b, await asyncio.wait_for(replace_task, 1))
+        retry = service.update_connector_keys(
+            "acct", "manzana", {"api_key": "NEW"}
+        )
+        CHECK.assertIs(connector_b, await asyncio.wait_for(retry, 1))
         CHECK.assertIs(connector_b, service._trading_connectors["acct"]["manzana"])
         CHECK.assertEqual(1, connector_a.stop_calls)
         CHECK.assertEqual(1, len(key_updates))
@@ -8609,7 +8646,7 @@ async def test_issue224_market_transaction_blocks_inherited_and_stale_children()
     service = _final_boundary_service(module, registry_type)
     connector_key = ("acct", "manzana")
     stale_release = asyncio.Event()
-    stale_entered = asyncio.Event()
+    stale_rejected = asyncio.Event()
 
     async def ordinary_child():
         with pytest.raises(
@@ -8620,8 +8657,10 @@ async def test_issue224_market_transaction_blocks_inherited_and_stale_children()
 
     async def stale_child():
         await stale_release.wait()
-        async with service._market_transaction_lock(connector_key):
-            stale_entered.set()
+        with pytest.raises(module.ConnectorCapabilityError):
+            async with service._market_transaction_lock(connector_key):
+                CHECK.fail("a stale child queued through an active root lease")
+        stale_rejected.set()
 
     async with service._market_transaction_lock(connector_key) as first_token:
         first_owner = asyncio.current_task()
@@ -8640,10 +8679,9 @@ async def test_issue224_market_transaction_blocks_inherited_and_stale_children()
         stale_release.set()
         await asyncio.sleep(0)
         CHECK.assertIs(asyncio.current_task(), second_token.owner_task)
-        CHECK.assertFalse(stale_entered.is_set())
+        CHECK.assertTrue(stale_rejected.is_set())
 
     await asyncio.wait_for(stale, 1)
-    CHECK.assertTrue(stale_entered.is_set())
     CHECK.assertIs(second_token.active, False)
     CHECK.assertIsNone(second_token.owner_task)
     CHECK.assertEqual({}, service._market_lock_users)
@@ -9044,46 +9082,35 @@ async def test_issue224_retained_frame_never_receives_public_stop_authority():
 async def test_issue224_preacquire_cancellation_reaps_guardians_and_users():
     module, registry_type = _load_unified_service_module()
     service = _final_boundary_service(module, registry_type)
+    service._ensure_connector_cleanup_state()
     connector_key = ("acct", "manzana")
     contenders_started = asyncio.Event()
-    holder_entered = asyncio.Event()
-    holder_release = asyncio.Event()
-
-    async def holder():
-        async with service._market_transaction_lock(connector_key):
-            holder_entered.set()
-            await holder_release.wait()
+    raw_lock = asyncio.Lock()
+    await raw_lock.acquire()
+    service._market_locks[connector_key] = raw_lock
 
     async def contender():
         contenders_started.set()
         async with service._market_transaction_lock(connector_key):
             CHECK.fail("a queued contender acquired before cancellation")
 
-    holder_task = asyncio.create_task(holder())
-    await holder_entered.wait()
     try:
         contenders = [asyncio.create_task(contender()) for _ in range(5)]
         await contenders_started.wait()
         for _ in range(50):
-            if service._market_lock_users.get(connector_key) == 6:
+            if service._market_lock_users.get(connector_key) == 5:
                 break
             await asyncio.sleep(0)
-        CHECK.assertEqual(6, service._market_lock_users[connector_key])
+        CHECK.assertEqual(5, service._market_lock_users[connector_key])
         for task in contenders:
             task.cancel()
         await asyncio.gather(*contenders, return_exceptions=True)
-        CHECK.assertEqual(1, service._market_lock_users[connector_key])
-        CHECK.assertEqual(
-            [connector_key], list(service._market_leases)
-        )
-        CHECK.assertTrue(service._market_locks[connector_key].locked())
+        CHECK.assertEqual({}, service._market_lock_users)
+        CHECK.assertEqual({}, service._market_leases)
+        CHECK.assertEqual({}, service._market_locks)
     finally:
-        holder_release.set()
-        await holder_task
-
-    CHECK.assertEqual({}, service._market_lock_users)
-    CHECK.assertEqual({}, service._market_locks)
-    CHECK.assertEqual({}, service._market_leases)
+        if raw_lock.locked():
+            raw_lock.release()
 
 
 @pytest.mark.asyncio
@@ -9137,7 +9164,11 @@ async def test_issue224_connector_cleanup_retry_uses_physical_terminal_truth(
         if not service._market_locks:
             break
         await asyncio.sleep(0)
-
+    CHECK.assertEqual(
+        {},
+        service._market_locks,
+        (service._market_leases, service._connector_residual_tasks),
+    )
     if terminal_outcome == "success":
         async with interface._market_transaction("manzana", "BTC-USD"):
             await interface._retry_market_cleanup_residual(
@@ -9278,6 +9309,8 @@ def test_issue224_account_routes_preserve_typed_capability_residuals():
 async def test_issue224_delete_credentials_commits_only_after_terminal_stop(
     monkeypatch,
 ):
+    from contextlib import asynccontextmanager
+
     from models.connectors import CapabilityErrorDetail
     from services.connector_capabilities import ConnectorCapabilityError
 
@@ -9297,13 +9330,25 @@ async def test_issue224_delete_credentials_commits_only_after_terminal_stop(
     class ConnectorService:
         fail = True
 
-        async def stop_trading_connector(self, account_name, connector_name):
+        @asynccontextmanager
+        async def credential_transaction(self, account_name, connector_name):
+            events.append("enter")
+            try:
+                yield
+            finally:
+                events.append("exit")
+
+        async def _stop_trading_connector_already_locked(
+            self, account_name, connector_name
+        ):
             events.append("stop")
             if self.fail:
-                raise ConnectorCapabilityError(detail)
-            return True
+                return detail
+            return None
 
-        def clear_trading_connector(self, account_name, connector_name):
+        def clear_trading_connector_already_locked(
+            self, account_name, connector_name
+        ):
             events.append("clear")
 
     connector_service = ConnectorService()
@@ -9331,12 +9376,462 @@ async def test_issue224_delete_credentials_commits_only_after_terminal_stop(
 
     with pytest.raises(ConnectorCapabilityError):
         await service.delete_credentials("acct", "manzana")
-    CHECK.assertEqual(["stop"], events)
+    CHECK.assertEqual(["enter", "stop", "exit"], events)
     CHECK.assertTrue(file_state["exists"])
     CHECK.assertEqual(["balance"], service.accounts_state["acct"]["manzana"])
 
     connector_service.fail = False
     await service.delete_credentials("acct", "manzana")
-    CHECK.assertEqual(["stop", "stop", "delete", "clear"], events)
+    CHECK.assertEqual(
+        [
+            "enter",
+            "stop",
+            "exit",
+            "enter",
+            "stop",
+            "delete",
+            "clear",
+            "exit",
+        ],
+        events,
+    )
     CHECK.assertFalse(file_state["exists"])
     CHECK.assertNotIn("manzana", service.accounts_state["acct"])
+
+
+@pytest.mark.asyncio
+async def test_issue224_waiting_guardian_observes_root_residual_before_release():
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    service._ensure_connector_cleanup_state()
+    connector_key = ("acct", "manzana")
+    publish = asyncio.Event()
+    published = asyncio.Event()
+    release = asyncio.Event()
+
+    residual = {
+        "code": "connector_cleanup_residual",
+        "message": "Connector cleanup is incomplete for 'acct:manzana'",
+        "connector": "manzana",
+        "feature": "connector_cleanup",
+        "reason": "cleanup_incomplete",
+        "cleanup_scope": "connector",
+        "cleanup_code": "connector_stop_pending",
+    }
+
+    async def holder():
+        async with service._market_transaction_lock(connector_key):
+            await publish.wait()
+            service._connector_creation_residuals[connector_key] = residual
+            notifier = getattr(service, "_signal_market_state_change", None)
+            if notifier is not None:
+                notifier(connector_key)
+            published.set()
+            await release.wait()
+
+    async def contender():
+        async with service._market_transaction_lock(connector_key):
+            CHECK.fail("a queued contender acquired through a live residual")
+
+    holder_task = asyncio.create_task(holder())
+    for _ in range(100):
+        if service._market_lock_users.get(connector_key) == 1:
+            break
+        await asyncio.sleep(0)
+    contender_task = asyncio.create_task(contender())
+    for _ in range(100):
+        if service._market_lock_users.get(connector_key) == 2:
+            break
+        await asyncio.sleep(0)
+    CHECK.assertEqual(2, service._market_lock_users[connector_key])
+
+    publish.set()
+    await published.wait()
+    with pytest.raises(module.ConnectorCapabilityError) as blocked:
+        await asyncio.wait_for(contender_task, 0.2)
+    CHECK.assertEqual("connector_stop_pending", blocked.value.detail["cleanup_code"])
+    CHECK.assertFalse(release.is_set())
+
+    release.set()
+    await holder_task
+    for _ in range(100):
+        if not service._market_locks:
+            break
+        await asyncio.sleep(0)
+    CHECK.assertEqual({}, service._market_lock_users)
+    CHECK.assertEqual({}, service._market_locks)
+
+
+@pytest.mark.asyncio
+async def test_issue224_active_root_blocks_foreign_sync_publish_and_clear():
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    service._ensure_connector_cleanup_state()
+    data_key = ("__data__", "manzana")
+    trading_key = ("acct", "manzana")
+    old_connector = Issue224RepairConnector()
+    service._trading_connectors = {"acct": {"manzana": old_connector}}
+    service._create_data_connector = lambda name: Issue224RepairConnector()
+    service._validate_instance_capabilities = lambda *args: None
+    mutate = asyncio.Event()
+    mutations_done = asyncio.Event()
+    failures = []
+
+    async def foreign_mutator():
+        await mutate.wait()
+        for operation in (
+            lambda: service.get_data_connector("manzana"),
+            lambda: service.clear_trading_connector("acct", "manzana"),
+        ):
+            try:
+                operation()
+            except (module.ConnectorCapabilityError, RuntimeError):
+                failures.append(True)
+        mutations_done.set()
+
+    foreign_task = asyncio.create_task(foreign_mutator())
+    async with service._market_transaction_lock(data_key):
+        async with service._market_transaction_lock(trading_key):
+            mutate.set()
+            await mutations_done.wait()
+            CHECK.assertNotIn("manzana", service._data_connectors)
+            CHECK.assertIs(
+                old_connector,
+                service._trading_connectors["acct"]["manzana"],
+            )
+    await foreign_task
+    CHECK.assertEqual([True, True], failures)
+
+
+@pytest.mark.asyncio
+async def test_issue224_repeated_caller_cancellation_cannot_interrupt_guardian_pruning():
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    service._ensure_connector_cleanup_state()
+    connector_key = ("acct", "manzana")
+    holder_release = asyncio.Event()
+
+    async def holder():
+        async with service._market_transaction_lock(connector_key):
+            await holder_release.wait()
+
+    async def contender():
+        async with service._market_transaction_lock(connector_key):
+            CHECK.fail("cancelled contender acquired the lock")
+
+    holder_task = asyncio.create_task(holder())
+    for _ in range(100):
+        if service._market_lock_users.get(connector_key) == 1:
+            break
+        await asyncio.sleep(0)
+    contender_task = asyncio.create_task(contender())
+    for _ in range(100):
+        if service._market_lock_users.get(connector_key) == 2:
+            break
+        await asyncio.sleep(0)
+    CHECK.assertEqual(2, service._market_lock_users[connector_key])
+
+    for _ in range(8):
+        contender_task.cancel()
+        await asyncio.sleep(0)
+    await asyncio.gather(contender_task, return_exceptions=True)
+    CHECK.assertEqual(1, service._market_lock_users[connector_key])
+    CHECK.assertTrue(service._market_locks[connector_key].locked())
+
+    holder_release.set()
+    await holder_task
+    for _ in range(100):
+        if not service._market_locks:
+            break
+        await asyncio.sleep(0)
+    CHECK.assertEqual({}, service._market_lock_users)
+    CHECK.assertEqual({}, service._market_locks)
+    CHECK.assertEqual({}, service._market_leases)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal_outcome", ["success", "false", "raise", "cancel"]
+)
+async def test_issue224_physical_wrapper_reconciles_before_lease_release(
+    terminal_outcome,
+):
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    service._ensure_connector_cleanup_state()
+    connector_key = ("acct", "manzana")
+    connector = Issue224RepairConnector()
+    service._trading_connectors = {"acct": {"manzana": connector}}
+    service._advance_connector_incarnation(connector_key)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def stop_network():
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release.wait()
+            if terminal_outcome == "cancel":
+                raise
+        if terminal_outcome == "false":
+            return False
+        if terminal_outcome == "raise":
+            raise RuntimeError("PRIVATE-TERMINAL-STOP")
+        return True
+
+    connector.stop_network = stop_network
+    public_stop = asyncio.create_task(
+        service.stop_trading_connector("acct", "manzana")
+    )
+    await entered.wait()
+    public_stop.cancel()
+    await asyncio.gather(public_stop, return_exceptions=True)
+    CHECK.assertTrue(service._market_locks[connector_key].locked())
+
+    release.set()
+    for _ in range(200):
+        if not service._market_locks:
+            break
+        await asyncio.sleep(0)
+    CHECK.assertEqual({}, service._market_locks)
+    CHECK.assertIsNot(
+        connector,
+        service._trading_connectors.get("acct", {}).get("manzana"),
+    )
+    if terminal_outcome == "success":
+        CHECK.assertNotIn(connector_key, service._connector_creation_residuals)
+        phase = service._connector_cleanup_phases[
+            (*connector_key, "network")
+        ]["connector_stop"]
+        CHECK.assertTrue(phase["complete"])
+        CHECK.assertIs(phase["result"], True)
+        CHECK.assertIsNone(phase["error_code"])
+    else:
+        expected_codes = {
+            "false": "connector_stop_returned_false",
+            "raise": "connector_stop_raised",
+            "cancel": "connector_stop_cancelled",
+        }
+        CHECK.assertEqual(
+            expected_codes[terminal_outcome],
+            service._connector_creation_residuals[connector_key]["cleanup_code"],
+        )
+
+
+def test_issue224_account_route_all_400_bodies_match_capability_contract():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from models.connectors import CapabilityErrorResponse
+    from routers import accounts as accounts_router
+    from services.accounts_service import validate_safe_name
+
+    class Accounts:
+        async def delete_account(self, account_name):
+            raise AssertionError("delete_account should not run")
+
+        async def delete_credentials(self, account_name, connector_name):
+            validate_safe_name(account_name, "account name")
+
+        async def add_credentials(self, account_name, connector_name, credentials):
+            validate_safe_name(account_name, "account name")
+            raise RuntimeError("PRIVATE-CREDENTIAL-FAILURE")
+
+    app = FastAPI()
+    app.include_router(accounts_router.router)
+    app.dependency_overrides[accounts_router.get_accounts_service] = Accounts
+    client = TestClient(app)
+    responses = (
+        client.post("/accounts/delete-account", params={"account_name": "bad.name"}),
+        client.post("/accounts/delete-account", params={"account_name": "master_account"}),
+        client.post("/accounts/delete-credential/bad.name/manzana"),
+        client.post(
+            "/accounts/add-credential/acct/manzana",
+            json={"api_key": "SECRET"},
+        ),
+    )
+    for response in responses:
+        CHECK.assertEqual(400, response.status_code, response.text)
+        CapabilityErrorResponse.model_validate(response.json())
+        CHECK.assertIsInstance(response.json()["detail"], dict)
+
+
+@pytest.mark.asyncio
+async def test_issue224_credential_refresh_rollback_precedes_later_update(
+    monkeypatch,
+):
+    from contextlib import asynccontextmanager
+
+    accounts_module = _load_accounts_service_module()
+    transaction_lock = asyncio.Lock()
+    refresh_entered = asyncio.Event()
+    release_refresh = asyncio.Event()
+    file_state = {"content": "OLD"}
+    cache_state = {"connector": "OLD"}
+
+    class ConnectorService:
+        @asynccontextmanager
+        async def credential_transaction(self, account_name, connector_name):
+            async with transaction_lock:
+                yield
+
+        async def stage_connector_keys_already_locked(
+            self, account_name, connector_name, credentials
+        ):
+            return {
+                "connector": types.SimpleNamespace(
+                    value=credentials["api_key"]
+                ),
+                "committed": False,
+            }
+
+        async def commit_staged_connector_keys_already_locked(
+            self, account_name, connector_name, stage
+        ):
+            value = stage["connector"].value
+            file_state["content"] = value
+            cache_state["connector"] = value
+            stage["committed"] = True
+            return stage["connector"]
+
+        async def discard_staged_connector_already_locked(
+            self, account_name, connector_name, stage
+        ):
+            stage["discarded"] = True
+
+    service = object.__new__(accounts_module.AccountsService)
+    service._connector_service = ConnectorService()
+    service.accounts_state = {"acct": {"manzana": ["OLD"]}}
+
+    monkeypatch.setattr(
+        accounts_module.fs_util,
+        "path_exists",
+        lambda path: True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        accounts_module.fs_util,
+        "read_file",
+        lambda path: file_state["content"],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        accounts_module.fs_util,
+        "ensure_file_and_dump_text",
+        lambda path, content: file_state.__setitem__("content", content),
+        raising=False,
+    )
+
+    async def staged_state(connector, *args, **kwargs):
+        if connector.value == "BAD":
+            refresh_entered.set()
+            await release_refresh.wait()
+            raise RuntimeError("refresh_failed")
+        return [connector.value]
+
+    service._get_connector_tokens_info = staged_state
+    rejected = asyncio.create_task(
+        service.add_credentials("acct", "manzana", {"api_key": "BAD"})
+    )
+    await refresh_entered.wait()
+    successor = asyncio.create_task(
+        service.add_credentials("acct", "manzana", {"api_key": "NEW"})
+    )
+    await asyncio.sleep(0)
+    CHECK.assertFalse(successor.done())
+    release_refresh.set()
+    with pytest.raises(RuntimeError, match="refresh_failed"):
+        await rejected
+    await successor
+    CHECK.assertEqual("NEW", file_state["content"])
+    CHECK.assertEqual("NEW", cache_state["connector"])
+    CHECK.assertEqual(["NEW"], service.accounts_state["acct"]["manzana"])
+
+
+@pytest.mark.asyncio
+async def test_issue224_balance_refresh_retries_identity_and_commits_under_authority():
+    from contextlib import asynccontextmanager
+    from decimal import Decimal
+
+    from models.connectors import CapabilityErrorDetail
+    from services.connector_capabilities import ConnectorCapabilityError
+
+    accounts_module = _load_accounts_service_module()
+
+    class Connector:
+        in_flight_orders = {}
+
+        def __init__(self, token):
+            self.token = token
+            self.balance_calls = 0
+
+        def _set_current_timestamp(self, timestamp):
+            pass
+
+        async def _update_balances(self):
+            self.balance_calls += 1
+
+        def get_all_balances(self):
+            return {"USDT": Decimal("2")}
+
+        def get_available_balance(self, token):
+            return Decimal("2")
+
+    old = Connector("OLD")
+    current = Connector("NEW")
+
+    class ConnectorService:
+        def __init__(self):
+            self.authority = False
+
+        @asynccontextmanager
+        async def connector_state_authority(
+            self, connector, connector_name, account_name
+        ):
+            if connector is not current:
+                raise ConnectorCapabilityError(
+                    CapabilityErrorDetail(
+                        code="connector_incarnation_changed",
+                        message="Connector changed while refreshing state",
+                        connector=connector_name,
+                        feature="connector_state",
+                        reason="connector_incarnation_changed",
+                    )
+                )
+            self.authority = True
+            try:
+                yield
+                CHECK.assertEqual(
+                    2.0,
+                    service.accounts_state["acct"]["manzana"][0]["units"],
+                )
+            finally:
+                self.authority = False
+
+        async def _update_connector_state(
+            self, connector, connector_name, account_name
+        ):
+            CHECK.assertTrue(self.authority)
+            await connector._update_balances()
+
+        def get_account_connectors(self, account_name):
+            return {"manzana": current}
+
+    connector_service = ConnectorService()
+    service = object.__new__(accounts_module.AccountsService)
+    service._connector_service = connector_service
+    service._market_data_service = types.SimpleNamespace(
+        get_rate_for_connector=lambda *args: None
+    )
+    service.accounts_state = {"acct": {}}
+    service.require_capability = lambda *args, **kwargs: None
+    service._is_perpetual_connector = lambda connector: False
+
+    result = await service._refresh_account_connector_state(
+        old, "manzana", "acct"
+    )
+    CHECK.assertEqual(0, old.balance_calls)
+    CHECK.assertEqual(1, current.balance_calls)
+    CHECK.assertEqual(result, service.accounts_state["acct"]["manzana"])
+    CHECK.assertFalse(connector_service.authority)

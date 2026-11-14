@@ -5,10 +5,28 @@ from starlette import status
 
 from deps import get_accounts_service, require_gateway_online
 from models import GatewayWalletCredential, SetDefaultWalletRequest
-from models.connectors import CapabilityErrorResponse
+from models.connectors import CapabilityErrorDetail, CapabilityErrorResponse
 from services.accounts_service import AccountsService, validate_safe_name
+from services.connector_capabilities import ConnectorCapabilityError
 
 router = APIRouter(tags=["Accounts"], prefix="/accounts")
+
+
+def _account_mutation_error(
+    code: str,
+    message: str,
+    resource_name: str,
+    reason: str,
+) -> ConnectorCapabilityError:
+    return ConnectorCapabilityError(
+        CapabilityErrorDetail(
+            code=code,
+            message=message,
+            connector=resource_name,
+            feature="account_mutation",
+            reason=reason,
+        )
+    )
 
 
 @router.get("/", response_model=List[str])
@@ -89,9 +107,25 @@ async def delete_account(account_name: str, accounts_service: AccountsService = 
     validate_safe_name(account_name, "account name")
     try:
         if account_name == "master_account":
-            raise HTTPException(status_code=400, detail="Cannot delete master account.")
+            raise _account_mutation_error(
+                "master_account_delete_forbidden",
+                "Cannot delete the master account",
+                account_name,
+                "protected_account",
+            )
         await accounts_service.delete_account(account_name)
         return {"message": "Account deleted successfully."}
+    except ConnectorCapabilityError:
+        raise
+    except HTTPException as exc:
+        if exc.status_code != 400:
+            raise
+        raise _account_mutation_error(
+            "account_delete_failed",
+            "Unable to delete the account",
+            account_name,
+            "account_delete_failed",
+        ) from exc
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -121,6 +155,17 @@ async def delete_credential(
     try:
         await accounts_service.delete_credentials(account_name, connector_name)
         return {"message": "Credential deleted successfully."}
+    except ConnectorCapabilityError:
+        raise
+    except HTTPException as exc:
+        if exc.status_code != 400:
+            raise
+        raise _account_mutation_error(
+            "credential_delete_failed",
+            "Unable to delete connector credentials",
+            connector_name,
+            "credential_delete_failed",
+        ) from exc
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -153,12 +198,26 @@ async def add_credential(
     try:
         await accounts_service.add_credentials(account_name, connector_name, credentials)
         return {"message": "Connector credentials added successfully."}
-    except HTTPException:
+    except ConnectorCapabilityError:
         raise
+    except HTTPException as exc:
+        if exc.status_code != 400:
+            raise
+        raise _account_mutation_error(
+            "credential_update_failed",
+            "Unable to add or update connector credentials",
+            connector_name,
+            "credential_update_failed",
+        ) from exc
     except Exception as e:
-        # Rollback is handled inside add_credentials, which only deletes the file for a
-        # brand-new creation and preserves pre-existing credentials on a failed update.
-        raise HTTPException(status_code=400, detail=str(e))
+        # add_credentials rolls the exact staged connector, file, and account state
+        # back while it still owns same-key transaction authority.
+        raise _account_mutation_error(
+            "credential_update_failed",
+            "Unable to add or update connector credentials",
+            connector_name,
+            "credential_update_failed",
+        ) from e
 
 
 # ============================================

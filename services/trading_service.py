@@ -1007,6 +1007,11 @@ class AccountTradingInterface:
         )
         residual = detail.model_dump(exclude_none=True)
         self._cleanup_residuals[key] = residual
+        notifier = getattr(
+            self._connector_service, "_signal_market_state_change", None
+        )
+        if notifier is not None:
+            notifier((self._account_name, connector_name))
         self._cleanup_owners[key] = {
             "connector": connector,
             "connector_preexisting": connector_preexisting,
@@ -1061,6 +1066,11 @@ class AccountTradingInterface:
             self._cleanup_residuals[key] = detail.model_dump(
                 exclude_none=True
             )
+            notifier = getattr(
+                self._connector_service, "_signal_market_state_change", None
+            )
+            if notifier is not None:
+                notifier((self._account_name, connector_name))
             self._cleanup_owners[key] = {
                 "connector": connector,
                 "connector_preexisting": connector_preexisting,

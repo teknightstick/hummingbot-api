@@ -38,11 +38,21 @@ def validate_safe_name(name: str, label: str = "name") -> str:
     :param name: The name to validate.
     :param label: Human readable label used in the error message.
     :return: The validated name.
-    :raises HTTPException: 400 if the name is invalid.
+    :raises ConnectorCapabilityError: Typed HTTP 400 if the name is invalid.
     """
     if not name or not SAFE_NAME_PATTERN.fullmatch(name):
-        raise HTTPException(status_code=400,
-                            detail=f"Invalid {label}: '{name}'. Only letters, numbers, underscores and hyphens are allowed.")
+        raise ConnectorCapabilityError(
+            CapabilityErrorDetail(
+                code="invalid_account_resource_name",
+                message=(
+                    f"Invalid {label}. Only letters, numbers, underscores "
+                    "and hyphens are allowed."
+                ),
+                connector=name or "account",
+                feature="account_mutation",
+                reason="invalid_name",
+            )
+        )
     return name
 
 
@@ -448,7 +458,12 @@ class AccountsService:
             connector_names: If provided, only update these connectors. If None, update all connectors.
                             For Gateway, this filters by chain-network (e.g., 'solana-mainnet-beta').
         """
-        all_connectors = self._connector_service.get_all_trading_connectors()
+        all_connectors = {
+            account_name: dict(connectors)
+            for account_name, connectors in (
+                self._connector_service.get_all_trading_connectors().items()
+            )
+        }
 
         # Validate the complete selected set before allocating account state or
         # constructing any balance/network coroutine.
@@ -477,9 +492,6 @@ class AccountsService:
                 if connector_names and connector_name not in connector_names:
                     continue
 
-                if account_name not in self.accounts_state:
-                    self.accounts_state[account_name] = {}
-
                 # Gateway connectors only track the tokens of their trading pairs; the full
                 # wallet balance is fetched by _update_gateway_balances below. Running both
                 # would overwrite the complete wallet state with the narrower connector view.
@@ -488,10 +500,10 @@ class AccountsService:
                     continue
 
                 tasks.append(
-                    self._get_connector_tokens_info(
+                    self._refresh_account_connector_state(
                         connector,
                         connector_name,
-                        account_name=account_name,
+                        account_name,
                     )
                 )
                 task_meta.append((account_name, connector_name))
@@ -513,9 +525,6 @@ class AccountsService:
         for (account_name, connector_name), result in zip(task_meta, results):
             if isinstance(result, Exception):
                 logger.error(f"Error updating balances for connector {connector_name} in account {account_name}: {result}")
-                self.accounts_state[account_name][connector_name] = []
-            else:
-                self.accounts_state[account_name][connector_name] = result
 
         if not skip_gateway:
             self._mirror_gateway_state_to_accounts(gateway_meta)
@@ -543,6 +552,7 @@ class AccountsService:
         connector_name: str,
         skip_balance_refresh: bool = False,
         account_name: Optional[str] = None,
+        authority_held: bool = False,
     ) -> List[Dict]:
         """Get token info from a connector instance using the ticker pool prices.
 
@@ -562,7 +572,11 @@ class AccountsService:
         # Fetch fresh balances from the exchange unless caller already did
         if not skip_balance_refresh and hasattr(connector, '_update_balances'):
             try:
-                if account_name is not None:
+                if authority_held:
+                    await self._connector_service._update_connector_state(
+                        connector, connector_name, account_name
+                    )
+                elif account_name is not None:
                     await self._connector_service.refresh_connector_state(
                         connector, connector_name, account_name
                     )
@@ -617,6 +631,44 @@ class AccountsService:
                 tokens_info[info_idx]["value"] = float(price * Decimal(str(tokens_info[info_idx]["units"])))
 
         return tokens_info
+
+    async def _refresh_account_connector_state(
+        self,
+        connector,
+        connector_name: str,
+        account_name: str,
+    ) -> List[Dict]:
+        """Refresh, read, and publish one exact connector under its authority."""
+        candidate = connector
+        for attempt in range(2):
+            try:
+                async with self._connector_service.connector_state_authority(
+                    candidate, connector_name, account_name
+                ):
+                    result = await self._get_connector_tokens_info(
+                        candidate,
+                        connector_name,
+                        account_name=account_name,
+                        authority_held=True,
+                    )
+                    self.accounts_state.setdefault(account_name, {})[
+                        connector_name
+                    ] = result
+                    return result
+            except ConnectorCapabilityError as exc:
+                detail = exc.detail if isinstance(exc.detail, dict) else {}
+                if (
+                    attempt
+                    or detail.get("code") != "connector_incarnation_changed"
+                ):
+                    raise
+                replacement = self._connector_service.get_account_connectors(
+                    account_name
+                ).get(connector_name)
+                if replacement is None or replacement is candidate:
+                    raise
+                candidate = replacement
+        raise RuntimeError("connector_state_retry_exhausted")
     
     async def _safe_get_last_traded_prices(
         self, connector, connector_name, trading_pairs, timeout=10
@@ -687,32 +739,74 @@ class AccountsService:
         validate_safe_name(account_name, "account name")
         validate_safe_name(connector_name, "connector name")
 
-        # Capture the original credential file BEFORE the in-place overwrite performed by
-        # update_connector_keys. This determines whether a failure is a brand-new CREATE
-        # (rollback the partial file) or an UPDATE (restore the previous file byte-for-byte).
+        # Snapshot rollback truth only after acquiring same-key authority. The staged
+        # connector remains unpublished until validation and account-state refresh pass.
         credentials_path = f"credentials/{account_name}/connectors/{connector_name}.yml"
-        credentials_existed = fs_util.path_exists(credentials_path)
-        original_content = fs_util.read_file(credentials_path) if credentials_existed else None
-
-        try:
-            # Update the connector keys (this saves the credentials to file and validates them)
-            connector = await self._connector_service.update_connector_keys(account_name, connector_name, credentials)
-
-            await self.update_account_state()
-        except Exception as e:
-            logger.error(f"Error adding connector credentials for account {account_name}: {e}")
-            # Roll back the file write. For a brand-new creation, delete the partial file. For an
-            # update, update_connector_keys overwrote the previous (valid) credentials in-place, so
-            # we restore the captured original content to keep the file byte-for-byte intact.
-            if not credentials_existed:
-                if fs_util.path_exists(credentials_path):
-                    fs_util.delete_file(
-                        directory=f"credentials/{account_name}/connectors",
-                        file_name=f"{connector_name}.yml",
+        stage = None
+        async with self._connector_service.credential_transaction(
+            account_name, connector_name
+        ):
+            credentials_existed = fs_util.path_exists(credentials_path)
+            original_content = (
+                fs_util.read_file(credentials_path)
+                if credentials_existed
+                else None
+            )
+            account_state_existed = account_name in self.accounts_state
+            connector_state_existed = (
+                account_state_existed
+                and connector_name in self.accounts_state[account_name]
+            )
+            original_connector_state = (
+                self.accounts_state[account_name][connector_name]
+                if connector_state_existed
+                else None
+            )
+            try:
+                stage = await self._connector_service.stage_connector_keys_already_locked(
+                    account_name, connector_name, credentials
+                )
+                staged_state = await self._get_connector_tokens_info(
+                    stage["connector"],
+                    connector_name,
+                    skip_balance_refresh=True,
+                )
+                connector = await self._connector_service.commit_staged_connector_keys_already_locked(
+                    account_name, connector_name, stage
+                )
+                if connector is not stage["connector"]:
+                    raise RuntimeError("credential_connector_commit_mismatch")
+                self.accounts_state.setdefault(account_name, {})[
+                    connector_name
+                ] = staged_state
+            except BaseException:
+                logger.error(
+                    "Error adding connector credentials for account %s",
+                    account_name,
+                )
+                if stage is not None:
+                    await self._connector_service.discard_staged_connector_already_locked(
+                        account_name, connector_name, stage
                     )
-            elif original_content is not None:
-                fs_util.ensure_file_and_dump_text(credentials_path, original_content)
-            raise e
+                if not credentials_existed:
+                    if fs_util.path_exists(credentials_path):
+                        fs_util.delete_file(
+                            directory=f"credentials/{account_name}/connectors",
+                            file_name=f"{connector_name}.yml",
+                        )
+                elif original_content is not None:
+                    fs_util.ensure_file_and_dump_text(
+                        credentials_path, original_content
+                    )
+                if connector_state_existed:
+                    self.accounts_state.setdefault(account_name, {})[
+                        connector_name
+                    ] = original_connector_state
+                elif account_name in self.accounts_state:
+                    self.accounts_state[account_name].pop(connector_name, None)
+                    if not account_state_existed and not self.accounts_state[account_name]:
+                        self.accounts_state.pop(account_name, None)
+                raise
 
     @staticmethod
     def list_accounts():
@@ -745,23 +839,28 @@ class AccountsService:
         """
         validate_safe_name(account_name, "account name")
         validate_safe_name(connector_name, "connector name")
-        # Physical connector truth commits first. A bounded residual leaves the
-        # credential file, connector cache, and account state byte-for-byte intact.
-        await self._connector_service.stop_trading_connector(account_name, connector_name)
-
-        credentials_path = f"credentials/{account_name}/connectors/{connector_name}.yml"
-        if fs_util.path_exists(credentials_path):
-            fs_util.delete_file(
-                directory=f"credentials/{account_name}/connectors",
-                file_name=f"{connector_name}.yml",
+        async with self._connector_service.credential_transaction(
+            account_name, connector_name
+        ):
+            detail = await self._connector_service._stop_trading_connector_already_locked(
+                account_name, connector_name
             )
+            if detail is not None:
+                raise ConnectorCapabilityError(detail)
 
-        # Clear the connector from cache
-        self._connector_service.clear_trading_connector(account_name, connector_name)
-
-        # Remove from account state
-        if account_name in self.accounts_state and connector_name in self.accounts_state[account_name]:
-            self.accounts_state[account_name].pop(connector_name)
+            credentials_path = (
+                f"credentials/{account_name}/connectors/{connector_name}.yml"
+            )
+            if fs_util.path_exists(credentials_path):
+                fs_util.delete_file(
+                    directory=f"credentials/{account_name}/connectors",
+                    file_name=f"{connector_name}.yml",
+                )
+            self._connector_service.clear_trading_connector_already_locked(
+                account_name, connector_name
+            )
+            if account_name in self.accounts_state:
+                self.accounts_state[account_name].pop(connector_name, None)
 
     def add_account(self, account_name: str):
         """

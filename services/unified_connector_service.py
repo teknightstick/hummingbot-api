@@ -92,6 +92,7 @@ class _MarketTransactionLease:
         "frames",
         "guardian_task",
         "lock",
+        "pruned",
         "release_requested",
         "root_exited",
         "root_task",
@@ -104,6 +105,7 @@ class _MarketTransactionLease:
         self.frames: Dict[asyncio.Task, Optional[asyncio.Task]] = {}
         self.guardian_task: Optional[asyncio.Task] = None
         self.lock: Optional[asyncio.Lock] = lock
+        self.pruned = False
         self.release_requested = asyncio.Event()
         self.root_exited = False
         self.root_task: Optional[asyncio.Task] = owner_task
@@ -240,6 +242,8 @@ class UnifiedConnectorService:
         self._market_leases: Dict[
             Tuple[str, str], _MarketTransactionLease
         ] = {}
+        self._market_state_versions: Dict[Tuple[str, str], int] = {}
+        self._market_state_waiters: Dict[Tuple[str, str], asyncio.Future] = {}
         self._market_locks_guard = asyncio.Lock()
         self._market_pair_owners: Dict[Tuple[str, str, str], Set[object]] = {}
         self._market_cleanup_residuals: Dict[Tuple[str, ...], Dict[str, Any]] = {}
@@ -410,6 +414,10 @@ class UnifiedConnectorService:
             self._market_lock_users = {}
         if not hasattr(self, "_market_leases"):
             self._market_leases = {}
+        if not hasattr(self, "_market_state_versions"):
+            self._market_state_versions = {}
+        if not hasattr(self, "_market_state_waiters"):
+            self._market_state_waiters = {}
         if not hasattr(self, "_market_locks_guard"):
             self._market_locks_guard = asyncio.Lock()
         market_defaults = (
@@ -557,6 +565,7 @@ class UnifiedConnectorService:
                 )
                 residual = detail.model_dump(exclude_none=True)
                 self._connector_creation_residuals[connector_key] = residual
+                self._signal_market_state_change(connector_key)
                 raise ConnectorCapabilityError(detail)
 
             try:
@@ -588,30 +597,53 @@ class UnifiedConnectorService:
             for task in tasks
         )
 
+    def _market_state_change_snapshot(
+        self, connector_key: Tuple[str, str]
+    ) -> Tuple[int, asyncio.Future]:
+        """Return a race-free generation and waiter for same-key state changes."""
+        self._ensure_connector_cleanup_state()
+        waiter = self._market_state_waiters.get(connector_key)
+        if waiter is None or waiter.done():
+            waiter = asyncio.get_running_loop().create_future()
+            self._market_state_waiters[connector_key] = waiter
+        return self._market_state_versions.get(connector_key, 0), waiter
+
+    def _signal_market_state_change(
+        self, connector_key: Tuple[str, str]
+    ) -> None:
+        """Wake queued guardians whenever lease or residual truth changes."""
+        self._ensure_connector_cleanup_state()
+        self._market_state_versions[connector_key] = (
+            self._market_state_versions.get(connector_key, 0) + 1
+        )
+        waiter = self._market_state_waiters.pop(connector_key, None)
+        if waiter is not None and not waiter.done():
+            waiter.set_result(None)
+
     def _market_mutation_preflight_detail(
         self,
         connector_key: Tuple[str, str],
         trading_pair: Optional[str] = None,
         *,
         current_lease: Optional[_MarketTransactionLease] = None,
+        allow_active_lease_wait: bool = False,
     ) -> Optional[CapabilityErrorDetail]:
         """Return same-key live cleanup truth before another mutator can queue."""
         self._ensure_connector_cleanup_state()
         lease = self._market_leases.get(connector_key)
         if lease is not None and lease.active:
             lease.reap_terminal_frames()
-        retained_lease = bool(
+        foreign_lease = bool(
             lease is not None
             and lease is not current_lease
             and lease.active
-            and any(not task.done() for task in lease.frames)
         )
         live_tasks = self._tasks_have_live_work(
             self._connector_residual_tasks, connector_key
         ) or self._tasks_have_live_work(
             self._market_residual_tasks, connector_key
         )
-        if not retained_lease and not live_tasks:
+        if not foreign_lease and not live_tasks:
             return None
 
         market_residuals = self._market_cleanup_residuals
@@ -633,6 +665,9 @@ class UnifiedConnectorService:
         residual = self._connector_creation_residuals.get(connector_key)
         if residual is not None:
             return CapabilityErrorDetail.model_validate(residual)
+
+        if foreign_lease and allow_active_lease_wait and not live_tasks:
+            return None
 
         account_name, connector_name = connector_key
         live_owner_kinds = {
@@ -668,11 +703,13 @@ class UnifiedConnectorService:
         trading_pair: Optional[str] = None,
         *,
         current_lease: Optional[_MarketTransactionLease] = None,
+        allow_active_lease_wait: bool = False,
     ) -> None:
         detail = self._market_mutation_preflight_detail(
             connector_key,
             trading_pair,
             current_lease=current_lease,
+            allow_active_lease_wait=allow_active_lease_wait,
         )
         if detail is not None:
             raise ConnectorCapabilityError(detail)
@@ -730,13 +767,55 @@ class UnifiedConnectorService:
             lease.exit_root()
             if transaction_token is None:
                 guardian_task.cancel()
-                await asyncio.gather(guardian_task, return_exceptions=True)
+                await self._await_market_guardian(guardian_task)
             elif not lease.frames:
-                try:
-                    await asyncio.shield(guardian_task)
-                except asyncio.CancelledError:
-                    if guardian_task.done():
-                        guardian_task.result()
+                await self._await_market_guardian(guardian_task)
+
+    @staticmethod
+    async def _await_market_guardian(guardian_task: asyncio.Task) -> None:
+        """Reap a guardian without forwarding repeated caller cancellation."""
+        cancelled = False
+        while not guardian_task.done():
+            try:
+                await asyncio.shield(guardian_task)
+            except asyncio.CancelledError:
+                cancelled = True
+                continue
+        try:
+            guardian_task.result()
+        except asyncio.CancelledError:
+            pass
+        if cancelled:
+            raise asyncio.CancelledError()
+
+    def _finish_market_guardian(
+        self,
+        connector_key: Tuple[str, str],
+        lock: asyncio.Lock,
+        lease: _MarketTransactionLease,
+        acquired: bool,
+    ) -> None:
+        """Synchronously release and prune exactly once, even under cancellation."""
+        if lease.pruned:
+            return
+        lease.pruned = True
+        lease.close()
+        if acquired and lock.locked():
+            lock.release()
+        if self._market_leases.get(connector_key) is lease:
+            self._market_leases.pop(connector_key, None)
+        users = max(self._market_lock_users.get(connector_key, 1) - 1, 0)
+        if users:
+            self._market_lock_users[connector_key] = users
+            self._signal_market_state_change(connector_key)
+        else:
+            self._market_lock_users.pop(connector_key, None)
+            if self._market_locks.get(connector_key) is lock:
+                self._market_locks.pop(connector_key, None)
+            waiter = self._market_state_waiters.pop(connector_key, None)
+            if waiter is not None and not waiter.done():
+                waiter.set_result(None)
+            self._market_state_versions.pop(connector_key, None)
 
     async def _guard_market_transaction_lock(
         self,
@@ -746,11 +825,34 @@ class UnifiedConnectorService:
     ) -> None:
         """Own acquisition, terminal release, and registry pruning for a lease."""
         acquired = False
+        acquire_task = asyncio.create_task(lock.acquire())
         try:
-            await lock.acquire()
+            while not acquire_task.done():
+                version, state_changed = self._market_state_change_snapshot(
+                    connector_key
+                )
+                detail = self._market_mutation_preflight_detail(
+                    connector_key, allow_active_lease_wait=True
+                )
+                if detail is not None:
+                    acquire_task.cancel()
+                    await asyncio.gather(acquire_task, return_exceptions=True)
+                    if not lease.acquired.done():
+                        lease.acquired.set_exception(
+                            ConnectorCapabilityError(detail)
+                        )
+                    return
+                if self._market_state_versions.get(connector_key, 0) != version:
+                    continue
+                await asyncio.wait(
+                    {acquire_task, state_changed},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            acquire_task.result()
             acquired = True
             async with self._market_locks_guard:
                 self._market_leases[connector_key] = lease
+            self._signal_market_state_change(connector_key)
             if not lease.acquired.done():
                 lease.acquired.set_result(None)
             await lease.release_requested.wait()
@@ -763,19 +865,12 @@ class UnifiedConnectorService:
                 lease.acquired.set_exception(exc)
             raise
         finally:
-            lease.close()
-            if acquired:
-                lock.release()
-            async with self._market_locks_guard:
-                if self._market_leases.get(connector_key) is lease:
-                    self._market_leases.pop(connector_key, None)
-                users = self._market_lock_users.get(connector_key, 1) - 1
-                if users:
-                    self._market_lock_users[connector_key] = users
-                else:
-                    self._market_lock_users.pop(connector_key, None)
-                    if self._market_locks.get(connector_key) is lock:
-                        self._market_locks.pop(connector_key, None)
+            if not acquire_task.done():
+                acquire_task.cancel()
+                acquire_task.add_done_callback(self._consume_background_task_result)
+            self._finish_market_guardian(
+                connector_key, lock, lease, acquired
+            )
 
     def _retain_market_transaction_descendant(
         self,
@@ -813,10 +908,20 @@ class UnifiedConnectorService:
         self, connector_key: Tuple[str, str]
     ) -> bool:
         lease = self._active_market_transaction_lease(connector_key)
-        current_task = asyncio.current_task()
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
         if lease is None or current_task is None:
             return False
         return lease.root_task is current_task and not lease.frames
+
+    def _exact_market_transaction_lease(
+        self, connector_key: Tuple[str, str]
+    ) -> Optional[_MarketTransactionLease]:
+        """Return authority only to the exact active root task."""
+        lease = self._active_market_transaction_lease(connector_key)
+        return lease if self._is_market_transaction_participant(connector_key) else None
 
     def _market_transaction_has_live_descendant(
         self, connector_key: Tuple[str, str]
@@ -928,11 +1033,12 @@ class UnifiedConnectorService:
         if connector_name not in self._data_connectors:
             self._ensure_connector_cleanup_state()
             connector_key = self._connector_key("__data__", connector_name)
-            self._raise_market_mutation_preflight(connector_key)
-            lease = self._active_market_transaction_lease(connector_key)
-            if lease is not None and not self._is_market_transaction_participant(
-                connector_key
-            ):
+            lease = self._exact_market_transaction_lease(connector_key)
+            self._raise_market_mutation_preflight(
+                connector_key, current_lease=lease
+            )
+            inherited_lease = self._active_market_transaction_lease(connector_key)
+            if inherited_lease is not None and lease is None:
                 raise RuntimeError("market_transaction_authority_unavailable")
             residual = self._connector_creation_residuals.get(connector_key)
             if residual is None and self._connector_has_private_state(connector_key):
@@ -950,6 +1056,7 @@ class UnifiedConnectorService:
                 )
                 residual = detail.model_dump(exclude_none=True)
                 self._connector_creation_residuals[connector_key] = residual
+                self._signal_market_state_change(connector_key)
             if residual is not None:
                 raise ConnectorCapabilityError(
                     CapabilityErrorDetail.model_validate(residual)
@@ -2027,6 +2134,7 @@ class UnifiedConnectorService:
         self._connector_creation_residuals[connector_key] = detail.model_dump(
             exclude_none=True
         )
+        self._signal_market_state_change(connector_key)
         return ConnectorCapabilityError(detail)
 
     @staticmethod
@@ -2080,6 +2188,7 @@ class UnifiedConnectorService:
                     self._connector_creation_residuals[
                         snapshot["connector_key"]
                     ] = detail.model_dump(exclude_none=True)
+                    self._signal_market_state_change(snapshot["connector_key"])
                 raise ConnectorCapabilityError(detail)
             return
 
@@ -2183,6 +2292,7 @@ class UnifiedConnectorService:
             self._connector_creation_residuals[connector_key] = (
                 detail.model_dump(exclude_none=True)
             )
+            self._signal_market_state_change(connector_key)
             logger.error(
                 "Public transaction cleanup failed for %s/%s (%s)",
                 connector_key[0],
@@ -2516,6 +2626,7 @@ class UnifiedConnectorService:
                 self._connector_creation_residuals[connector_key] = (
                     cleanup_detail.model_dump(exclude_none=True)
                 )
+                self._signal_market_state_change(connector_key)
             raise ConnectorCapabilityError(cleanup_detail)
 
     def _purge_trading_pair_registration(
@@ -3175,9 +3286,23 @@ class UnifiedConnectorService:
         creation_owner: Dict[str, Any],
     ) -> ConnectorBase:
         """Create and fully initialize a trading connector."""
-        # Authenticate and create connector
         connector = self._create_trading_connector(account_name, connector_name)
         creation_owner["connector"] = connector
+        await self._initialize_trading_connector_candidate(
+            connector, account_name, connector_name
+        )
+        await self._activate_trading_connector_candidate(
+            connector, account_name, connector_name
+        )
+        return connector
+
+    async def _initialize_trading_connector_candidate(
+        self,
+        connector: ConnectorBase,
+        account_name: str,
+        connector_name: str,
+    ) -> None:
+        """Validate credentials and remote state without publishing the candidate."""
         self._validate_instance_capabilities(connector_name, connector)
         setattr(connector, "_api_cleanup_account", account_name)
         setattr(connector, "_api_cleanup_connector", connector_name)
@@ -3196,6 +3321,14 @@ class UnifiedConnectorService:
             if PositionMode.HEDGE in connector.supported_position_modes():
                 connector.set_position_mode(PositionMode.HEDGE)
             await connector._update_positions()
+
+    async def _activate_trading_connector_candidate(
+        self,
+        connector: ConnectorBase,
+        account_name: str,
+        connector_name: str,
+    ) -> None:
+        """Start private runtime state before one synchronous publication."""
 
         # Load existing orders from database
         if self.db_manager:
@@ -3235,7 +3368,6 @@ class UnifiedConnectorService:
         # rejected before the caller can publish the connector in its cache.
         self._validate_instance_capabilities(connector_name, connector)
         logger.info(f"Initialized trading connector {connector_name} for {account_name}")
-        return connector
 
     @property
     def connector_creation_residuals(self) -> Dict[str, Dict[str, Any]]:
@@ -3301,6 +3433,143 @@ class UnifiedConnectorService:
                     pass
         return True
 
+    def _unpublish_terminal_connector(
+        self,
+        owner_key: Tuple[str, str, str],
+        phase: Mapping[str, Any],
+    ) -> None:
+        """Remove only the exact physical connector whose stop is terminal."""
+        connector_key = owner_key[:2]
+        authority = phase.get("authority", _OWNER_AUTHORITY_UNSET)
+        incarnation = phase.get("authority_incarnation", _OWNER_AUTHORITY_UNSET)
+        if authority is _OWNER_AUTHORITY_UNSET:
+            return
+        if (
+            incarnation is not _OWNER_AUTHORITY_UNSET
+            and self._connector_incarnation(connector_key) != incarnation
+        ):
+            return
+        if self._cached_public_connector(connector_key) is not authority:
+            return
+        account_name, connector_name = connector_key
+        if account_name == "__data__":
+            self._data_connectors.pop(connector_name, None)
+            self._data_connectors_started.pop(connector_name, None)
+            return
+        account_connectors = self._trading_connectors.get(account_name)
+        if account_connectors is not None:
+            account_connectors.pop(connector_name, None)
+            if not account_connectors:
+                self._trading_connectors.pop(account_name, None)
+
+    async def _reconcile_owner_operation_terminal(
+        self,
+        owner_key: Tuple[str, str, str],
+        phase_name: str,
+        phase: Dict[str, Any],
+    ) -> None:
+        """Commit terminal owner, phase, and cache truth before lease release."""
+        task = asyncio.current_task()
+        retained = self._connector_residual_tasks.get(owner_key)
+        if retained is not None and task is not None:
+            retained.discard(task)
+            if not retained:
+                self._connector_residual_tasks.pop(owner_key, None)
+        if phase_name != "connector_stop":
+            return
+
+        authority = phase.get("authority", _OWNER_AUTHORITY_UNSET)
+        if authority is not _OWNER_AUTHORITY_UNSET:
+            tasks = set(phase.get("terminal_tasks", ()))
+            if not await self._drain_owner_tasks(owner_key, tasks):
+                if phase.get("error_code") is None:
+                    phase["error_code"] = "task_cleanup_pending"
+        self._unpublish_terminal_connector(owner_key, phase)
+        connector_key = owner_key[:2]
+        error_code = phase.get("error_code")
+        for market_key, market_phase in tuple(
+            self._market_cleanup_phases.items()
+        ):
+            if (
+                market_key[:2] != connector_key
+                or len(market_key) < 4
+                or market_key[2] != "remote_cleanup"
+                or not isinstance(market_phase, dict)
+            ):
+                continue
+            market_phase["complete"] = True
+            market_phase["result"] = phase.get("result")
+            market_phase["error_code"] = error_code
+            retained_market = self._market_residual_tasks.get(market_key)
+            if retained_market is not None:
+                for retained_task in tuple(retained_market):
+                    if retained_task.done():
+                        retained_market.discard(retained_task)
+                        self._consume_background_task_result(retained_task)
+                if not retained_market:
+                    self._market_residual_tasks.pop(market_key, None)
+        if error_code is None:
+            self._connector_creation_residuals.pop(connector_key, None)
+            self._signal_market_state_change(connector_key)
+            return
+
+        detail = CapabilityErrorDetail(
+            code="connector_cleanup_residual",
+            message=(
+                f"Connector cleanup is incomplete for "
+                f"'{connector_key[0]}:{connector_key[1]}'"
+            ),
+            connector=connector_key[1],
+            feature="connector_cleanup",
+            reason="cleanup_incomplete",
+            cleanup_scope="connector",
+            cleanup_code=error_code,
+        )
+        self._connector_creation_residuals[connector_key] = detail.model_dump(
+            exclude_none=True
+        )
+        self._signal_market_state_change(connector_key)
+
+    async def _owner_operation_wrapper(
+        self,
+        owner_key: Tuple[str, str, str],
+        phase_name: str,
+        phase: Dict[str, Any],
+        awaitable,
+    ):
+        """Keep retained authority until terminal truth has been reconciled."""
+        try:
+            result = await awaitable
+        except asyncio.CancelledError:
+            phase["complete"] = True
+            phase["error_code"] = f"{phase_name}_cancelled"
+            await self._reconcile_owner_operation_terminal(
+                owner_key, phase_name, phase
+            )
+            return None
+        except Exception as exc:
+            phase["complete"] = True
+            phase["error_code"] = f"{phase_name}_raised"
+            logger.error(
+                "Cleanup phase %s failed for %s/%s (%s)",
+                phase_name,
+                owner_key[0],
+                owner_key[1],
+                type(exc).__name__,
+            )
+            await self._reconcile_owner_operation_terminal(
+                owner_key, phase_name, phase
+            )
+            return None
+        phase["complete"] = True
+        phase["result"] = result
+        if result is False:
+            phase["error_code"] = f"{phase_name}_returned_false"
+        await self._reconcile_owner_operation_terminal(
+            owner_key, phase_name, phase
+        )
+        return result
+
     async def _run_owner_operation(
         self,
         owner_key: Tuple[str, str, str],
@@ -3310,8 +3579,9 @@ class UnifiedConnectorService:
         timeout: float = _CONNECTOR_CLEANUP_TIMEOUT,
         authority=_OWNER_AUTHORITY_UNSET,
         authority_incarnation=_OWNER_AUTHORITY_UNSET,
+        terminal_tasks: Optional[Set[asyncio.Task]] = None,
     ):
-        """Run one non-repeatable cleanup phase and retain its exact task/result."""
+        """Run one non-repeatable phase through a retained terminal wrapper."""
         self._ensure_connector_cleanup_state()
         owner_phases = self._connector_cleanup_phases.setdefault(owner_key, {})
         phase = owner_phases.get(phase_name)
@@ -3326,17 +3596,14 @@ class UnifiedConnectorService:
             if authority is not _OWNER_AUTHORITY_UNSET:
                 phase["authority"] = authority
                 phase["authority_incarnation"] = authority_incarnation
+                phase["terminal_tasks"] = tuple(terminal_tasks or ())
             owner_phases[phase_name] = phase
         elif authority is not _OWNER_AUTHORITY_UNSET:
-            retained_authority = phase.get(
-                "authority", _OWNER_AUTHORITY_UNSET
-            )
-            retained_incarnation = phase.get(
-                "authority_incarnation", _OWNER_AUTHORITY_UNSET
-            )
             if (
-                retained_authority is not authority
-                or retained_incarnation != authority_incarnation
+                phase.get("authority", _OWNER_AUTHORITY_UNSET) is not authority
+                or phase.get(
+                    "authority_incarnation", _OWNER_AUTHORITY_UNSET
+                ) != authority_incarnation
             ):
                 raise RuntimeError(f"{phase_name}_authority_mismatch")
         if phase["complete"]:
@@ -3353,12 +3620,8 @@ class UnifiedConnectorService:
                     raise
                 phase["complete"] = True
                 phase["error_code"] = f"{phase_name}_raised"
-                logger.error(
-                    "Cleanup phase %s failed for %s/%s (%s)",
-                    phase_name,
-                    owner_key[0],
-                    owner_key[1],
-                    type(exc).__name__,
+                await self._reconcile_owner_operation_terminal(
+                    owner_key, phase_name, phase
                 )
                 raise RuntimeError(phase["error_code"]) from None
             if not inspect.isawaitable(result):
@@ -3366,9 +3629,17 @@ class UnifiedConnectorService:
                 phase["result"] = result
                 if result is False:
                     phase["error_code"] = f"{phase_name}_returned_false"
+                await self._reconcile_owner_operation_terminal(
+                    owner_key, phase_name, phase
+                )
+                if phase["error_code"] is not None:
                     raise RuntimeError(phase["error_code"])
                 return result
-            task = asyncio.ensure_future(result)
+            task = asyncio.create_task(
+                self._owner_operation_wrapper(
+                    owner_key, phase_name, phase, result
+                )
+            )
             phase["task"] = task
             connector_key = owner_key[:2]
             lease = self._active_market_transaction_lease(connector_key)
@@ -3377,6 +3648,9 @@ class UnifiedConnectorService:
             ):
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
+                close_awaitable = getattr(result, "close", None)
+                if callable(close_awaitable):
+                    close_awaitable()
                 phase["task"] = None
                 phase["complete"] = True
                 phase["error_code"] = f"{phase_name}_authority_unavailable"
@@ -3403,34 +3677,13 @@ class UnifiedConnectorService:
                 self._connector_residual_tasks.setdefault(owner_key, set()).add(task)
                 raise RuntimeError(f"{phase_name}_pending")
 
-        retained = self._connector_residual_tasks.get(owner_key)
-        if retained is not None:
-            retained.discard(task)
-            if not retained:
-                self._connector_residual_tasks.pop(owner_key, None)
         try:
-            result = task.result()
-        except asyncio.CancelledError:
-            phase["complete"] = True
-            phase["error_code"] = f"{phase_name}_cancelled"
-            raise RuntimeError(phase["error_code"]) from None
-        except Exception as exc:
-            phase["complete"] = True
-            phase["error_code"] = f"{phase_name}_raised"
-            logger.error(
-                "Cleanup phase %s failed for %s/%s (%s)",
-                phase_name,
-                owner_key[0],
-                owner_key[1],
-                type(exc).__name__,
-            )
-            raise RuntimeError(phase["error_code"]) from None
-        phase["complete"] = True
-        phase["result"] = result
-        if result is False:
-            phase["error_code"] = f"{phase_name}_returned_false"
+            task.result()
+        except (asyncio.CancelledError, Exception):
+            pass
+        if phase["error_code"] is not None:
             raise RuntimeError(phase["error_code"])
-        return result
+        return phase["result"]
 
     def _finish_owner_cleanup(self, owner_key: Tuple[str, str, str]) -> None:
         """Discard phase truth only after the complete owner transaction succeeds."""
@@ -3636,6 +3889,7 @@ class UnifiedConnectorService:
             cleanup_code=cleanup_codes[0],
         )
         residuals[connector_key] = detail.model_dump(exclude_none=True)
+        self._signal_market_state_change(connector_key)
         return detail
 
     async def _complete_failed_connector_creation(
@@ -3681,7 +3935,9 @@ class UnifiedConnectorService:
     def _create_trading_connector(
         self,
         account_name: str,
-        connector_name: str
+        connector_name: str,
+        *,
+        api_keys: Optional[Dict[str, Any]] = None,
     ) -> ConnectorBase:
         """Create a trading connector with API keys.
 
@@ -3689,10 +3945,11 @@ class UnifiedConnectorService:
         Gateway connector which auto-detects chain/network and uses the default wallet.
         The dex_name and trading_type are passed to methods, not to the connector.
         """
-        BackendAPISecurity.login_account(
-            account_name=account_name,
-            secrets_manager=self.secrets_manager
-        )
+        if api_keys is None:
+            BackendAPISecurity.login_account(
+                account_name=account_name,
+                secrets_manager=self.secrets_manager
+            )
 
         # Check if this is a Gateway network connector
         # Gateway connectors are NOT in AllConnectorSettings (those are exchange connectors)
@@ -3706,7 +3963,11 @@ class UnifiedConnectorService:
             )
 
         conn_setting = self._conn_settings[connector_name]
-        keys = BackendAPISecurity.api_keys(connector_name)
+        keys = (
+            BackendAPISecurity.api_keys(connector_name)
+            if api_keys is None
+            else api_keys
+        )
 
         init_params = conn_setting.conn_init_parameters(
             trading_pairs=[],
@@ -3955,6 +4216,7 @@ class UnifiedConnectorService:
                     connector.stop_network,
                     authority=connector,
                     authority_incarnation=authority_incarnation,
+                    terminal_tasks=tasks,
                 )
             except asyncio.CancelledError:
                 raise
@@ -4033,6 +4295,7 @@ class UnifiedConnectorService:
             stop_network,
             authority=connector,
             authority_incarnation=authority_incarnation,
+            terminal_tasks=tasks,
         )
         if collect_connector_tasks:
             tasks.update(self._collect_connector_tasks(connector))
@@ -4051,6 +4314,21 @@ class UnifiedConnectorService:
         Delegates to the internal _update_connector_state implementation so callers
         in sibling services don't depend on the underscore-prefixed helper.
         """
+        async with self.connector_state_authority(
+            connector, connector_name, account_name
+        ):
+            await self._update_connector_state(
+                connector, connector_name, account_name
+            )
+
+    @asynccontextmanager
+    async def connector_state_authority(
+        self,
+        connector: ConnectorBase,
+        connector_name: str,
+        account_name: Optional[str] = None,
+    ):
+        """Keep one exact live connector stable through refresh, reads, and commit."""
         connector_key = self._connector_key(
             account_name or "__data__", connector_name
         )
@@ -4069,9 +4347,7 @@ class UnifiedConnectorService:
                             reason="connector_incarnation_changed",
                         )
                     )
-                await self._update_connector_state(
-                    connector, connector_name, account_name
-                )
+                yield
 
     async def _update_connector_state(
         self,
@@ -4599,6 +4875,120 @@ class UnifiedConnectorService:
     # Credentials and Configuration
     # =========================================================================
 
+    @asynccontextmanager
+    async def credential_transaction(
+        self, account_name: str, connector_name: str
+    ):
+        """Hold exact connector authority across file, cache, and account state."""
+        connector_key = self._connector_key(account_name, connector_name)
+        async with self._market_transaction_lock(connector_key) as token:
+            yield token
+
+    def _require_exact_market_root(
+        self, connector_key: Tuple[str, str]
+    ) -> _MarketTransactionLease:
+        lease = self._exact_market_transaction_lease(connector_key)
+        if lease is None:
+            raise RuntimeError("market_transaction_authority_unavailable")
+        return lease
+
+    async def stage_connector_keys_already_locked(
+        self,
+        account_name: str,
+        connector_name: str,
+        keys: dict,
+    ) -> Dict[str, Any]:
+        """Validate a replacement connector without publishing file or cache state."""
+        connector_key = self._connector_key(account_name, connector_name)
+        self._require_exact_market_root(connector_key)
+        if not BackendAPISecurity.login_account(
+            account_name=account_name,
+            secrets_manager=self.secrets_manager,
+        ):
+            raise ValueError(f"Failed to authenticate for {account_name}")
+
+        connector_config = HummingbotAPIConfigAdapter(
+            AllConnectorSettings.get_connector_config_keys(connector_name)
+        )
+        for key, value in keys.items():
+            setattr(connector_config, key, value)
+        api_keys = api_keys_from_connector_config_map(connector_config)
+        connector = self._create_trading_connector(
+            account_name, connector_name, api_keys=api_keys
+        )
+        stage = {
+            "connector": connector,
+            "config": connector_config,
+            "activated": False,
+            "committed": False,
+        }
+        try:
+            await self._initialize_trading_connector_candidate(
+                connector, account_name, connector_name
+            )
+        except BaseException:
+            await self.discard_staged_connector_already_locked(
+                account_name, connector_name, stage
+            )
+            raise
+        return stage
+
+    async def discard_staged_connector_already_locked(
+        self,
+        account_name: str,
+        connector_name: str,
+        stage: Mapping[str, Any],
+    ) -> None:
+        """Stop only the exact unpublished/rejected replacement candidate."""
+        connector_key = self._connector_key(account_name, connector_name)
+        self._require_exact_market_root(connector_key)
+        connector = stage.get("connector")
+        if connector is None or stage.get("discarded"):
+            return
+        if isinstance(stage, dict):
+            stage["discarded"] = True
+        if self._cached_public_connector(connector_key) is connector:
+            account_connectors = self._trading_connectors.get(account_name, {})
+            account_connectors.pop(connector_name, None)
+            if not account_connectors:
+                self._trading_connectors.pop(account_name, None)
+        await self._stop_connector_network(
+            connector, account_name, connector_name
+        )
+
+    async def commit_staged_connector_keys_already_locked(
+        self,
+        account_name: str,
+        connector_name: str,
+        stage: Dict[str, Any],
+    ) -> ConnectorBase:
+        """Stop the old generation, activate the candidate, then publish atomically."""
+        connector_key = self._connector_key(account_name, connector_name)
+        self._require_exact_market_root(connector_key)
+        connector = stage["connector"]
+        detail = await self._stop_trading_connector_already_locked(
+            account_name, connector_name
+        )
+        if detail is not None:
+            raise ConnectorCapabilityError(detail)
+
+        await self._activate_trading_connector_candidate(
+            connector, account_name, connector_name
+        )
+        stage["activated"] = True
+        BackendAPISecurity.update_connector_keys(
+            account_name, stage["config"]
+        )
+        BackendAPISecurity.decrypt_all(account_name=account_name)
+        self._trading_connectors.setdefault(account_name, {})[
+            connector_name
+        ] = connector
+        self._advance_connector_incarnation(connector_key)
+        self._connector_creation_residuals.pop(connector_key, None)
+        stage["committed"] = True
+        self._signal_market_state_change(connector_key)
+        return connector
+
     async def update_connector_keys(
         self,
         account_name: str,
@@ -4606,34 +4996,33 @@ class UnifiedConnectorService:
         keys: dict
     ) -> ConnectorBase:
         """Update API keys and recreate connector."""
-        if not BackendAPISecurity.login_account(
-            account_name=account_name,
-            secrets_manager=self.secrets_manager
-        ):
-            raise ValueError(f"Failed to authenticate for {account_name}")
-
-        connector_config = HummingbotAPIConfigAdapter(
-            AllConnectorSettings.get_connector_config_keys(connector_name)
-        )
-
-        for key, value in keys.items():
-            setattr(connector_config, key, value)
-
         connector_key = self._connector_key(account_name, connector_name)
         async with self._market_transaction_lock(connector_key):
-            # Reconcile the old physical connector before committing credential
-            # bytes. A bounded residual must leave both file and cache truth intact.
-            detail = await self._stop_trading_connector_already_locked(
-                account_name, connector_name
+            stage = await self.stage_connector_keys_already_locked(
+                account_name, connector_name, keys
             )
-            if detail is not None:
-                raise ConnectorCapabilityError(detail)
+            try:
+                return await self.commit_staged_connector_keys_already_locked(
+                    account_name, connector_name, stage
+                )
+            except BaseException:
+                if not stage.get("committed"):
+                    await self.discard_staged_connector_already_locked(
+                        account_name, connector_name, stage
+                    )
+                raise
 
-            BackendAPISecurity.update_connector_keys(account_name, connector_config)
-            BackendAPISecurity.decrypt_all(account_name=account_name)
-            return await self._get_trading_connector_already_locked(
-                account_name, connector_name
-            )
+    def clear_trading_connector_already_locked(
+        self, account_name: str, connector_name: str
+    ) -> None:
+        """Clear exact cache state only for the current transaction root."""
+        connector_key = self._connector_key(account_name, connector_name)
+        self._require_exact_market_root(connector_key)
+        account_connectors = self._trading_connectors.get(account_name)
+        if account_connectors is not None:
+            account_connectors.pop(connector_name, None)
+            if not account_connectors:
+                self._trading_connectors.pop(account_name, None)
 
     def clear_trading_connector(
         self,
@@ -5112,6 +5501,7 @@ class UnifiedConnectorService:
             cleanup_code=cleanup_codes[0],
         )
         residuals[connector_key] = detail.model_dump(exclude_none=True)
+        self._signal_market_state_change(connector_key)
         return detail
 
     async def stop_all(self):
