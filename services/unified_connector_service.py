@@ -84,12 +84,13 @@ class _PublicTransactionToken:
 
 
 class _MarketTransactionToken:
-    """Inherited proof that one logical market transaction owns its lock."""
+    """Revocable proof that one exact task owns a market transaction lock."""
 
-    __slots__ = ("active",)
+    __slots__ = ("active", "owner_task")
 
-    def __init__(self):
+    def __init__(self, owner_task: asyncio.Task):
         self.active = True
+        self.owner_task = owner_task
 
 
 class UnknownConnectorError(ValueError):
@@ -468,12 +469,19 @@ class UnifiedConnectorService:
     async def _market_transaction_lock(
         self, connector_key: Tuple[str, str]
     ):
-        """Serialize market and connector mutation with inherited transaction truth."""
+        """Serialize mutation and reenter only for the exact authorized task."""
         self._ensure_connector_cleanup_state()
         scope = (id(self), connector_key)
         inherited = _MARKET_TRANSACTION_CONTEXT.get()
+        current_task = asyncio.current_task()
+        if current_task is None:
+            raise RuntimeError("market transaction lock requires an asyncio.Task")
         for inherited_scope, inherited_token in reversed(inherited):
-            if inherited_scope == scope and inherited_token.active:
+            if (
+                inherited_scope == scope
+                and inherited_token.active
+                and inherited_token.owner_task is current_task
+            ):
                 yield inherited_token
                 return
 
@@ -488,7 +496,7 @@ class UnifiedConnectorService:
         try:
             await lock.acquire()
             acquired = True
-            transaction_token = _MarketTransactionToken()
+            transaction_token = _MarketTransactionToken(current_task)
             context_token = _MARKET_TRANSACTION_CONTEXT.set(
                 (*inherited, (scope, transaction_token))
             )
@@ -496,6 +504,7 @@ class UnifiedConnectorService:
         finally:
             if transaction_token is not None:
                 transaction_token.active = False
+                transaction_token.owner_task = None
             if context_token is not None:
                 _MARKET_TRANSACTION_CONTEXT.reset(context_token)
             if acquired:
@@ -510,6 +519,44 @@ class UnifiedConnectorService:
                     self._market_lock_users.pop(connector_key, None)
                     if self._market_locks.get(connector_key) is lock:
                         self._market_locks.pop(connector_key, None)
+
+    def _transfer_market_transaction_authority(
+        self,
+        connector_key: Tuple[str, str],
+        delegate_task: asyncio.Task,
+    ) -> bool:
+        """Delegate an owned transaction until one exact child task completes."""
+        if not isinstance(delegate_task, asyncio.Task):
+            raise TypeError("market transaction authority requires an asyncio.Task")
+        current_task = asyncio.current_task()
+        if (
+            current_task is None
+            or delegate_task is current_task
+            or delegate_task.done()
+        ):
+            return False
+        scope = (id(self), connector_key)
+        inherited = _MARKET_TRANSACTION_CONTEXT.get()
+        for inherited_scope, transaction_token in reversed(inherited):
+            if inherited_scope != scope or not transaction_token.active:
+                continue
+            if transaction_token.owner_task is not current_task:
+                return False
+
+            transaction_token.owner_task = delegate_task
+
+            def restore_owner(
+                completed_task,
+                *,
+                token=transaction_token,
+                prior_owner=current_task,
+            ):
+                if token.active and token.owner_task is completed_task:
+                    token.owner_task = prior_owner
+
+            delegate_task.add_done_callback(restore_owner)
+            return True
+        return False
 
     @asynccontextmanager
     async def _connector_creation_lock(self, connector_key: Tuple[str, str]):
@@ -4178,9 +4225,8 @@ class UnifiedConnectorService:
             BackendAPISecurity.update_connector_keys(account_name, connector_config)
             BackendAPISecurity.decrypt_all(account_name=account_name)
 
-            # Stop and recreate under one inherited market transaction. The public
-            # stop uses a shielded child task, so the transaction token, rather than
-            # task identity, proves that the outer lock is already held.
+            # Stop and recreate under one market transaction. The public stop
+            # explicitly delegates that transaction to its shielded child task.
             await self.stop_trading_connector(account_name, connector_name)
             return await self.get_trading_connector(account_name, connector_name)
 
@@ -4293,9 +4339,11 @@ class UnifiedConnectorService:
 
     async def stop_trading_connector(self, account_name: str, connector_name: str):
         """Stop a trading connector, exposing any residual instead of hiding it."""
+        connector_key = self._connector_key(account_name, connector_name)
         cleanup_task = asyncio.create_task(
             self._locked_stop_trading_connector(account_name, connector_name)
         )
+        self._transfer_market_transaction_authority(connector_key, cleanup_task)
         cancelled = False
         while not cleanup_task.done():
             try:

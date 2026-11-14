@@ -492,6 +492,21 @@ class AccountTradingInterface:
                     if self._market_locks.get(transaction_key) is lock:
                         self._market_locks.pop(transaction_key, None)
 
+    def _transfer_market_transaction_authority(
+        self, connector_name: str, delegate_task: asyncio.Task
+    ) -> bool:
+        """Delegate shared market authority to one exact child when available."""
+        transfer = getattr(
+            self._connector_service,
+            "_transfer_market_transaction_authority",
+            None,
+        )
+        if not callable(transfer):
+            return False
+        return bool(
+            transfer((self._account_name, connector_name), delegate_task)
+        )
+
     @staticmethod
     def _order_book_is_ready(tracker, trading_pair: str) -> bool:
         if tracker is None or trading_pair not in getattr(tracker, "order_books", {}):
@@ -686,6 +701,7 @@ class AccountTradingInterface:
         if phase["complete"]:
             return phase["error_code"]
 
+        authority_transferred = False
         try:
             cleanup_task = phase["task"]
             if cleanup_task is None:
@@ -715,6 +731,12 @@ class AccountTradingInterface:
                     awaitable = cleanup(self._account_name, connector_name)
                 cleanup_task = asyncio.ensure_future(awaitable)
                 phase["task"] = cleanup_task
+                if not connector_preexisting:
+                    authority_transferred = (
+                        self._transfer_market_transaction_authority(
+                            connector_name, cleanup_task
+                        )
+                    )
 
             if not cleanup_task.done():
                 _, pending = await asyncio.wait(
@@ -733,6 +755,15 @@ class AccountTradingInterface:
                 self._residual_tasks.setdefault(task_key, set()).add(
                     cleanup_task
                 )
+                delegated_cancellation = False
+                while authority_transferred and not cleanup_task.done():
+                    try:
+                        await asyncio.shield(cleanup_task)
+                    except asyncio.CancelledError:
+                        if not cleanup_task.done():
+                            delegated_cancellation = True
+                if delegated_cancellation:
+                    raise asyncio.CancelledError()
                 return "cleanup_deadline_exceeded"
 
             retained = self._residual_tasks.get(task_key)
@@ -942,6 +973,9 @@ class AccountTradingInterface:
                 connector_preexisting,
                 connector_incarnation,
             )
+        )
+        self._transfer_market_transaction_authority(
+            connector_name, cleanup_task
         )
         cancelled = False
         while not cleanup_task.done():
