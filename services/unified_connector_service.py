@@ -83,14 +83,86 @@ class _PublicTransactionToken:
         self.active = True
 
 
-class _MarketTransactionToken:
-    """Revocable proof that one exact task owns a market transaction lock."""
+class _MarketTransactionLease:
+    """Keep one physical market lock alive through all retained descendants."""
 
-    __slots__ = ("active", "owner_task")
+    __slots__ = (
+        "active",
+        "acquired",
+        "frames",
+        "guardian_task",
+        "lock",
+        "release_requested",
+        "root_exited",
+        "root_task",
+    )
 
-    def __init__(self, owner_task: asyncio.Task):
+    def __init__(self, owner_task: asyncio.Task, lock: asyncio.Lock):
+        loop = asyncio.get_running_loop()
         self.active = True
-        self.owner_task = owner_task
+        self.acquired = loop.create_future()
+        self.frames: Dict[asyncio.Task, Optional[asyncio.Task]] = {}
+        self.guardian_task: Optional[asyncio.Task] = None
+        self.lock: Optional[asyncio.Lock] = lock
+        self.release_requested = asyncio.Event()
+        self.root_exited = False
+        self.root_task: Optional[asyncio.Task] = owner_task
+
+    def retain(self, parent_task: asyncio.Task, child_task: asyncio.Task) -> bool:
+        """Retain an exact child frame without granting it mutation authority."""
+        parent_is_root = (
+            not self.root_exited and self.root_task is parent_task
+        )
+        if (
+            not self.active
+            or child_task is parent_task
+            or child_task.done()
+            or child_task in self.frames
+            or (not parent_is_root and parent_task not in self.frames)
+        ):
+            return False
+        self.frames[child_task] = parent_task
+        child_task.add_done_callback(self._frame_completed)
+        return True
+
+    def exit_root(self) -> None:
+        self.root_exited = True
+        self.root_task = None
+        self._request_release_if_terminal()
+
+    def _frame_completed(self, completed_task: asyncio.Task) -> None:
+        self.frames.pop(completed_task, None)
+        self._request_release_if_terminal()
+
+    def _request_release_if_terminal(self) -> None:
+        if self.root_exited and not self.frames:
+            self.release_requested.set()
+
+    def close(self) -> None:
+        """Revoke stale contexts and sever every task reference exactly once."""
+        self.active = False
+        self.root_exited = True
+        self.root_task = None
+        self.frames.clear()
+        self.lock = None
+        self.guardian_task = None
+
+
+class _MarketTransactionToken:
+    """Context proof for the root task of one retained physical-lock lease."""
+
+    __slots__ = ("lease",)
+
+    def __init__(self, lease: _MarketTransactionLease):
+        self.lease = lease
+
+    @property
+    def active(self) -> bool:
+        return self.lease.active
+
+    @property
+    def owner_task(self) -> Optional[asyncio.Task]:
+        return self.lease.root_task if self.lease.active else None
 
 
 class UnknownConnectorError(ValueError):
@@ -469,7 +541,7 @@ class UnifiedConnectorService:
     async def _market_transaction_lock(
         self, connector_key: Tuple[str, str]
     ):
-        """Serialize mutation and reenter only for the exact authorized task."""
+        """Serialize mutation while a guardian retains live physical descendants."""
         self._ensure_connector_cleanup_state()
         scope = (id(self), connector_key)
         inherited = _MARKET_TRANSACTION_CONTEXT.get()
@@ -477,41 +549,67 @@ class UnifiedConnectorService:
         if current_task is None:
             raise RuntimeError("market transaction lock requires an asyncio.Task")
         for inherited_scope, inherited_token in reversed(inherited):
-            if (
-                inherited_scope == scope
-                and inherited_token.active
-                and inherited_token.owner_task is current_task
-            ):
+            if inherited_scope != scope or not inherited_token.active:
+                continue
+            lease = inherited_token.lease
+            if lease.root_task is current_task and not lease.frames:
                 yield inherited_token
                 return
+            raise RuntimeError("market_transaction_authority_unavailable")
 
         async with self._market_locks_guard:
             lock = self._market_locks.setdefault(connector_key, asyncio.Lock())
             self._market_lock_users[connector_key] = (
                 self._market_lock_users.get(connector_key, 0) + 1
             )
-        acquired = False
+        lease = _MarketTransactionLease(current_task, lock)
+        guardian_task = asyncio.create_task(
+            self._guard_market_transaction_lock(connector_key, lock, lease)
+        )
+        lease.guardian_task = guardian_task
         transaction_token = None
         context_token = None
         try:
-            await lock.acquire()
-            acquired = True
-            transaction_token = _MarketTransactionToken(current_task)
+            await asyncio.shield(lease.acquired)
+            transaction_token = _MarketTransactionToken(lease)
             context_token = _MARKET_TRANSACTION_CONTEXT.set(
                 (*inherited, (scope, transaction_token))
             )
             yield transaction_token
         finally:
-            if transaction_token is not None:
-                transaction_token.active = False
-                transaction_token.owner_task = None
             if context_token is not None:
                 _MARKET_TRANSACTION_CONTEXT.reset(context_token)
+            lease.exit_root()
+            if transaction_token is not None and not lease.frames:
+                try:
+                    await asyncio.shield(guardian_task)
+                except asyncio.CancelledError:
+                    if guardian_task.done():
+                        guardian_task.result()
+
+    async def _guard_market_transaction_lock(
+        self,
+        connector_key: Tuple[str, str],
+        lock: asyncio.Lock,
+        lease: _MarketTransactionLease,
+    ) -> None:
+        """Own acquisition, terminal release, and registry pruning for a lease."""
+        acquired = False
+        try:
+            await lock.acquire()
+            acquired = True
+            if not lease.acquired.done():
+                lease.acquired.set_result(None)
+            await lease.release_requested.wait()
+        except BaseException as exc:
+            if not lease.acquired.done():
+                lease.acquired.set_exception(exc)
+            raise
+        finally:
+            lease.close()
             if acquired:
                 lock.release()
-            try:
-                await asyncio.sleep(0)
-            finally:
+            async with self._market_locks_guard:
                 users = self._market_lock_users.get(connector_key, 1) - 1
                 if users:
                     self._market_lock_users[connector_key] = users
@@ -520,43 +618,62 @@ class UnifiedConnectorService:
                     if self._market_locks.get(connector_key) is lock:
                         self._market_locks.pop(connector_key, None)
 
-    def _transfer_market_transaction_authority(
+    def _retain_market_transaction_descendant(
         self,
         connector_key: Tuple[str, str],
-        delegate_task: asyncio.Task,
+        descendant_task: asyncio.Task,
     ) -> bool:
-        """Delegate an owned transaction until one exact child task completes."""
-        if not isinstance(delegate_task, asyncio.Task):
-            raise TypeError("market transaction authority requires an asyncio.Task")
+        """Retain a physical descendant without allowing it to reenter the lock."""
+        if not isinstance(descendant_task, asyncio.Task):
+            raise TypeError("market transaction retention requires an asyncio.Task")
         current_task = asyncio.current_task()
-        if (
-            current_task is None
-            or delegate_task is current_task
-            or delegate_task.done()
-        ):
+        if current_task is None:
             return False
         scope = (id(self), connector_key)
         inherited = _MARKET_TRANSACTION_CONTEXT.get()
         for inherited_scope, transaction_token in reversed(inherited):
             if inherited_scope != scope or not transaction_token.active:
                 continue
-            if transaction_token.owner_task is not current_task:
-                return False
-
-            transaction_token.owner_task = delegate_task
-
-            def restore_owner(
-                completed_task,
-                *,
-                token=transaction_token,
-                prior_owner=current_task,
-            ):
-                if token.active and token.owner_task is completed_task:
-                    token.owner_task = prior_owner
-
-            delegate_task.add_done_callback(restore_owner)
-            return True
+            return transaction_token.lease.retain(
+                current_task, descendant_task
+            )
         return False
+
+    def _active_market_transaction_lease(
+        self, connector_key: Tuple[str, str]
+    ) -> Optional[_MarketTransactionLease]:
+        scope = (id(self), connector_key)
+        for inherited_scope, transaction_token in reversed(
+            _MARKET_TRANSACTION_CONTEXT.get()
+        ):
+            if inherited_scope == scope and transaction_token.active:
+                return transaction_token.lease
+        return None
+
+    def _is_market_transaction_participant(
+        self, connector_key: Tuple[str, str]
+    ) -> bool:
+        lease = self._active_market_transaction_lease(connector_key)
+        current_task = asyncio.current_task()
+        if lease is None or current_task is None:
+            return False
+        if lease.root_task is current_task:
+            return not lease.frames
+        return set(lease.frames) == {current_task}
+
+    def _market_transaction_has_live_descendant(
+        self, connector_key: Tuple[str, str]
+    ) -> bool:
+        """Report physical frames other than the exact task asking."""
+        lease = self._active_market_transaction_lease(connector_key)
+        current_task = asyncio.current_task()
+        return bool(
+            lease is not None
+            and any(
+                task is not current_task and not task.done()
+                for task in lease.frames
+            )
+        )
 
     @asynccontextmanager
     async def _connector_creation_lock(self, connector_key: Tuple[str, str]):
@@ -3021,6 +3138,17 @@ class UnifiedConnectorService:
                 return result
             task = asyncio.ensure_future(result)
             phase["task"] = task
+            connector_key = owner_key[:2]
+            lease = self._active_market_transaction_lease(connector_key)
+            if lease is not None and not self._retain_market_transaction_descendant(
+                connector_key, task
+            ):
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                phase["task"] = None
+                phase["complete"] = True
+                phase["error_code"] = f"{phase_name}_authority_unavailable"
+                raise RuntimeError(phase["error_code"])
             self._connector_residual_tasks.setdefault(owner_key, set()).add(task)
 
         if not task.done():
@@ -4225,9 +4353,13 @@ class UnifiedConnectorService:
             BackendAPISecurity.update_connector_keys(account_name, connector_config)
             BackendAPISecurity.decrypt_all(account_name=account_name)
 
-            # Stop and recreate under one market transaction. The public stop
-            # explicitly delegates that transaction to its shielded child task.
-            await self.stop_trading_connector(account_name, connector_name)
+            # Stop and recreate under one market transaction without asking a
+            # child to reenter the physical market lock.
+            detail = await self._stop_trading_connector_already_locked(
+                account_name, connector_name
+            )
+            if detail is not None:
+                raise ConnectorCapabilityError(detail)
             return await self.get_trading_connector(account_name, connector_name)
 
     def clear_trading_connector(
@@ -4340,22 +4472,44 @@ class UnifiedConnectorService:
     async def stop_trading_connector(self, account_name: str, connector_name: str):
         """Stop a trading connector, exposing any residual instead of hiding it."""
         connector_key = self._connector_key(account_name, connector_name)
+        self._ensure_connector_cleanup_state()
+        retained_detail = self._connector_creation_residuals.get(connector_key)
+        has_live_residual = any(
+            task is not asyncio.current_task() and not task.done()
+            for owner_key, tasks in self._connector_residual_tasks.items()
+            if owner_key[:2] == connector_key
+            for task in tasks
+        )
+        if retained_detail is not None and has_live_residual:
+            raise ConnectorCapabilityError(
+                CapabilityErrorDetail.model_validate(retained_detail)
+            )
+        lease = self._active_market_transaction_lease(connector_key)
+        if lease is not None:
+            if not self._is_market_transaction_participant(connector_key):
+                raise RuntimeError("market_transaction_authority_unavailable")
+            detail = await self._stop_trading_connector_already_locked(
+                account_name, connector_name
+            )
+            if detail is not None:
+                raise ConnectorCapabilityError(detail)
+            return True
+
         cleanup_task = asyncio.create_task(
             self._locked_stop_trading_connector(account_name, connector_name)
         )
-        self._transfer_market_transaction_authority(connector_key, cleanup_task)
-        cancelled = False
-        while not cleanup_task.done():
-            try:
-                await asyncio.shield(cleanup_task)
-            except asyncio.CancelledError:
-                cancelled = True
-        detail = cleanup_task.result()
-        if cancelled:
-            raise asyncio.CancelledError()
+        cleanup_task.add_done_callback(self._consume_background_task_result)
+        detail = await asyncio.shield(cleanup_task)
         if detail is not None:
             raise ConnectorCapabilityError(detail)
         return True
+
+    @staticmethod
+    def _consume_background_task_result(task: asyncio.Task) -> None:
+        try:
+            task.exception()
+        except (asyncio.CancelledError, Exception):
+            pass
 
     async def _locked_stop_trading_connector(
         self, account_name: str, connector_name: str
@@ -4363,10 +4517,19 @@ class UnifiedConnectorService:
         """Acquire market authority before connector authority for every stop."""
         connector_key = self._connector_key(account_name, connector_name)
         async with self._market_transaction_lock(connector_key):
-            async with self._connector_creation_lock(connector_key):
-                return await self._finalize_stop_trading_connector(
-                    account_name, connector_name
-                )
+            return await self._stop_trading_connector_already_locked(
+                account_name, connector_name
+            )
+
+    async def _stop_trading_connector_already_locked(
+        self, account_name: str, connector_name: str
+    ) -> Optional[CapabilityErrorDetail]:
+        """Stop under an existing market lease without public-lock reentry."""
+        connector_key = self._connector_key(account_name, connector_name)
+        async with self._connector_creation_lock(connector_key):
+            return await self._finalize_stop_trading_connector(
+                account_name, connector_name
+            )
 
     async def _finalize_stop_data_connector(
         self,

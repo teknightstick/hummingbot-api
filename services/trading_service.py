@@ -492,19 +492,32 @@ class AccountTradingInterface:
                     if self._market_locks.get(transaction_key) is lock:
                         self._market_locks.pop(transaction_key, None)
 
-    def _transfer_market_transaction_authority(
+    def _retain_market_transaction_descendant(
         self, connector_name: str, delegate_task: asyncio.Task
-    ) -> bool:
-        """Delegate shared market authority to one exact child when available."""
-        transfer = getattr(
+    ) -> Optional[bool]:
+        """Retain a physical child under the shared market-lock lease."""
+        retain = getattr(
             self._connector_service,
-            "_transfer_market_transaction_authority",
+            "_retain_market_transaction_descendant",
             None,
         )
-        if not callable(transfer):
-            return False
+        if not callable(retain):
+            return None
         return bool(
-            transfer((self._account_name, connector_name), delegate_task)
+            retain((self._account_name, connector_name), delegate_task)
+        )
+
+    def _market_transaction_has_live_descendant(
+        self, connector_name: str
+    ) -> bool:
+        has_live_descendant = getattr(
+            self._connector_service,
+            "_market_transaction_has_live_descendant",
+            None,
+        )
+        return bool(
+            callable(has_live_descendant)
+            and has_live_descendant((self._account_name, connector_name))
         )
 
     @staticmethod
@@ -701,7 +714,6 @@ class AccountTradingInterface:
         if phase["complete"]:
             return phase["error_code"]
 
-        authority_transferred = False
         try:
             cleanup_task = phase["task"]
             if cleanup_task is None:
@@ -721,22 +733,46 @@ class AccountTradingInterface:
                 else:
                     cleanup = getattr(
                         self._connector_service,
-                        "stop_trading_connector",
+                        "_stop_trading_connector_already_locked",
                         None,
                     )
+                    cleanup_is_internal = cleanup is not None
+                    if cleanup is None:
+                        cleanup = getattr(
+                            self._connector_service,
+                            "stop_trading_connector",
+                            None,
+                        )
                     if cleanup is None:
                         phase["complete"] = True
                         phase["error_code"] = "connector_cleanup_unavailable"
                         return phase["error_code"]
-                    awaitable = cleanup(self._account_name, connector_name)
+
+                    async def stop_new_connector():
+                        result = await cleanup(
+                            self._account_name, connector_name
+                        )
+                        if cleanup_is_internal:
+                            if result is not None:
+                                raise ConnectorCapabilityError(result)
+                            return True
+                        return result
+
+                    awaitable = stop_new_connector()
                 cleanup_task = asyncio.ensure_future(awaitable)
                 phase["task"] = cleanup_task
-                if not connector_preexisting:
-                    authority_transferred = (
-                        self._transfer_market_transaction_authority(
-                            connector_name, cleanup_task
-                        )
+                retained = self._retain_market_transaction_descendant(
+                    connector_name, cleanup_task
+                )
+                if retained is False:
+                    cleanup_task.cancel()
+                    await asyncio.gather(
+                        cleanup_task, return_exceptions=True
                     )
+                    phase["task"] = None
+                    phase["complete"] = True
+                    phase["error_code"] = "cleanup_authority_unavailable"
+                    return phase["error_code"]
 
             if not cleanup_task.done():
                 _, pending = await asyncio.wait(
@@ -755,15 +791,6 @@ class AccountTradingInterface:
                 self._residual_tasks.setdefault(task_key, set()).add(
                     cleanup_task
                 )
-                delegated_cancellation = False
-                while authority_transferred and not cleanup_task.done():
-                    try:
-                        await asyncio.shield(cleanup_task)
-                    except asyncio.CancelledError:
-                        if not cleanup_task.done():
-                            delegated_cancellation = True
-                if delegated_cancellation:
-                    raise asyncio.CancelledError()
                 return "cleanup_deadline_exceeded"
 
             retained = self._residual_tasks.get(task_key)
@@ -831,29 +858,12 @@ class AccountTradingInterface:
         residual_pair = residual.get("trading_pair") or trading_pair
         owner = self._cleanup_owners.get(key, {})
         connector = owner.get("connector") or self.connectors.get(connector_name)
-        tasks_ok = await self._drain_market_residual_tasks(
-            connector_name, residual_pair
-        )
-        local_ok = False
-        try:
-            local_ok = await self._remove_owned_pair_state(
-                connector_name, residual_pair, connector
-            )
-        except asyncio.CancelledError:
-            raise
-        except BaseException:
-            local_ok = False
-
         scope = residual.get("cleanup_scope", "pair")
         same_pair_owned = bool(
             self._market_owner_set(connector_name, residual_pair)
         )
         other_pairs = self._other_owned_pairs(connector_name, residual_pair)
-        if not tasks_ok:
-            reason = "task_cleanup_pending"
-        elif not local_ok:
-            reason = "task_cleanup_pending"
-        elif same_pair_owned:
+        if same_pair_owned:
             # Shared state now belongs to a live peer token. Consuming this
             # transaction's residue must not unsubscribe or erase that peer.
             reason = None
@@ -867,6 +877,21 @@ class AccountTradingInterface:
                 residual_pair,
                 scope == "pair",
             )
+        tasks_ok = False
+        local_ok = False
+        if not self._market_transaction_has_live_descendant(connector_name):
+            tasks_ok = await self._drain_market_residual_tasks(
+                connector_name, residual_pair
+            )
+            if tasks_ok:
+                try:
+                    local_ok = await self._remove_owned_pair_state(
+                        connector_name, residual_pair, connector
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except BaseException:
+                    local_ok = False
         stale_local = (
             self._pair_exists_in_connector_state(
                 connector,
@@ -907,12 +932,13 @@ class AccountTradingInterface:
             )
         )
         local_ok = False
-        try:
-            local_ok = await self._remove_owned_pair_state(
-                connector_name, trading_pair, connector
-            )
-        except BaseException:
-            local_ok = False
+        if not self._market_transaction_has_live_descendant(connector_name):
+            try:
+                local_ok = await self._remove_owned_pair_state(
+                    connector_name, trading_pair, connector
+                )
+            except BaseException:
+                local_ok = False
 
         stale_local = (
             self._pair_exists_in_connector_state(
@@ -964,7 +990,7 @@ class AccountTradingInterface:
         connector_preexisting: bool,
         connector_incarnation=None,
     ) -> Optional[CapabilityErrorDetail]:
-        """Shield finalization from caller cancellation while preserving that cancellation."""
+        """Retain finalization after bounded public cancellation."""
         cleanup_task = asyncio.create_task(
             self._finalize_failed_market_add(
                 connector_name,
@@ -974,20 +1000,42 @@ class AccountTradingInterface:
                 connector_incarnation,
             )
         )
-        self._transfer_market_transaction_authority(
+        retained = self._retain_market_transaction_descendant(
             connector_name, cleanup_task
         )
-        cancelled = False
-        while not cleanup_task.done():
-            try:
-                await asyncio.shield(cleanup_task)
-            except asyncio.CancelledError:
-                cancelled = True
-                continue
-        result = cleanup_task.result()
-        if cancelled:
-            raise asyncio.CancelledError()
-        return result
+        if retained is False:
+            cleanup_task.cancel()
+            await asyncio.gather(cleanup_task, return_exceptions=True)
+            detail = CapabilityErrorDetail(
+                code="market_cleanup_residual",
+                message=(
+                    f"Cleanup is incomplete for "
+                    f"'{connector_name}/{trading_pair}'"
+                ),
+                connector=connector_name,
+                feature=ConnectorFeature.LIVE_ORDER_BOOK.value,
+                trading_pair=trading_pair,
+                reason="cleanup_incomplete",
+                cleanup_scope=(
+                    "pair" if connector_preexisting else "connector"
+                ),
+                cleanup_code="cleanup_authority_unavailable",
+            )
+            key = self._residual_key(
+                connector_name,
+                trading_pair,
+                "pair" if connector_preexisting else "connector",
+            )
+            self._cleanup_residuals[key] = detail.model_dump(
+                exclude_none=True
+            )
+            self._cleanup_owners[key] = {
+                "connector": connector,
+                "connector_preexisting": connector_preexisting,
+                "incarnation": connector_incarnation,
+            }
+            return detail
+        return await asyncio.shield(cleanup_task)
 
     async def remove_market(
         self,
