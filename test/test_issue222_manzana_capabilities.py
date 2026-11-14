@@ -2735,7 +2735,7 @@ async def test_late_declaration_rejection_stops_fresh_candidate_once():
     ("failure_type", "preloaded"),
     [(KeyError, True), (RuntimeError, True), (RuntimeError, False)],
 )
-async def test_public_symbol_discovery_exception_is_typed_sanitized_and_read_only(
+async def test_public_symbol_discovery_exception_is_typed_sanitized_and_fail_closed(
     failure_type,
     preloaded,
     caplog,
@@ -2792,17 +2792,12 @@ async def test_public_symbol_discovery_exception_is_typed_sanitized_and_read_onl
     CHECK.assertEqual([], connector.order_book_tracker._trading_pairs)
     CHECK.assertEqual({}, connector.order_book_tracker.order_books)
     CHECK.assertEqual(0, connector.start_calls)
-    if preloaded:
-        CHECK.assertEqual(0, connector.stop_calls)
-        CHECK.assertIs(connector, service._data_connectors["manzana"])
-        CHECK.assertEqual({"manzana": True}, service._data_connectors_started)
-    else:
-        CHECK.assertEqual(1, connector.stop_calls)
-        CHECK.assertEqual({}, service._data_connectors)
-        CHECK.assertEqual({}, service._data_connectors_started)
-        CHECK.assertEqual({}, service._connector_cleanup_owners)
-        CHECK.assertEqual({}, service._connector_residual_tasks)
-        CHECK.assertEqual({}, service._connector_cleanup_phases)
+    CHECK.assertEqual(1, connector.stop_calls)
+    CHECK.assertEqual({}, service._data_connectors)
+    CHECK.assertEqual({}, service._data_connectors_started)
+    CHECK.assertEqual({}, service._connector_cleanup_owners)
+    CHECK.assertEqual({}, service._connector_residual_tasks)
+    CHECK.assertEqual({}, service._connector_cleanup_phases)
 
 
 @pytest.mark.asyncio
@@ -3037,6 +3032,366 @@ async def test_public_symbol_discovery_accepts_compatible_final_declaration():
 
     CHECK.assertIs(ready, True)
     CHECK.assertEqual(["BTC-USD"], pair_mutation_calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preloaded", [False, True])
+@pytest.mark.parametrize(
+    "descriptor_kind", ["runtime", "attribute", "noncallable", "missing"]
+)
+async def test_public_symbol_discovery_descriptor_failures_are_closed_and_sanitized(
+    descriptor_kind,
+    preloaded,
+    caplog,
+):
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    secret = f"private-{descriptor_kind}-descriptor-value"
+    pair_mutations = []
+
+    class Tracker:
+        def __init__(self):
+            self._trading_pairs = []
+            self.order_books = {}
+
+    class ExplodingDescriptor:
+        def __get__(self, instance, owner):
+            if descriptor_kind == "attribute":
+                raise AttributeError(secret)
+            raise RuntimeError(secret)
+
+    class Connector:
+        def __init__(self):
+            self.api_capabilities = _shift_successor_capabilities()
+            self._trading_pairs = []
+            self.order_book_tracker = Tracker()
+            self.stop_calls = 0
+            self.start_calls = 0
+
+        async def start_network(self):
+            self.start_calls += 1
+
+        async def stop_network(self):
+            self.stop_calls += 1
+
+    if descriptor_kind in {"runtime", "attribute"}:
+        Connector.exchange_symbol_associated_to_pair = ExplodingDescriptor()
+    elif descriptor_kind == "noncallable":
+        Connector.exchange_symbol_associated_to_pair = property(lambda self: object())
+
+    connector = Connector()
+    if preloaded:
+        service._data_connectors = {"manzana": connector}
+        service._data_connectors_started = {"manzana": True}
+    else:
+        service._create_data_connector = lambda connector_name: connector
+
+    async def mutate_pair(connector_arg, trading_pair):
+        pair_mutations.append(trading_pair)
+        return True
+
+    service._add_trading_pair_to_tracker = mutate_pair
+    service._wait_for_order_book = lambda *args: asyncio.sleep(0, result=True)
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(module.ConnectorCapabilityError) as failure:
+            await service.initialize_order_book("manzana", "BTC-USD", timeout=0)
+
+    CHECK.assertEqual(
+        "connector_symbol_discovery_failed", failure.value.detail["code"]
+    )
+    CHECK.assertNotIn(secret, json.dumps(failure.value.detail))
+    CHECK.assertNotIn(secret, caplog.text)
+    CHECK.assertEqual([], pair_mutations)
+    CHECK.assertEqual(0, connector.start_calls)
+    CHECK.assertEqual(1, connector.stop_calls)
+    CHECK.assertEqual({}, service._data_connectors)
+    CHECK.assertEqual({}, service._data_connectors_started)
+
+
+@pytest.mark.asyncio
+async def test_preloaded_symbol_discovery_mutation_then_raise_never_stays_published():
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    secret = "private-mutating-symbol-discovery-value"
+
+    class Tracker:
+        def __init__(self):
+            self._trading_pairs = []
+            self.order_books = {}
+
+    class Connector:
+        def __init__(self):
+            self.api_capabilities = _shift_successor_capabilities()
+            self._trading_pairs = []
+            self.order_book_tracker = Tracker()
+            self.stop_calls = 0
+
+        async def exchange_symbol_associated_to_pair(self, trading_pair):
+            declaration = _shift_successor_capabilities()
+            declaration["features"] = set(declaration["features"]) - {
+                module.ConnectorFeature.LIVE_ORDER_BOOK
+            }
+            self.api_capabilities = declaration
+            self._trading_pairs.append("REJECTED-PAIR")
+            raise RuntimeError(secret)
+
+        async def stop_network(self):
+            self.stop_calls += 1
+
+    connector = Connector()
+    service._data_connectors = {"manzana": connector}
+    service._data_connectors_started = {"manzana": True}
+
+    with pytest.raises(module.ConnectorCapabilityError) as failure:
+        await service.initialize_order_book("manzana", "BTC-USD", timeout=0)
+
+    CHECK.assertEqual(
+        "connector_symbol_discovery_failed", failure.value.detail["code"]
+    )
+    CHECK.assertNotIn(secret, json.dumps(failure.value.detail))
+    CHECK.assertEqual(1, connector.stop_calls)
+    CHECK.assertEqual({}, service._data_connectors)
+    CHECK.assertEqual({}, service._data_connectors_started)
+    CHECK.assertEqual(
+        "api-bootstrap", service.get_connector_capabilities("manzana").source
+    )
+
+
+@pytest.mark.asyncio
+async def test_data_start_revalidates_final_declaration_before_started_or_success(
+    monkeypatch,
+):
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+
+    async def immediate_sleep(delay, result=None):
+        return result
+
+    monkeypatch.setattr(module.asyncio, "sleep", immediate_sleep)
+
+    class ReadyBook:
+        snapshot = ([1], [1])
+
+    class Tracker:
+        def __init__(self):
+            self._trading_pairs = []
+            self.order_books = {}
+            self._order_book_stream_listener_task = object()
+
+    class Connector:
+        def __init__(self):
+            self.api_capabilities = _shift_successor_capabilities()
+            self._trading_pairs = []
+            self.order_book_tracker = Tracker()
+            self.start_calls = 0
+            self.stop_calls = 0
+
+        async def exchange_symbol_associated_to_pair(self, trading_pair):
+            return "BTCUSD"
+
+        async def start_network(self):
+            self.start_calls += 1
+            declaration = _shift_successor_capabilities(
+                supported_pairs={"BTC-USD"}
+            )
+            declaration["features"] = set(declaration["features"]) - {
+                module.ConnectorFeature.LIVE_ORDER_BOOK
+            }
+            self.api_capabilities = declaration
+            self.order_book_tracker.order_books["BTC-USD"] = ReadyBook()
+
+        async def stop_network(self):
+            self.stop_calls += 1
+
+    connector = Connector()
+    service._create_data_connector = lambda connector_name: connector
+
+    with pytest.raises(module.ConnectorCapabilityError) as mismatch:
+        await service.initialize_order_book("manzana", "BTC-USD", timeout=0)
+
+    CHECK.assertEqual("connector_capability_mismatch", mismatch.value.detail["code"])
+    CHECK.assertEqual(1, connector.start_calls)
+    CHECK.assertEqual(1, connector.stop_calls)
+    CHECK.assertEqual({}, service._data_connectors)
+    CHECK.assertEqual({}, service._data_connectors_started)
+
+
+@pytest.mark.asyncio
+async def test_public_data_initialization_serializes_paused_a_before_rejecting_b():
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    a_paused = asyncio.Event()
+    release_a = asyncio.Event()
+    events = []
+
+    class Tracker:
+        def __init__(self):
+            self._trading_pairs = []
+            self.order_books = {}
+
+    class Connector:
+        def __init__(self):
+            self.api_capabilities = _shift_successor_capabilities()
+            self._trading_pairs = []
+            self.order_book_tracker = Tracker()
+            self.discovery_calls = 0
+            self.stop_calls = 0
+
+        async def exchange_symbol_associated_to_pair(self, trading_pair):
+            self.discovery_calls += 1
+            if self.discovery_calls == 1:
+                events.append("a_discovery")
+                return "AUSD"
+            events.append("b_discovery")
+            declaration = _shift_successor_capabilities()
+            declaration["features"] = set(declaration["features"]) - {
+                module.ConnectorFeature.LIVE_ORDER_BOOK
+            }
+            self.api_capabilities = declaration
+            return "BUSD"
+
+        async def stop_network(self):
+            self.stop_calls += 1
+
+    connector = Connector()
+    service._data_connectors = {"manzana": connector}
+    service._data_connectors_started = {"manzana": True}
+
+    async def add_pair(connector_arg, trading_pair):
+        events.append("a_paused")
+        a_paused.set()
+        await release_a.wait()
+        events.append("a_pair_mutation")
+        connector_arg._trading_pairs.append(trading_pair)
+        return True
+
+    async def wait_for_book(tracker, trading_pair, timeout):
+        events.append(
+            "a_return_owned"
+            if service._data_connectors.get("manzana") is connector
+            else "a_return_unowned"
+        )
+        return True
+
+    service._add_trading_pair_to_tracker = add_pair
+    service._wait_for_order_book = wait_for_book
+
+    request_a = asyncio.create_task(
+        service.initialize_order_book("manzana", "A-USD", timeout=0)
+    )
+    await a_paused.wait()
+    request_b = asyncio.create_task(
+        service.initialize_order_book("manzana", "B-USD", timeout=0)
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    release_a.set()
+    result_a, result_b = await asyncio.gather(
+        request_a, request_b, return_exceptions=True
+    )
+
+    CHECK.assertIs(result_a, True)
+    CHECK.assertIsInstance(result_b, module.ConnectorCapabilityError)
+    CHECK.assertEqual("connector_capability_mismatch", result_b.detail["code"])
+    CHECK.assertLess(events.index("a_pair_mutation"), events.index("b_discovery"))
+    CHECK.assertIn("a_return_owned", events)
+    CHECK.assertNotIn("a_return_unowned", events)
+    CHECK.assertEqual(1, connector.stop_calls)
+    CHECK.assertEqual({}, service._data_connectors)
+    CHECK.assertEqual({}, service._data_connectors_started)
+
+
+@pytest.mark.asyncio
+async def test_data_network_timeout_owner_completes_exact_task_on_stop_all_retry():
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    release_stop = asyncio.Event()
+
+    class Connector:
+        order_book_tracker = None
+
+        def __init__(self):
+            self.api_capabilities = _shift_successor_capabilities()
+            self.stop_calls = 0
+
+        async def stop_network(self):
+            self.stop_calls += 1
+            try:
+                await release_stop.wait()
+            except asyncio.CancelledError:
+                await release_stop.wait()
+
+    connector = Connector()
+    service._data_connectors = {"manzana": connector}
+    service._data_connectors_started = {"manzana": True}
+    approved = service._validate_instance_capabilities("manzana", connector)
+
+    with pytest.raises(module.ConnectorCapabilityError) as residual:
+        await service._discard_invalid_public_declaration(
+            "manzana", connector, approved
+        )
+
+    CHECK.assertEqual(
+        "connector_capability_cleanup_residual", residual.value.detail["code"]
+    )
+    CHECK.assertEqual(1, connector.stop_calls)
+    CHECK.assertEqual({}, service._data_connectors)
+    owner_key = ("__data__", "manzana", "data_network")
+    retained_task = service._connector_cleanup_phases[owner_key]["connector_stop"][
+        "task"
+    ]
+
+    release_stop.set()
+    await retained_task
+    await service.stop_all()
+    await service.stop_all()
+
+    CHECK.assertEqual(1, connector.stop_calls)
+    CHECK.assertEqual({}, service._connector_creation_residuals)
+    CHECK.assertEqual({}, service._connector_cleanup_owners)
+    CHECK.assertEqual({}, service._connector_residual_tasks)
+    CHECK.assertEqual({}, service._connector_cleanup_phases)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_kind", ["false", "raise"])
+async def test_data_network_terminal_stop_failure_remains_truthful(terminal_kind):
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+
+    class Connector:
+        order_book_tracker = None
+
+        def __init__(self):
+            self.api_capabilities = _shift_successor_capabilities()
+
+        async def stop_network(self):
+            if terminal_kind == "false":
+                return False
+            raise RuntimeError("private-stop-error")
+
+    connector = Connector()
+    service._data_connectors = {"manzana": connector}
+    service._data_connectors_started = {"manzana": True}
+    approved = service._validate_instance_capabilities("manzana", connector)
+
+    with pytest.raises(module.ConnectorCapabilityError):
+        await service._discard_invalid_public_declaration(
+            "manzana", connector, approved
+        )
+
+    for _ in range(2):
+        with pytest.raises(module.ConnectorCapabilityError) as residual:
+            await service.stop_all()
+        CHECK.assertEqual("connector_cleanup_residual", residual.value.detail["code"])
+        CHECK.assertEqual(
+            "connector_cleanup_incomplete", residual.value.detail["cleanup_code"]
+        )
+
+    owner_key = ("__data__", "manzana", "data_network")
+    CHECK.assertIn(owner_key, service._connector_cleanup_owners)
+    CHECK.assertIn(owner_key, service._connector_cleanup_phases)
 
 
 @pytest.mark.asyncio

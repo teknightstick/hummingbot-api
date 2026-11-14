@@ -112,6 +112,7 @@ class UnifiedConnectorService:
         self._connector_cleanup_phases: Dict[
             Tuple[str, str, str], Dict[str, Dict[str, Any]]
         ] = {}
+        self._connector_incarnations: Dict[Tuple[str, str], int] = {}
 
         # Connector settings cache
         self._conn_settings = AllConnectorSettings.get_connector_settings()
@@ -248,6 +249,12 @@ class UnifiedConnectorService:
 
     def _ensure_connector_cleanup_state(self) -> None:
         """Initialize private lifecycle registries for dependency-light instances."""
+        if not hasattr(self, "_connector_locks"):
+            self._connector_locks = {}
+        if not hasattr(self, "_connector_lock_users"):
+            self._connector_lock_users = {}
+        if not hasattr(self, "_connector_locks_guard"):
+            self._connector_locks_guard = asyncio.Lock()
         defaults = (
             ("_connector_creation_residuals", {}),
             ("_connector_creation_failures", {}),
@@ -255,10 +262,23 @@ class UnifiedConnectorService:
             ("_connector_cleanup_indices", {}),
             ("_connector_residual_tasks", {}),
             ("_connector_cleanup_phases", {}),
+            ("_connector_incarnations", {}),
         )
         for name, value in defaults:
             if not hasattr(self, name):
                 setattr(self, name, value)
+
+    def _connector_incarnation(self, connector_key: Tuple[str, str]) -> int:
+        self._ensure_connector_cleanup_state()
+        return self._connector_incarnations.get(connector_key, 0)
+
+    def _advance_connector_incarnation(
+        self, connector_key: Tuple[str, str]
+    ) -> int:
+        """Invalidate every in-flight ownership token for one physical owner."""
+        incarnation = self._connector_incarnation(connector_key) + 1
+        self._connector_incarnations[connector_key] = incarnation
+        return incarnation
 
     async def get_trading_connector(
         self,
@@ -312,12 +332,14 @@ class UnifiedConnectorService:
                 self._connector_creation_failures[connector_key] = dict(error.detail)
                 raise
             self._trading_connectors.setdefault(account_name, {})[connector_name] = connector
+            self._advance_connector_incarnation(connector_key)
             self._connector_creation_residuals.pop(connector_key, None)
             return connector
 
     @asynccontextmanager
     async def _connector_creation_lock(self, connector_key: Tuple[str, str]):
         """Serialize creation and prune the caller-controlled cache key after use."""
+        self._ensure_connector_cleanup_state()
         async with self._connector_locks_guard:
             lock = self._connector_locks.setdefault(connector_key, asyncio.Lock())
             self._connector_lock_users[connector_key] = self._connector_lock_users.get(connector_key, 0) + 1
@@ -409,6 +431,9 @@ class UnifiedConnectorService:
             connector = self._create_data_connector(connector_name)
             self._validate_instance_capabilities(connector_name, connector)
             self._data_connectors[connector_name] = connector
+            self._advance_connector_incarnation(
+                self._connector_key("__data__", connector_name)
+            )
         return self._data_connectors[connector_name]
 
     async def ensure_data_connector_started(
@@ -428,38 +453,192 @@ class UnifiedConnectorService:
         Returns:
             True if started successfully
         """
+        connector_key = self._connector_key("__data__", connector_name)
+        async with self._connector_creation_lock(connector_key):
+            residual = self._connector_creation_residuals.get(connector_key)
+            if residual is not None:
+                raise ConnectorCapabilityError(
+                    CapabilityErrorDetail.model_validate(residual)
+                )
+            connector = self.get_data_connector(connector_name)
+            approved_capabilities = self._validate_instance_capabilities(
+                connector_name, connector
+            )
+            snapshot = self._snapshot_public_connector_state(
+                connector_name,
+                connector,
+                connector_key,
+                approved_capabilities,
+            )
+            return await self._ensure_data_connector_started_locked(
+                connector_name, trading_pair, connector, snapshot
+            )
+
+    async def _ensure_data_connector_started_locked(
+        self,
+        connector_name: str,
+        trading_pair: str,
+        connector: ConnectorBase,
+        snapshot: Dict[str, Any],
+    ) -> bool:
+        """Start one owned data incarnation and validate its final declaration."""
+        self._require_public_connector_ownership(snapshot)
         if self._data_connectors_started.get(connector_name, False):
             return True
 
-        connector = self.get_data_connector(connector_name)
-
         try:
-            # Add trading pair before starting network
             if trading_pair not in connector._trading_pairs:
                 connector._trading_pairs.append(trading_pair)
 
-            # Start network
             await connector.start_network()
-            self._data_connectors_started[connector_name] = True
-            logger.info(f"Started data connector: {connector_name} with pair {trading_pair}")
+            self._require_public_connector_ownership(snapshot)
 
-            # Wait for order book tracker to be ready
             max_wait = 30
             waited = 0
             tracker = connector.order_book_tracker
             while waited < max_wait:
                 if tracker._order_book_stream_listener_task is not None:
                     await asyncio.sleep(2.0)
+                    self._require_public_connector_ownership(snapshot)
                     break
                 await asyncio.sleep(0.5)
+                self._require_public_connector_ownership(snapshot)
                 waited += 0.5
 
+            final_capabilities = self._validate_instance_capabilities(
+                connector_name, connector
+            )
+            self._capability_registry.require_resolved(
+                connector_name,
+                final_capabilities,
+                ConnectorFeature.DYNAMIC_SUBSCRIPTION,
+                trading_pair,
+            )
+            self._capability_registry.require_resolved(
+                connector_name,
+                final_capabilities,
+                ConnectorFeature.LIVE_ORDER_BOOK,
+                trading_pair,
+            )
+            self._require_public_connector_ownership(snapshot)
+            self._data_connectors_started[connector_name] = True
+            logger.info(
+                "Started data connector: %s with pair %s",
+                connector_name,
+                trading_pair,
+            )
             return True
-
-        except Exception as e:
-            logger.error(f"Error starting data connector {connector_name}: {e}")
+        except ConnectorCapabilityError:
+            self._purge_trading_pair_registration(connector, trading_pair)
+            await self._discard_invalid_public_declaration(
+                connector_name, connector, snapshot
+            )
+            raise
+        except Exception as exc:
+            logger.error(
+                "Error starting data connector %s (%s)",
+                connector_name,
+                type(exc).__name__,
+            )
             self._purge_trading_pair_registration(connector, trading_pair)
             return False
+
+    def _resolve_public_connector_key(
+        self, connector_name: str, account_name: Optional[str]
+    ) -> Tuple[str, str]:
+        if account_name is not None:
+            return self._connector_key(account_name, connector_name)
+        for owner_account, connectors in getattr(
+            self, "_trading_connectors", {}
+        ).items():
+            if connector_name in connectors:
+                return self._connector_key(owner_account, connector_name)
+        return self._connector_key("__data__", connector_name)
+
+    def _connector_for_public_key(
+        self, connector_key: Tuple[str, str]
+    ) -> Optional[ConnectorBase]:
+        account_name, connector_name = connector_key
+        if account_name == "__data__":
+            if not hasattr(self, "_data_connectors"):
+                return self.get_best_connector_for_market(connector_name)
+            return self.get_data_connector(connector_name)
+        return getattr(self, "_trading_connectors", {}).get(
+            account_name, {}
+        ).get(connector_name)
+
+    def _snapshot_public_connector_state(
+        self,
+        connector_name: str,
+        connector: ConnectorBase,
+        connector_key: Tuple[str, str],
+        approved_capabilities: ConnectorCapabilities,
+    ) -> Dict[str, Any]:
+        """Capture immutable truth and ownership before untrusted discovery awaits."""
+        return {
+            "connector_name": connector_name,
+            "connector_key": connector_key,
+            "connector": connector,
+            "incarnation": self._connector_incarnation(connector_key),
+            "approved_capabilities": approved_capabilities,
+            "data_started_present": connector_name
+            in getattr(self, "_data_connectors_started", {}),
+            "data_started": getattr(self, "_data_connectors_started", {}).get(
+                connector_name
+            ),
+        }
+
+    def _validate_public_data_capabilities(
+        self,
+        connector_name: str,
+        connector: ConnectorBase,
+        trading_pair: str,
+    ) -> ConnectorCapabilities:
+        capabilities = self._validate_instance_capabilities(
+            connector_name, connector
+        )
+        for feature in (
+            ConnectorFeature.DYNAMIC_SUBSCRIPTION,
+            ConnectorFeature.LIVE_ORDER_BOOK,
+        ):
+            self._capability_registry.require_resolved(
+                connector_name, capabilities, feature, trading_pair
+            )
+        return capabilities
+
+    def _public_connector_is_owned(self, snapshot: Mapping[str, Any]) -> bool:
+        connector_key = snapshot["connector_key"]
+        if self._connector_incarnation(connector_key) != snapshot["incarnation"]:
+            return False
+        account_name, connector_name = connector_key
+        if account_name == "__data__":
+            current = getattr(self, "_data_connectors", {}).get(connector_name)
+        else:
+            current = getattr(self, "_trading_connectors", {}).get(
+                account_name, {}
+            ).get(
+                connector_name
+            )
+        return current is snapshot["connector"]
+
+    def _require_public_connector_ownership(
+        self, snapshot: Mapping[str, Any]
+    ) -> None:
+        if self._public_connector_is_owned(snapshot):
+            return
+        connector_name = snapshot["connector_name"]
+        raise ConnectorCapabilityError(
+            CapabilityErrorDetail(
+                code="connector_lifecycle_changed",
+                message=(
+                    f"Connector '{connector_name}' changed while the request was "
+                    "initializing public data"
+                ),
+                connector=connector_name,
+                feature=ConnectorFeature.LIVE_ORDER_BOOK.value,
+                reason="connector_incarnation_changed",
+            )
+        )
 
     async def _is_trading_pair_supported(
         self,
@@ -474,10 +653,19 @@ class UnifiedConnectorService:
         subscribing, so a single unknown pair raises and aborts the whole
         subscription, which then retries and fails forever.
         """
-        if not hasattr(connector, "exchange_symbol_associated_to_pair"):
-            return True
         try:
-            await connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+            missing = object()
+            descriptor = inspect.getattr_static(
+                connector, "exchange_symbol_associated_to_pair", missing
+            )
+            if descriptor is missing:
+                if connector_name == "manzana":
+                    raise AttributeError("required symbol discovery is unavailable")
+                return True
+            discovery = getattr(connector, "exchange_symbol_associated_to_pair")
+            if not callable(discovery):
+                raise TypeError("symbol discovery is not callable")
+            await discovery(trading_pair=trading_pair)
             return True
         except Exception as exc:
             logger.warning(
@@ -504,39 +692,57 @@ class UnifiedConnectorService:
         self,
         connector_name: str,
         connector: ConnectorBase,
-        approved_capabilities: ConnectorCapabilities,
+        approved_state,
     ) -> None:
-        """Remove rejected data truth or restore immutable truth on a trading owner."""
-        if self._data_connectors.get(connector_name) is connector:
+        """Unpublish rejected truth unless exact restoration is provably safe."""
+        if isinstance(approved_state, Mapping) and "connector_key" in approved_state:
+            snapshot = approved_state
+        else:
+            connector_key = self._resolve_public_connector_key(connector_name, None)
+            snapshot = self._snapshot_public_connector_state(
+                connector_name,
+                connector,
+                connector_key,
+                approved_state,
+            )
+
+        if not self._public_connector_is_owned(snapshot):
+            return
+
+        connector_key = snapshot["connector_key"]
+        account_name, _ = connector_key
+        if account_name == "__data__":
             self._data_connectors.pop(connector_name, None)
             self._data_connectors_started.pop(connector_name, None)
+            self._advance_connector_incarnation(connector_key)
             try:
                 await self._stop_data_connector_network(connector, connector_name)
             except asyncio.CancelledError:
                 raise
             except BaseException:
-                raise ConnectorCapabilityError(
-                    CapabilityErrorDetail(
-                        code="connector_capability_cleanup_residual",
-                        message=(
-                            f"Rejected capability cleanup is incomplete for "
-                            f"'{connector_name}'"
-                        ),
-                        connector=connector_name,
-                        feature="capabilities",
-                        reason="cleanup_incomplete",
-                        cleanup_scope="connector",
-                        cleanup_code="connector_stop_failed",
-                    )
-                ) from None
+                detail = CapabilityErrorDetail(
+                    code="connector_capability_cleanup_residual",
+                    message=(
+                        f"Rejected capability cleanup is incomplete for "
+                        f"'{connector_name}'"
+                    ),
+                    connector=connector_name,
+                    feature="capabilities",
+                    reason="cleanup_incomplete",
+                    cleanup_scope="connector",
+                    cleanup_code="connector_stop_failed",
+                )
+                self._connector_creation_residuals[connector_key] = (
+                    detail.model_dump(exclude_none=True)
+                )
+                raise ConnectorCapabilityError(detail) from None
             return
 
-        try:
-            setattr(connector, "api_capabilities", approved_capabilities)
-        except Exception:
-            # The rejected declaration remains untrusted: every later read repeats
-            # validation and therefore cannot admit it through a feature gate.
-            return
+        cleanup_detail = await self._finalize_stop_trading_connector(
+            account_name, connector_name
+        )
+        if cleanup_detail is not None:
+            raise ConnectorCapabilityError(cleanup_detail)
 
     def _purge_trading_pair_registration(
         self,
@@ -690,6 +896,36 @@ class UnifiedConnectorService:
         account_name: Optional[str] = None,
         timeout: float = 30.0
     ) -> bool:
+        """Serialize the complete public-data transaction under its physical owner."""
+        while True:
+            connector_key = self._resolve_public_connector_key(
+                connector_name, account_name
+            )
+            async with self._connector_creation_lock(connector_key):
+                if (
+                    self._resolve_public_connector_key(connector_name, account_name)
+                    != connector_key
+                ):
+                    continue
+                residual = self._connector_creation_residuals.get(connector_key)
+                if residual is not None:
+                    raise ConnectorCapabilityError(
+                        CapabilityErrorDetail.model_validate(residual)
+                    )
+                return await self._initialize_order_book_locked(
+                    connector_name,
+                    trading_pair,
+                    connector_key,
+                    timeout,
+                )
+
+    async def _initialize_order_book_locked(
+        self,
+        connector_name: str,
+        trading_pair: str,
+        connector_key: Tuple[str, str],
+        timeout: float,
+    ) -> bool:
         """
         Initialize order book for a trading pair using the best available connector.
 
@@ -707,31 +943,56 @@ class UnifiedConnectorService:
         Returns:
             True if order book initialized successfully
         """
-        self.require_capability(
-            connector_name, ConnectorFeature.DYNAMIC_SUBSCRIPTION, trading_pair
-        )
-        self.require_capability(
-            connector_name, ConnectorFeature.LIVE_ORDER_BOOK, trading_pair
-        )
-        data_connectors = getattr(self, "_data_connectors", {})
-        cached_data_connector = data_connectors.get(connector_name)
-        if account_name is not None:
-            # Account-scoped cleanup must never fall back to a connector owned by
-            # another account (or to a shared data connector).
-            connector = self._trading_connectors.get(account_name, {}).get(
-                connector_name
+        bootstrap_capabilities = self._capability_registry.get(connector_name)
+        for feature in (
+            ConnectorFeature.DYNAMIC_SUBSCRIPTION,
+            ConnectorFeature.LIVE_ORDER_BOOK,
+        ):
+            self._capability_registry.require_resolved(
+                connector_name, bootstrap_capabilities, feature, trading_pair
             )
-        else:
-            connector = self.get_best_connector_for_market(connector_name)
+
+        connector = self._connector_for_public_key(connector_key)
 
         if not connector:
             logger.error(f"No connector available for {connector_name}")
             return False
 
-        # Gateway/AMM connectors don't have order book trackers - skip initialization
-        if not hasattr(connector, 'order_book_tracker') or connector.order_book_tracker is None:
-            logger.info(f"Connector {connector_name} doesn't have order book tracker (AMM/Gateway) - skipping")
+        # Gateway/AMM connectors do not expose an order-book tracker. Preserve
+        # that legacy no-op before applying exchange-specific discovery seams.
+        if (
+            not hasattr(connector, "order_book_tracker")
+            or connector.order_book_tracker is None
+        ):
+            logger.info(
+                "Connector %s doesn't have order book tracker "
+                "(AMM/Gateway) - skipping",
+                connector_name,
+            )
             return True
+
+        try:
+            approved_capabilities = self._validate_public_data_capabilities(
+                connector_name, connector, trading_pair
+            )
+        except ConnectorCapabilityError:
+            rejected_snapshot = self._snapshot_public_connector_state(
+                connector_name,
+                connector,
+                connector_key,
+                bootstrap_capabilities,
+            )
+            await self._discard_invalid_public_declaration(
+                connector_name, connector, rejected_snapshot
+            )
+            raise
+
+        snapshot = self._snapshot_public_connector_state(
+            connector_name,
+            connector,
+            connector_key,
+            approved_capabilities,
+        )
 
         tracker = connector.order_book_tracker
 
@@ -742,27 +1003,22 @@ class UnifiedConnectorService:
                 bids, asks = ob.snapshot
                 if len(bids) > 0 and len(asks) > 0:
                     logger.info(f"Order book for {trading_pair} already initialized")
+                    self._require_public_connector_ownership(snapshot)
                     return True
             except Exception:
                 pass
 
         # Reject pairs the exchange doesn't list before registering them anywhere
-        approved_capabilities = self._validate_instance_capabilities(
-            connector_name, connector
-        )
         try:
             pair_is_supported = await self._is_trading_pair_supported(
                 connector_name, connector, trading_pair
             )
         except ConnectorCapabilityError:
-            if (
-                cached_data_connector is None
-                and data_connectors.get(connector_name) is connector
-            ):
-                await self._discard_invalid_public_declaration(
-                    connector_name, connector, approved_capabilities
-                )
+            await self._discard_invalid_public_declaration(
+                connector_name, connector, snapshot
+            )
             raise
+        self._require_public_connector_ownership(snapshot)
         if not pair_is_supported:
             logger.error(
                 f"Trading pair {trading_pair} is not listed on {connector_name} - "
@@ -773,39 +1029,72 @@ class UnifiedConnectorService:
         # Lazy symbol/instrument discovery may replace api_capabilities. Validate
         # that loaded declaration before any pair, book, or tracker state changes.
         try:
-            self._validate_instance_capabilities(connector_name, connector)
+            self._validate_public_data_capabilities(
+                connector_name, connector, trading_pair
+            )
         except ConnectorCapabilityError:
             await self._discard_invalid_public_declaration(
-                connector_name, connector, approved_capabilities
+                connector_name, connector, snapshot
             )
             raise
 
         # For data connectors, ensure network is started
-        if connector_name in self._data_connectors:
+        if connector_key[0] == "__data__":
             if not self._data_connectors_started.get(connector_name, False):
-                success = await self.ensure_data_connector_started(
-                    connector_name, trading_pair
+                success = await self._ensure_data_connector_started_locked(
+                    connector_name, trading_pair, connector, snapshot
                 )
+                self._require_public_connector_ownership(snapshot)
                 if not success:
                     return False
                 # Wait for order book after starting
-                return await self._wait_for_order_book(tracker, trading_pair, timeout)
+                ready = await self._wait_for_order_book(
+                    tracker, trading_pair, timeout
+                )
+                self._require_public_connector_ownership(snapshot)
+                if not ready:
+                    return False
+                try:
+                    self._validate_public_data_capabilities(
+                        connector_name, connector, trading_pair
+                    )
+                except ConnectorCapabilityError:
+                    await self._discard_invalid_public_declaration(
+                        connector_name, connector, snapshot
+                    )
+                    raise
+                return True
             else:
                 # Connector started, dynamically add trading pair
                 success = await self._add_trading_pair_to_tracker(
                     connector, trading_pair
                 )
+                self._require_public_connector_ownership(snapshot)
                 if not success:
                     return False
 
         # For trading connectors, dynamically add trading pair
         else:
             success = await self._add_trading_pair_to_tracker(connector, trading_pair)
+            self._require_public_connector_ownership(snapshot)
             if not success:
                 return False
 
         # Wait for order book to have data
-        return await self._wait_for_order_book(tracker, trading_pair, timeout)
+        ready = await self._wait_for_order_book(tracker, trading_pair, timeout)
+        self._require_public_connector_ownership(snapshot)
+        if not ready:
+            return False
+        try:
+            self._validate_public_data_capabilities(
+                connector_name, connector, trading_pair
+            )
+        except ConnectorCapabilityError:
+            await self._discard_invalid_public_declaration(
+                connector_name, connector, snapshot
+            )
+            raise
+        return True
 
     def _is_tracker_running(self, tracker) -> bool:
         """Check if the order book tracker is running."""
@@ -2528,7 +2817,14 @@ class UnifiedConnectorService:
             if account_name == "__data__"
             else None
         )
-        connector = data_connector
+        data_owner = (
+            self._connector_cleanup_owners.get(
+                self._owner_key("__data__", connector_name, "data_network")
+            )
+            if account_name == "__data__"
+            else None
+        )
+        connector = data_connector if data_connector is not None else data_owner
         if connector is None and account_connectors:
             connector = account_connectors.get(connector_name)
         stopped_connectors = []
@@ -2539,7 +2835,9 @@ class UnifiedConnectorService:
             )
         if connector is not None and not restart_phase_failed:
             try:
-                if connector is data_connector:
+                if account_name == "__data__" and (
+                    connector is data_connector or connector is data_owner
+                ):
                     await self._stop_data_connector_network(
                         connector, connector_name
                     )
@@ -2552,12 +2850,16 @@ class UnifiedConnectorService:
                 network_cleanup_failed = True
             else:
                 stopped_connectors.append(connector)
-                if connector is data_connector:
+                if account_name == "__data__" and (
+                    connector is data_connector or connector is data_owner
+                ):
                     if self._data_connectors.get(connector_name) is connector:
                         self._data_connectors.pop(connector_name, None)
+                        self._advance_connector_incarnation(connector_key)
                     self._data_connectors_started.pop(connector_name, None)
                 elif account_connectors and account_connectors.get(connector_name) is connector:
                     account_connectors.pop(connector_name, None)
+                    self._advance_connector_incarnation(connector_key)
                 if account_connectors is not None and not account_connectors:
                     self._trading_connectors.pop(account_name, None)
 
