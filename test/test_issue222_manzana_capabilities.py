@@ -7655,7 +7655,7 @@ async def test_issue224_data_discard_reconciles_restart_before_one_successor(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("connector_type", ["data", "trading"])
-@pytest.mark.parametrize("private_state", ["owner", "phase", "residual"])
+@pytest.mark.parametrize("private_state", ["owner", "residual"])
 async def test_issue224_orphan_private_state_recovers_before_one_successor(
     caplog, connector_type, private_state
 ):
@@ -7670,16 +7670,6 @@ async def test_issue224_orphan_private_state_recovers_before_one_successor(
 
     if private_state == "owner":
         service._connector_cleanup_owners[owner_key] = old_connector
-    elif private_state == "phase":
-        service._connector_cleanup_phases[owner_key] = {
-            "connector_stop": {
-                "task": None,
-                "complete": False,
-                "result": None,
-                "error_code": None,
-                "cancel_requested": False,
-            }
-        }
     else:
         service._connector_creation_residuals[connector_key] = {
             "code": "connector_cleanup_residual",
@@ -7723,10 +7713,7 @@ async def test_issue224_orphan_private_state_recovers_before_one_successor(
     await service.stop_all()
 
     CHECK.assertEqual(1 if private_state == "owner" else 0, old_connector.stop_calls)
-    CHECK.assertEqual(
-        private_state == "phase",
-        "orphan_terminal_phase_consumed" in caplog.text,
-    )
+    CHECK.assertNotIn("orphan_terminal_phase_consumed", caplog.text)
     CHECK.assertEqual({}, service._connector_creation_residuals)
     CHECK.assertEqual({}, service._connector_cleanup_owners)
     CHECK.assertEqual({}, service._connector_cleanup_indices)
@@ -8319,3 +8306,282 @@ def test_issue224_add_pair_failure_has_one_typed_500_contract(outcome):
         "#/components/schemas/PublicErrorResponse",
         responses["500"]["content"]["application/json"]["schema"]["$ref"],
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("account_name", "owner_kind"),
+    [("acct", "network"), ("__data__", "data_network")],
+)
+async def test_issue224_empty_phase_cannot_consume_same_key_residual(
+    account_name, owner_kind
+):
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    connector_key = (account_name, "manzana")
+    owner_key = (*connector_key, owner_kind)
+    residual = {
+        "code": "connector_cleanup_residual",
+        "message": "Connector cleanup is incomplete",
+        "connector": "manzana",
+        "feature": "connector_cleanup",
+        "reason": "cleanup_incomplete",
+        "cleanup_scope": "connector",
+        "cleanup_code": "owner_cleanup_incomplete",
+    }
+    phase = {
+        "connector_stop": {
+            "task": None,
+            "complete": False,
+            "result": None,
+            "error_code": None,
+            "cancel_requested": False,
+        }
+    }
+    service._connector_creation_residuals[connector_key] = residual
+    service._connector_cleanup_phases[owner_key] = phase
+
+    with pytest.raises(module.ConnectorCapabilityError) as incomplete:
+        await service.stop_all()
+
+    CHECK.assertEqual(
+        f"{owner_kind}_cleanup_incomplete",
+        incomplete.value.detail["cleanup_code"],
+    )
+    CHECK.assertEqual(
+        "connector_cleanup_residual",
+        service._connector_creation_residuals[connector_key]["code"],
+    )
+    CHECK.assertIs(phase, service._connector_cleanup_phases[owner_key])
+
+    successor_calls = 0
+
+    def create_data_successor(connector_name):
+        nonlocal successor_calls
+        successor_calls += 1
+        return Issue224RepairConnector()
+
+    async def create_trading_successor(account, connector_name):
+        nonlocal successor_calls
+        successor_calls += 1
+        return Issue224RepairConnector()
+
+    if account_name == "__data__":
+        service._create_data_connector = create_data_successor
+        with pytest.raises(module.ConnectorCapabilityError):
+            service.get_data_connector("manzana")
+    else:
+        service._create_and_initialize_trading_connector = create_trading_successor
+        with pytest.raises(module.ConnectorCapabilityError):
+            await service.get_trading_connector(account_name, "manzana")
+    CHECK.assertEqual(0, successor_calls)
+    CHECK.assertEqual(
+        "connector_cleanup_residual",
+        service._connector_creation_residuals[connector_key]["code"],
+    )
+    CHECK.assertIs(phase, service._connector_cleanup_phases[owner_key])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_outcome", ["success", "false", "raise"])
+async def test_issue224_connector_stop_phase_keeps_exact_physical_owner(
+    terminal_outcome,
+):
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    connector_key = ("acct", "manzana")
+    owner_key = (*connector_key, "network")
+    release_a = asyncio.Event()
+    a_cancelled = asyncio.Event()
+
+    class Connector(Issue224RepairConnector):
+        def __init__(self, name):
+            super().__init__()
+            self.name = name
+
+    connector_a = Connector("A")
+    connector_b = Connector("B")
+
+    async def stop_a():
+        connector_a.stop_calls += 1
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            a_cancelled.set()
+            await release_a.wait()
+        if terminal_outcome == "false":
+            return False
+        if terminal_outcome == "raise":
+            raise RuntimeError("PRIVATE-A-STOP-SECRET")
+        return True
+
+    connector_a.stop_network = stop_a
+    service._trading_connectors = {"acct": {"manzana": connector_a}}
+    service._advance_connector_incarnation(connector_key)
+    market_key = (*connector_key, "connector")
+    service._market_cleanup_owners = {
+        market_key: {
+            "connector": connector_b,
+            "connector_preexisting": False,
+        }
+    }
+    service._market_cleanup_residuals = {
+        market_key: {
+            "code": "market_cleanup_residual",
+            "message": "Cleanup is incomplete",
+            "connector": "manzana",
+            "feature": "live_order_book",
+            "reason": "cleanup_incomplete",
+            "cleanup_scope": "connector",
+            "cleanup_code": "cleanup_deadline_exceeded",
+        }
+    }
+    service._market_cleanup_phases = {}
+    service._market_pair_owners = {}
+    service._market_residual_tasks = {}
+
+    with pytest.raises(module.ConnectorCapabilityError):
+        await service.stop_all()
+    await a_cancelled.wait()
+    CHECK.assertIs(connector_a, service._connector_cleanup_owners[owner_key])
+    CHECK.assertEqual(1, connector_a.stop_calls)
+    CHECK.assertEqual(0, connector_b.stop_calls)
+
+    with pytest.raises(module.ConnectorCapabilityError):
+        await service.stop_all()
+    CHECK.assertIs(connector_a, service._connector_cleanup_owners[owner_key])
+    CHECK.assertEqual(1, connector_a.stop_calls)
+    CHECK.assertEqual(0, connector_b.stop_calls)
+
+    phase_task = service._connector_cleanup_phases[owner_key]["connector_stop"][
+        "task"
+    ]
+    release_a.set()
+    await asyncio.gather(phase_task, return_exceptions=True)
+
+    if terminal_outcome == "success":
+        await service.stop_all()
+        CHECK.assertEqual(1, connector_a.stop_calls)
+        CHECK.assertEqual(1, connector_b.stop_calls)
+        CHECK.assertEqual({}, service._trading_connectors)
+        CHECK.assertEqual({}, service._connector_creation_residuals)
+        CHECK.assertEqual({}, service._connector_cleanup_owners)
+        CHECK.assertEqual({}, service._connector_residual_tasks)
+        CHECK.assertEqual({}, service._connector_cleanup_phases)
+        CHECK.assertEqual({}, service._market_cleanup_owners)
+    else:
+        with pytest.raises(module.ConnectorCapabilityError):
+            await service.stop_all()
+        CHECK.assertIs(connector_a, service._connector_cleanup_owners[owner_key])
+        CHECK.assertEqual(1, connector_a.stop_calls)
+        CHECK.assertEqual(0, connector_b.stop_calls)
+        CHECK.assertIs(
+            connector_a,
+            service._trading_connectors["acct"]["manzana"],
+        )
+        CHECK.assertIn(market_key, service._market_cleanup_owners)
+
+
+@pytest.mark.asyncio
+async def test_issue224_market_add_serializes_authenticated_key_replacement(
+    monkeypatch,
+):
+    from services.trading_service import AccountTradingInterface
+
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    service.secrets_manager = object()
+    connector_key = ("acct", "manzana")
+    connector_a = Issue224RepairConnector()
+    connector_b = Issue224RepairConnector()
+    connector_b._trading_pairs = []
+    connector_b.order_book_tracker._trading_pairs = []
+    connector_b.order_book_tracker.order_books = {}
+    connector_a._update_balances = lambda: asyncio.sleep(0)
+    connector_b._update_balances = lambda: asyncio.sleep(0)
+    service._trading_connectors = {"acct": {"manzana": connector_a}}
+    incarnation_a = service._advance_connector_incarnation(connector_key)
+    service.require_capability = lambda *args, **kwargs: None
+    entered_initialize = asyncio.Event()
+    release_initialize = asyncio.Event()
+    commit_connectors = []
+
+    async def initialize_order_book(**kwargs):
+        entered_initialize.set()
+        await release_initialize.wait()
+        connector_a.order_book_tracker._trading_pairs.append("BTC-USD")
+        connector_a.order_book_tracker.order_books["BTC-USD"] = Issue224RepairBook()
+        return True
+
+    market_data = types.SimpleNamespace(
+        initialize_order_book=initialize_order_book,
+        remove_trading_pair=lambda **kwargs: asyncio.sleep(0, result=True),
+    )
+    interface = AccountTradingInterface(service, market_data, "acct")
+    register_owner = interface._register_market_owner
+
+    def record_commit(connector_name, trading_pair):
+        commit_connectors.append(service._trading_connectors["acct"][connector_name])
+        register_owner(connector_name, trading_pair)
+
+    interface._register_market_owner = record_commit
+    key_updates = []
+    monkeypatch.setattr(
+        module.BackendAPISecurity,
+        "login_account",
+        staticmethod(lambda **kwargs: True),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module.BackendAPISecurity,
+        "update_connector_keys",
+        staticmethod(lambda *args: key_updates.append(args)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module.BackendAPISecurity,
+        "decrypt_all",
+        staticmethod(lambda **kwargs: None),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module.AllConnectorSettings,
+        "get_connector_config_keys",
+        staticmethod(lambda connector_name: object()),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module,
+        "HummingbotAPIConfigAdapter",
+        lambda config: types.SimpleNamespace(),
+    )
+
+    async def create_successor(account_name, connector_name):
+        return connector_b
+
+    service._create_and_initialize_trading_connector = create_successor
+    add_task = asyncio.create_task(interface.add_market("manzana", "BTC-USD"))
+    await entered_initialize.wait()
+    replace_task = asyncio.create_task(
+        service.update_connector_keys("acct", "manzana", {"api_key": "NEW"})
+    )
+    await asyncio.sleep(0.01)
+
+    try:
+        CHECK.assertEqual([], key_updates)
+        CHECK.assertFalse(replace_task.done())
+        CHECK.assertIs(connector_a, service._trading_connectors["acct"]["manzana"])
+        CHECK.assertEqual(
+            incarnation_a,
+            service._connector_incarnation(connector_key),
+        )
+        release_initialize.set()
+        await asyncio.wait_for(add_task, 1)
+        CHECK.assertEqual([connector_a], commit_connectors)
+        CHECK.assertIs(connector_b, await asyncio.wait_for(replace_task, 1))
+        CHECK.assertIs(connector_b, service._trading_connectors["acct"]["manzana"])
+        CHECK.assertEqual(1, connector_a.stop_calls)
+        CHECK.assertEqual(1, len(key_updates))
+    finally:
+        release_initialize.set()
+        await asyncio.gather(add_task, replace_task, return_exceptions=True)

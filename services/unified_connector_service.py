@@ -65,8 +65,12 @@ _INSTANCE_FEATURE_CALLABLE_CHAINS = MappingProxyType(
 _PUBLIC_TRANSACTION_CONTEXT = ContextVar(
     "public_transaction_context", default=None
 )
+_MARKET_TRANSACTION_CONTEXT = ContextVar(
+    "market_transaction_context", default=()
+)
 _PUBLIC_TASK_FACTORY_STATES: Dict[Any, Dict[str, Any]] = {}
 _PUBLIC_TRANSACTION_TOKEN_IDS = count(1)
+_OWNER_AUTHORITY_UNSET = object()
 
 
 class _PublicTransactionToken:
@@ -76,6 +80,15 @@ class _PublicTransactionToken:
 
     def __init__(self, token_id: int):
         self.id = token_id
+        self.active = True
+
+
+class _MarketTransactionToken:
+    """Inherited proof that one logical market transaction owns its lock."""
+
+    __slots__ = ("active",)
+
+    def __init__(self):
         self.active = True
 
 
@@ -142,6 +155,9 @@ class UnifiedConnectorService:
         self._active_public_transaction_tokens: Dict[int, Dict[str, Any]] = {}
         self._connector_incarnations: Dict[Tuple[str, str], int] = {}
         self._connector_incarnation_sequence = 0
+        self._market_locks: Dict[Tuple[str, str], asyncio.Lock] = {}
+        self._market_lock_users: Dict[Tuple[str, str], int] = {}
+        self._market_locks_guard = asyncio.Lock()
 
         # Connector settings cache
         self._conn_settings = AllConnectorSettings.get_connector_settings()
@@ -300,6 +316,13 @@ class UnifiedConnectorService:
         if not hasattr(self, "_connector_incarnation_sequence"):
             self._connector_incarnation_sequence = 0
 
+        if not hasattr(self, "_market_locks"):
+            self._market_locks = {}
+        if not hasattr(self, "_market_lock_users"):
+            self._market_lock_users = {}
+        if not hasattr(self, "_market_locks_guard"):
+            self._market_locks_guard = asyncio.Lock()
+
     def _connector_incarnation(
         self, connector_key: Tuple[str, str]
     ) -> Optional[int]:
@@ -440,6 +463,53 @@ class UnifiedConnectorService:
             self._advance_connector_incarnation(connector_key)
             self._connector_creation_residuals.pop(connector_key, None)
             return connector
+
+    @asynccontextmanager
+    async def _market_transaction_lock(
+        self, connector_key: Tuple[str, str]
+    ):
+        """Serialize market and connector mutation with inherited transaction truth."""
+        self._ensure_connector_cleanup_state()
+        scope = (id(self), connector_key)
+        inherited = _MARKET_TRANSACTION_CONTEXT.get()
+        for inherited_scope, inherited_token in reversed(inherited):
+            if inherited_scope == scope and inherited_token.active:
+                yield inherited_token
+                return
+
+        async with self._market_locks_guard:
+            lock = self._market_locks.setdefault(connector_key, asyncio.Lock())
+            self._market_lock_users[connector_key] = (
+                self._market_lock_users.get(connector_key, 0) + 1
+            )
+        acquired = False
+        transaction_token = None
+        context_token = None
+        try:
+            await lock.acquire()
+            acquired = True
+            transaction_token = _MarketTransactionToken()
+            context_token = _MARKET_TRANSACTION_CONTEXT.set(
+                (*inherited, (scope, transaction_token))
+            )
+            yield transaction_token
+        finally:
+            if transaction_token is not None:
+                transaction_token.active = False
+            if context_token is not None:
+                _MARKET_TRANSACTION_CONTEXT.reset(context_token)
+            if acquired:
+                lock.release()
+            try:
+                await asyncio.sleep(0)
+            finally:
+                users = self._market_lock_users.get(connector_key, 1) - 1
+                if users:
+                    self._market_lock_users[connector_key] = users
+                else:
+                    self._market_lock_users.pop(connector_key, None)
+                    if self._market_locks.get(connector_key) is lock:
+                        self._market_locks.pop(connector_key, None)
 
     @asynccontextmanager
     async def _connector_creation_lock(self, connector_key: Tuple[str, str]):
@@ -2842,20 +2912,37 @@ class UnifiedConnectorService:
         operation,
         *,
         timeout: float = _CONNECTOR_CLEANUP_TIMEOUT,
+        authority=_OWNER_AUTHORITY_UNSET,
+        authority_incarnation=_OWNER_AUTHORITY_UNSET,
     ):
         """Run one non-repeatable cleanup phase and retain its exact task/result."""
         self._ensure_connector_cleanup_state()
         owner_phases = self._connector_cleanup_phases.setdefault(owner_key, {})
-        phase = owner_phases.setdefault(
-            phase_name,
-            {
+        phase = owner_phases.get(phase_name)
+        if phase is None:
+            phase = {
                 "task": None,
                 "complete": False,
                 "result": None,
                 "error_code": None,
                 "cancel_requested": False,
-            },
-        )
+            }
+            if authority is not _OWNER_AUTHORITY_UNSET:
+                phase["authority"] = authority
+                phase["authority_incarnation"] = authority_incarnation
+            owner_phases[phase_name] = phase
+        elif authority is not _OWNER_AUTHORITY_UNSET:
+            retained_authority = phase.get(
+                "authority", _OWNER_AUTHORITY_UNSET
+            )
+            retained_incarnation = phase.get(
+                "authority_incarnation", _OWNER_AUTHORITY_UNSET
+            )
+            if (
+                retained_authority is not authority
+                or retained_incarnation != authority_incarnation
+            ):
+                raise RuntimeError(f"{phase_name}_authority_mismatch")
         if phase["complete"]:
             if phase["error_code"] is not None:
                 raise RuntimeError(phase["error_code"])
@@ -2999,6 +3086,7 @@ class UnifiedConnectorService:
         market_owners = getattr(self, "_market_cleanup_owners", {})
         has_connector_authority = (
             self._cached_public_connector(connector_key) is not None
+            or connector_key in self._connector_creation_residuals
             or any(key[:2] == connector_key for key in owners)
             or any(key[:2] == connector_key for key in market_owners)
         )
@@ -3379,16 +3467,33 @@ class UnifiedConnectorService:
         found.discard(current)
         return found
 
+    def _claim_connector_stop_owner(
+        self,
+        owner_key: Tuple[str, str, str],
+        connector: ConnectorBase,
+    ) -> None:
+        """Publish one physical stop owner without rebinding retained truth."""
+        retained_owner = self._connector_cleanup_owners.get(owner_key)
+        if retained_owner is not None and retained_owner is not connector:
+            raise RuntimeError("connector_stop_authority_mismatch")
+        self._connector_cleanup_owners[owner_key] = connector
+
     async def _stop_connector_network(
         self,
         connector: ConnectorBase,
         account_name: str = "__unscoped__",
         connector_name: str = "__unscoped__",
+        *,
+        authority_incarnation=_OWNER_AUTHORITY_UNSET,
     ):
         """Stop connector tasks with a hard deadline and retain pending handles."""
         self._ensure_connector_cleanup_state()
         owner_key = self._owner_key(account_name, connector_name, "network")
-        self._connector_cleanup_owners[owner_key] = connector
+        self._claim_connector_stop_owner(owner_key, connector)
+        if authority_incarnation is _OWNER_AUTHORITY_UNSET:
+            authority_incarnation = self._connector_incarnation(
+                (account_name, connector_name)
+            )
         if not await self._drain_owner_tasks(owner_key):
             raise RuntimeError("task_cleanup_pending")
         task_names = (
@@ -3426,6 +3531,8 @@ class UnifiedConnectorService:
                     owner_key,
                     "connector_stop",
                     connector.stop_network,
+                    authority=connector,
+                    authority_incarnation=authority_incarnation,
                 )
             except asyncio.CancelledError:
                 raise
@@ -3477,11 +3584,16 @@ class UnifiedConnectorService:
         connector_name: str,
         *,
         collect_connector_tasks: bool = True,
+        authority_incarnation=_OWNER_AUTHORITY_UNSET,
     ) -> None:
         """Stop one published data connector without double-stopping its tracker."""
         self._ensure_connector_cleanup_state()
         owner_key = self._owner_key("__data__", connector_name, "data_network")
-        self._connector_cleanup_owners[owner_key] = connector
+        self._claim_connector_stop_owner(owner_key, connector)
+        if authority_incarnation is _OWNER_AUTHORITY_UNSET:
+            authority_incarnation = self._connector_incarnation(
+                ("__data__", connector_name)
+            )
         if not await self._drain_owner_tasks(owner_key):
             raise RuntimeError("task_cleanup_pending")
 
@@ -3497,6 +3609,8 @@ class UnifiedConnectorService:
             owner_key,
             "connector_stop",
             stop_network,
+            authority=connector,
+            authority_incarnation=authority_incarnation,
         )
         if collect_connector_tasks:
             tasks.update(self._collect_connector_tasks(connector))
@@ -4059,14 +4173,16 @@ class UnifiedConnectorService:
         for key, value in keys.items():
             setattr(connector_config, key, value)
 
-        BackendAPISecurity.update_connector_keys(account_name, connector_config)
-        BackendAPISecurity.decrypt_all(account_name=account_name)
+        connector_key = self._connector_key(account_name, connector_name)
+        async with self._market_transaction_lock(connector_key):
+            BackendAPISecurity.update_connector_keys(account_name, connector_config)
+            BackendAPISecurity.decrypt_all(account_name=account_name)
 
-        # Properly stop old connector (stops recorders, network tasks, cleans up caches)
-        await self.stop_trading_connector(account_name, connector_name)
-
-        # Create new connector with fresh recorders
-        return await self.get_trading_connector(account_name, connector_name)
+            # Stop and recreate under one inherited market transaction. The public
+            # stop uses a shielded child task, so the transaction token, rather than
+            # task identity, proves that the outer lock is already held.
+            await self.stop_trading_connector(account_name, connector_name)
+            return await self.get_trading_connector(account_name, connector_name)
 
     def clear_trading_connector(
         self,
@@ -4196,12 +4312,13 @@ class UnifiedConnectorService:
     async def _locked_stop_trading_connector(
         self, account_name: str, connector_name: str
     ) -> Optional[CapabilityErrorDetail]:
-        """Use the same per-key transaction lock for ordinary stop and publish."""
+        """Acquire market authority before connector authority for every stop."""
         connector_key = self._connector_key(account_name, connector_name)
-        async with self._connector_creation_lock(connector_key):
-            return await self._finalize_stop_trading_connector(
-                account_name, connector_name
-            )
+        async with self._market_transaction_lock(connector_key):
+            async with self._connector_creation_lock(connector_key):
+                return await self._finalize_stop_trading_connector(
+                    account_name, connector_name
+                )
 
     async def _finalize_stop_data_connector(
         self,
@@ -4378,17 +4495,23 @@ class UnifiedConnectorService:
             market_connector = (
                 owner.get("connector") if isinstance(owner, dict) else None
             )
+            market_incarnation = (
+                owner.get("incarnation") if isinstance(owner, dict) else None
+            )
             if (
                 market_connector is not None
                 and not any(
                     market_connector is stopped for stopped in stopped_connectors
                 )
             ):
-                if restart_phase_failed:
+                if restart_phase_failed or network_cleanup_failed:
                     continue
                 try:
                     await self._stop_connector_network(
-                        market_connector, account_name, connector_name
+                        market_connector,
+                        account_name,
+                        connector_name,
+                        authority_incarnation=market_incarnation,
                     )
                 except BaseException:
                     cleanup_codes.append("market_owner_cleanup_incomplete")

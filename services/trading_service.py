@@ -295,6 +295,48 @@ class AccountTradingInterface:
             connector_name
         )
 
+    def _connector_authority(
+        self, connector_name: str, connector: ConnectorBase
+    ) -> Tuple[ConnectorBase, Optional[int]]:
+        """Snapshot the physical connector and its published incarnation."""
+        incarnation = getattr(
+            self._connector_service, "_connector_incarnation", None
+        )
+        token = (
+            incarnation((self._account_name, connector_name))
+            if callable(incarnation)
+            else None
+        )
+        return connector, token
+
+    def _require_current_connector_authority(
+        self,
+        connector_name: str,
+        authority: Tuple[ConnectorBase, Optional[int]],
+    ) -> None:
+        """Reject a local commit when physical connector ownership changed."""
+        connector, incarnation = authority
+        current_incarnation = getattr(
+            self._connector_service, "_connector_incarnation", None
+        )
+        if self.connectors.get(connector_name) is connector and (
+            not callable(current_incarnation)
+            or current_incarnation((self._account_name, connector_name))
+            == incarnation
+        ):
+            return
+        raise ConnectorCapabilityError(
+            CapabilityErrorDetail(
+                code="connector_incarnation_changed",
+                message=(
+                    f"Connector '{connector_name}' changed while adding a market"
+                ),
+                connector=connector_name,
+                feature=ConnectorFeature.LIVE_ORDER_BOOK.value,
+                reason="connector_incarnation_changed",
+            )
+        )
+
     async def add_market(
         self,
         connector_name: str,
@@ -330,6 +372,11 @@ class AccountTradingInterface:
             await self._retry_market_cleanup_residual(connector_name, trading_pair)
             connector_preexisting = connector_name in self.connectors
             connector = self.connectors.get(connector_name)
+            authority = (
+                self._connector_authority(connector_name, connector)
+                if connector is not None
+                else None
+            )
 
             # A local marker without a ready book has ambiguous remote ownership. Until
             # child B/C returns an initialization transaction result, retrying it could
@@ -343,6 +390,9 @@ class AccountTradingInterface:
                 tracker = getattr(connector, "order_book_tracker", None)
                 if self._pair_exists_in_connector_state(connector, tracker, trading_pair):
                     if self._order_book_is_ready(tracker, trading_pair):
+                        self._require_current_connector_authority(
+                            connector_name, authority
+                        )
                         self._markets.setdefault(connector_name, set()).add(trading_pair)
                         self._register_market_owner(connector_name, trading_pair)
                         self._clear_pair_residual(connector_name, trading_pair)
@@ -355,10 +405,14 @@ class AccountTradingInterface:
                     connector = self.connectors.get(connector_name)
                 if connector is None:
                     raise ValueError(f"Connector {connector_name} not available. Check credentials.")
+                authority = self._connector_authority(connector_name, connector)
 
                 tracker = getattr(connector, "order_book_tracker", None)
                 if self._pair_exists_in_connector_state(connector, tracker, trading_pair):
                     if self._order_book_is_ready(tracker, trading_pair):
+                        self._require_current_connector_authority(
+                            connector_name, authority
+                        )
                         self._markets.setdefault(connector_name, set()).add(trading_pair)
                         self._register_market_owner(connector_name, trading_pair)
                         self._clear_pair_residual(connector_name, trading_pair)
@@ -381,6 +435,9 @@ class AccountTradingInterface:
                 if hasattr(connector, "_update_balances"):
                     await connector._update_balances()
 
+                self._require_current_connector_authority(
+                    connector_name, authority
+                )
                 self._markets.setdefault(connector_name, set()).add(trading_pair)
                 self._register_market_owner(connector_name, trading_pair)
                 self._clear_pair_residual(connector_name, trading_pair)
@@ -391,6 +448,7 @@ class AccountTradingInterface:
                     trading_pair,
                     connector,
                     connector_preexisting,
+                    authority[1] if authority is not None else None,
                 )
                 if isinstance(primary_error, asyncio.CancelledError):
                     raise
@@ -402,6 +460,13 @@ class AccountTradingInterface:
     async def _market_transaction(self, connector_name: str):
         """Serialize connector-wide mutations and prune the caller-controlled lock key."""
         transaction_key = (self._account_name, connector_name)
+        shared_transaction = getattr(
+            self._connector_service, "_market_transaction_lock", None
+        )
+        if callable(shared_transaction):
+            async with shared_transaction(transaction_key):
+                yield
+            return
         async with self._market_locks_guard:
             lock = self._market_locks.setdefault(transaction_key, asyncio.Lock())
             self._market_lock_users[transaction_key] = self._market_lock_users.get(transaction_key, 0) + 1
@@ -797,6 +862,7 @@ class AccountTradingInterface:
         trading_pair: str,
         connector,
         connector_preexisting: bool,
+        connector_incarnation=None,
     ) -> Optional[CapabilityErrorDetail]:
         """Run bounded public cleanup, then remove only transaction-owned pair state."""
         same_pair_owned = self._has_other_market_owners(
@@ -855,6 +921,7 @@ class AccountTradingInterface:
         self._cleanup_owners[key] = {
             "connector": connector,
             "connector_preexisting": connector_preexisting,
+            "incarnation": connector_incarnation,
         }
         return detail
 
@@ -864,6 +931,7 @@ class AccountTradingInterface:
         trading_pair: str,
         connector,
         connector_preexisting: bool,
+        connector_incarnation=None,
     ) -> Optional[CapabilityErrorDetail]:
         """Shield finalization from caller cancellation while preserving that cancellation."""
         cleanup_task = asyncio.create_task(
@@ -872,6 +940,7 @@ class AccountTradingInterface:
                 trading_pair,
                 connector,
                 connector_preexisting,
+                connector_incarnation,
             )
         )
         cancelled = False
