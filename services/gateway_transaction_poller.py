@@ -73,26 +73,51 @@ class GatewayTransactionPoller:
 
     async def stop(self):
         """Stop the polling service."""
-        if not self._running:
-            return
-
         self._running = False
+        tasks = (
+            ("_poll_task", self._poll_task),
+            ("_position_poll_task", self._position_poll_task),
+        )
 
-        # Cancel transaction polling task
-        if self._poll_task:
-            self._poll_task.cancel()
+        async def cancel_and_drain(attribute, task):
+            if task is None:
+                return None
             try:
-                await self._poll_task
-            except asyncio.CancelledError:
-                pass
+                if not task.done():
+                    task.cancel()
+                outcome = (
+                    await asyncio.gather(task, return_exceptions=True)
+                )[0]
+                if isinstance(outcome, asyncio.CancelledError):
+                    return None
+                return outcome if isinstance(outcome, BaseException) else None
+            finally:
+                if getattr(self, attribute, None) is task:
+                    setattr(self, attribute, None)
 
-        # Cancel position polling task
-        if self._position_poll_task:
-            self._position_poll_task.cancel()
-            try:
-                await self._position_poll_task
-            except asyncio.CancelledError:
-                pass
+        # Each drain owns its own finally path. A failure from one publisher is
+        # only raised after both tasks have been cancelled and reached terminal
+        # state, so the other publisher can never be skipped.
+        failures = await asyncio.gather(
+            *(cancel_and_drain(attribute, task) for attribute, task in tasks),
+            return_exceptions=True,
+        )
+        failures = [
+            failure
+            for failure in failures
+            if isinstance(failure, BaseException)
+            and not isinstance(failure, asyncio.CancelledError)
+        ]
+        if failures:
+            logger.error(
+                "GatewayTransactionPoller stopped with %d task failure(s)",
+                len(failures),
+            )
+            if len(failures) == 1:
+                raise failures[0]
+            raise BaseExceptionGroup(
+                "GatewayTransactionPoller task failures", failures
+            )
 
         logger.info("GatewayTransactionPoller stopped")
 

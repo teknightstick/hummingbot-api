@@ -43,10 +43,12 @@ from database import (
     GatewayCLMMRepository,
     GatewaySwapRepository,
 )
+from models.connectors import CapabilityErrorDetail
 from models.executors import PositionHold
+from services.connector_capabilities import ConnectorCapabilityError, ConnectorFeature
 from services.gateway_client import get_native_gas_token
-from services.connector_capabilities import ConnectorFeature
 from services.trading_service import AccountTradingInterface, TradingService
+from utils.account_names import validate_account_name
 from utils.executor_log_capture import ExecutorLogCapture, current_executor_id
 from utils.trading_pair import InvalidTradingPair, split_trading_pair
 
@@ -831,17 +833,33 @@ class ExecutorService:
         Raises:
             HTTPException: 400 if the type is missing/invalid or the config is invalid
         """
+        connector_name = executor_config.get("connector_name")
+        error_connector = (
+            connector_name
+            if isinstance(connector_name, str) and connector_name
+            else "executor"
+        )
         executor_type = executor_config.get("type")
         if not executor_type:
-            raise HTTPException(
-                status_code=400,
-                detail="executor_config must include 'type' field"
+            raise ConnectorCapabilityError(
+                CapabilityErrorDetail(
+                    code="invalid_executor_config",
+                    message="Executor configuration must include a type.",
+                    connector=error_connector,
+                    feature="executor_creation",
+                    reason="missing_type",
+                )
             )
 
         if executor_type not in self.EXECUTOR_REGISTRY:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid executor type '{executor_type}'. Valid types: {list(self.EXECUTOR_REGISTRY.keys())}"
+            raise ConnectorCapabilityError(
+                CapabilityErrorDetail(
+                    code="invalid_executor_config",
+                    message="Executor type is not supported.",
+                    connector=error_connector,
+                    feature="executor_creation",
+                    reason="unsupported_type",
+                )
             )
 
         if "timestamp" not in executor_config or executor_config["timestamp"] is None:
@@ -850,11 +868,16 @@ class ExecutorService:
         executor_class, config_class = self.EXECUTOR_REGISTRY[executor_type]
         try:
             typed_config = config_class(**executor_config)
-        except Exception as e:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid executor config: {str(e)}"
-            )
+        except Exception as exc:
+            raise ConnectorCapabilityError(
+                CapabilityErrorDetail(
+                    code="invalid_executor_config",
+                    message="Executor configuration is invalid.",
+                    connector=error_connector,
+                    feature="executor_creation",
+                    reason="validation_failed",
+                )
+            ) from exc
 
         return executor_class, config_class, typed_config
 
@@ -929,19 +952,20 @@ class ExecutorService:
         Returns:
             Dictionary with executor_id and initial status
         """
-        account = account_name or self.default_account
+        account = validate_account_name(account_name or self.default_account)
         markets = self._extract_executor_markets(executor_config)
         self._require_executor_market_capabilities(markets)
 
         # Validation adds a default timestamp. Keep caller-owned request data exact.
         config_data = copy.deepcopy(executor_config)
-        trading_interface = self._get_trading_interface(account)
 
-        # Validate executor type and build the typed config
+        # Validate before creating or caching an account interface. A wall-clock
+        # timestamp matches a newly created interface's initial timestamp.
         executor_class, _config_class, typed_config = self._validate_executor_config(
-            config_data, default_timestamp=trading_interface.current_timestamp
+            config_data, default_timestamp=time.time()
         )
         executor_type = config_data["type"]
+        trading_interface = self._get_trading_interface(account)
 
         # Ensure connector and market are ready
         connector_name = config_data.get("connector_name")

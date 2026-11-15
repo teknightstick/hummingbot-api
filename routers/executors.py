@@ -29,6 +29,7 @@ from models.executors import (
 from models.pagination import PaginatedResponse
 from services.executor_service import ExecutorService
 from services.market_data_service import MarketDataService
+from utils.account_names import validate_account_name
 from utils.trading_pair import InvalidTradingPair, split_trading_pair
 
 logger = logging.getLogger(__name__)
@@ -68,9 +69,14 @@ async def create_executor(
     Returns the created executor ID and initial status.
     """
     try:
+        account_name = (
+            validate_account_name(request.account_name)
+            if request.account_name is not None
+            else None
+        )
         result = await executor_service.create_executor(
             executor_config=request.executor_config,
-            account_name=request.account_name,
+            account_name=account_name,
             controller_id=request.controller_id
         )
         return CreateExecutorResponse(**result)

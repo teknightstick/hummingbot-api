@@ -10,6 +10,8 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field
 
+from utils.account_names import AccountName
+
 from .pagination import PaginationParams
 
 # ========================================
@@ -292,7 +294,7 @@ class CreateExecutorRequest(BaseModel):
         }
     )
 
-    account_name: Optional[str] = Field(
+    account_name: Optional[AccountName] = Field(
         None,
         description="Account name to use (defaults to master_account)"
     )

@@ -120,6 +120,7 @@ class AccountsService:
         self.default_quote = default_quote
         self._update_account_state_task: Optional[asyncio.Task] = None
         self._order_status_polling_task: Optional[asyncio.Task] = None
+        self._publisher_tasks = set()
 
         # Cache for storing last successful prices by trading pair (per-instance)
         self._last_known_prices = {}
@@ -160,6 +161,7 @@ class AccountsService:
         )
         self._gateway_poller_started = False
         self._gateway_poller_start_task: Optional[asyncio.Task] = None
+        self._gateway_poller_start_error: Optional[Exception] = None
 
     def _ensure_account_shutdown_state(self) -> None:
         """Initialize lifecycle state for normal and dependency-light instances."""
@@ -173,6 +175,17 @@ class AccountsService:
             self._stop_in_progress = False
         if not hasattr(self, "_stop_lock"):
             self._stop_lock = asyncio.Lock()
+        if not hasattr(self, "_publisher_tasks"):
+            self._publisher_tasks = set()
+        for attribute in (
+            "_update_account_state_task",
+            "_order_status_polling_task",
+        ):
+            task = getattr(self, attribute, None)
+            if task is not None:
+                self._publisher_tasks.add(task)
+        if not hasattr(self, "_gateway_poller_start_error"):
+            self._gateway_poller_start_error = None
 
     def _ensure_account_mutations_allowed(self) -> None:
         self._ensure_account_shutdown_state()
@@ -192,6 +205,79 @@ class AccountsService:
             logger.error("%s failed during shutdown (%s)", label, type(exc).__name__)
         finally:
             if getattr(self, attribute, None) is task:
+                setattr(self, attribute, None)
+
+    @staticmethod
+    def _retrieve_task_outcome(task: asyncio.Task, label: str) -> None:
+        """Retrieve one terminal task outcome before its handle is replaced."""
+        if not task.done():
+            return
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.error("%s terminated (%s)", label, type(exc).__name__)
+
+    def _publisher_done(self, task: asyncio.Task, label: str) -> None:
+        """Retrieve failures promptly while retaining generation ownership."""
+        self._retrieve_task_outcome(task, label)
+
+    def _start_publisher_task(self, attribute: str, coroutine_factory, label: str):
+        """Reuse a live generation or retrieve and replace a terminal one."""
+        task = getattr(self, attribute, None)
+        if task is not None:
+            self._publisher_tasks.add(task)
+            if not task.done():
+                return task
+            self._retrieve_task_outcome(task, label)
+            self._publisher_tasks.discard(task)
+
+        task = asyncio.create_task(coroutine_factory())
+        task.add_done_callback(
+            lambda completed, task_label=label: self._publisher_done(
+                completed, task_label
+            )
+        )
+        self._publisher_tasks.add(task)
+        setattr(self, attribute, task)
+        return task
+
+    async def _cancel_publisher_tasks(self) -> None:
+        """Cancel and drain every owned publisher generation."""
+        self._ensure_account_shutdown_state()
+        tasks = set(self._publisher_tasks)
+        for attribute in (
+            "_update_account_state_task",
+            "_order_status_polling_task",
+        ):
+            task = getattr(self, attribute, None)
+            if task is not None:
+                tasks.add(task)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+            for task, outcome in zip(tasks, outcomes):
+                if isinstance(outcome, Exception) and not isinstance(
+                    outcome, asyncio.CancelledError
+                ):
+                    logger.error(
+                        "Publisher task failed during shutdown (%s)",
+                        type(outcome).__name__,
+                    )
+                self._retrieve_task_outcome(task, "Publisher task")
+
+        live = [task for task in tasks if not task.done()]
+        if live:
+            raise RuntimeError("account_publishers_not_quiescent")
+        self._publisher_tasks.difference_update(tasks)
+        for attribute in (
+            "_update_account_state_task",
+            "_order_status_polling_task",
+        ):
+            if getattr(self, attribute, None) in tasks:
                 setattr(self, attribute, None)
 
     async def _quiesce_account_continuations(self) -> None:
@@ -257,28 +343,56 @@ class AccountsService:
         self._stopping = False
         self._stopped = False
 
-        # Start the update loop which will call check_all_connectors
-        self._update_account_state_task = asyncio.create_task(self.update_account_state_loop())
-
-        # Start order status polling loop (every 1 minute)
-        self._order_status_polling_task = asyncio.create_task(self.order_status_polling_loop())
-        logger.info("Order status polling started (1 minute interval)")
+        # Reuse each live generation. Terminal outcomes are retrieved before a
+        # replacement is published, so no task can be orphaned by start().
+        self._start_publisher_task(
+            "_update_account_state_task",
+            self.update_account_state_loop,
+            "Account state update loop",
+        )
+        self._start_publisher_task(
+            "_order_status_polling_task",
+            self.order_status_polling_loop,
+            "Order status polling loop",
+        )
+        logger.info("Order status polling is active (1 minute interval)")
 
         # Start Gateway transaction poller
-        if not self._gateway_poller_started:
+        startup_task = getattr(self, "_gateway_poller_start_task", None)
+        if startup_task is not None and startup_task.done():
+            self._retrieve_task_outcome(startup_task, "Gateway poller startup")
+            if self._gateway_poller_start_task is startup_task:
+                self._gateway_poller_start_task = None
+            startup_task = None
+        if not self._gateway_poller_started and startup_task is None:
             self._gateway_poller_start_task = asyncio.create_task(
                 self._start_gateway_poller()
             )
-            self._gateway_poller_started = True
             logger.info("Gateway transaction poller startup initiated")
 
     async def _start_gateway_poller(self):
         """Start the Gateway transaction poller (async helper)."""
+        startup_task = asyncio.current_task()
         try:
             await self.gateway_tx_poller.start()
-            logger.info("Gateway transaction poller started successfully")
+        except asyncio.CancelledError:
+            self._gateway_poller_started = False
+            raise
         except Exception as e:
-            logger.error(f"Error starting Gateway transaction poller: {e}", exc_info=True)
+            self._gateway_poller_started = False
+            self._gateway_poller_start_error = e
+            logger.error(
+                "Gateway transaction poller startup failed (%s)",
+                type(e).__name__,
+                exc_info=True,
+            )
+        else:
+            self._gateway_poller_started = True
+            self._gateway_poller_start_error = None
+            logger.info("Gateway transaction poller started successfully")
+        finally:
+            if self._gateway_poller_start_task is startup_task:
+                self._gateway_poller_start_task = None
 
     async def stop(self):
         """
@@ -295,12 +409,7 @@ class AccountsService:
             self._stopped = False
             logger.info("Stopping AccountsService...")
             try:
-                await self._cancel_service_task(
-                    "_update_account_state_task", "Account state update loop"
-                )
-                await self._cancel_service_task(
-                    "_order_status_polling_task", "Order status polling loop"
-                )
+                await self._cancel_publisher_tasks()
                 await self._cancel_service_task(
                     "_gateway_poller_start_task", "Gateway poller startup"
                 )
@@ -310,16 +419,21 @@ class AccountsService:
                 # stop_all takes its connector inventory.
                 await self._quiesce_account_continuations()
 
-                if getattr(self, "_gateway_poller_started", False):
+                poller_failure = None
+                gateway_poller = getattr(self, "gateway_tx_poller", None)
+                if gateway_poller is not None:
                     try:
-                        await self.gateway_tx_poller.stop()
+                        await gateway_poller.stop()
                         logger.info("Gateway transaction poller stopped")
-                        self._gateway_poller_started = False
                     except Exception as e:
+                        poller_failure = e
                         logger.error(
-                            f"Error stopping Gateway transaction poller: {e}",
+                            "Gateway transaction poller stop failed (%s)",
+                            type(e).__name__,
                             exc_info=True,
                         )
+                    finally:
+                        self._gateway_poller_started = False
 
                 try:
                     await self.gateway_wallet_service.close()
@@ -337,6 +451,10 @@ class AccountsService:
                 await self._quiesce_account_continuations()
                 if self._account_continuations:
                     raise RuntimeError("account_continuations_not_quiescent")
+                if any(not task.done() for task in self._publisher_tasks):
+                    raise RuntimeError("account_publishers_not_quiescent")
+                if poller_failure is not None:
+                    raise poller_failure
                 self._stopped = True
                 logger.info("AccountsService stopped successfully")
             finally:

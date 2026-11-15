@@ -11860,3 +11860,353 @@ def test_issue224_reserved_account_routes_declare_exact_typed_400_refs():
         CHECK.assertEqual(
             "#/components/schemas/CapabilityErrorResponse", schema["$ref"]
         )
+
+
+def _load_gateway_transaction_poller_module():
+    database = _module("database")
+    database.AsyncDatabaseManager = type("AsyncDatabaseManager", (), {})
+    gateway_client = _module("services.gateway_client")
+    gateway_client.GatewayClient = type("GatewayClient", (), {})
+    gateway_client.get_native_gas_token = lambda chain: "SOL"
+    clmm_service = _module("services.gateway_clmm_service")
+    clmm_service.GatewayCLMMService = type("GatewayCLMMService", (), {})
+    swap_service = _module("services.gateway_swap_service")
+    swap_service.GatewaySwapService = type("GatewaySwapService", (), {})
+
+    module_name = "issue224_gateway_transaction_poller_under_test"
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        Path(__file__).resolve().parents[1]
+        / "services"
+        / "gateway_transaction_poller.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _issue224_publisher_probe_service(accounts_module, gateway_poller):
+    events = []
+
+    class ConnectorService:
+        async def stop_all(self):
+            events.append("connectors-stopped")
+
+    class WalletService:
+        async def close(self):
+            events.append("wallet-closed")
+
+    service = object.__new__(accounts_module.AccountsService)
+    service._connector_service = ConnectorService()
+    service.gateway_wallet_service = WalletService()
+    service.gateway_tx_poller = gateway_poller
+    service.accounts_state = {}
+    service._update_account_state_task = None
+    service._order_status_polling_task = None
+    service._gateway_poller_start_task = None
+    service._gateway_poller_started = False
+    service._account_continuations = set()
+    service._stopping = False
+    service._stopped = False
+    service._stop_in_progress = False
+    service._stop_lock = asyncio.Lock()
+    return service, events
+
+
+@pytest.mark.asyncio
+async def test_issue224_accounts_publishers_are_generation_safe_and_drained():
+    accounts_module = _load_accounts_service_module()
+    complete_first = asyncio.Event()
+    fail_second = asyncio.Event()
+    publisher_calls = 0
+    owned_tasks = set()
+
+    class GatewayPoller:
+        async def start(self):
+            return None
+
+        async def stop(self):
+            return None
+
+    service, _ = _issue224_publisher_probe_service(
+        accounts_module, GatewayPoller()
+    )
+
+    async def update_loop():
+        nonlocal publisher_calls
+        publisher_calls += 1
+        generation = publisher_calls
+        if generation == 1:
+            await complete_first.wait()
+            return "first-complete"
+        if generation == 2:
+            await fail_second.wait()
+            raise RuntimeError("publisher-generation-failed")
+        await asyncio.Event().wait()
+
+    async def order_loop():
+        await asyncio.Event().wait()
+
+    service.update_account_state_loop = update_loop
+    service.order_status_polling_loop = order_loop
+    try:
+        service.start()
+        first_update = service._update_account_state_task
+        first_order = service._order_status_polling_task
+        owned_tasks.update((first_update, first_order))
+        service.start()
+        CHECK.assertIs(first_update, service._update_account_state_task)
+        CHECK.assertIs(first_order, service._order_status_polling_task)
+
+        complete_first.set()
+        await first_update
+        service.start()
+        second_update = service._update_account_state_task
+        owned_tasks.add(second_update)
+        CHECK.assertIsNot(first_update, second_update)
+        CHECK.assertIs(first_order, service._order_status_polling_task)
+
+        fail_second.set()
+        await asyncio.sleep(0)
+        CHECK.assertTrue(second_update.done())
+        service.start()
+        third_update = service._update_account_state_task
+        owned_tasks.add(third_update)
+        CHECK.assertIsNot(second_update, third_update)
+        CHECK.assertFalse(second_update._log_traceback)
+
+        await service.stop()
+        CHECK.assertTrue(all(task.done() for task in owned_tasks))
+        CHECK.assertTrue(service._stopped)
+    finally:
+        for task in owned_tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*owned_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_issue224_gateway_poller_stop_drains_both_tasks_before_failure():
+    module = _load_gateway_transaction_poller_module()
+    position_cancelled = asyncio.Event()
+
+    async def failed_transaction_publisher():
+        raise RuntimeError("transaction-publisher-failed")
+
+    async def position_publisher():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            position_cancelled.set()
+
+    transaction_task = asyncio.create_task(failed_transaction_publisher())
+    position_task = asyncio.create_task(position_publisher())
+    await asyncio.sleep(0)
+    poller = object.__new__(module.GatewayTransactionPoller)
+    poller._running = True
+    poller._poll_task = transaction_task
+    poller._position_poll_task = position_task
+    try:
+        with pytest.raises(RuntimeError, match="transaction-publisher-failed"):
+            await poller.stop()
+        CHECK.assertTrue(position_cancelled.is_set())
+        CHECK.assertTrue(transaction_task.done())
+        CHECK.assertTrue(position_task.done())
+        CHECK.assertFalse(transaction_task._log_traceback)
+        CHECK.assertIsNone(poller._poll_task)
+        CHECK.assertIsNone(poller._position_poll_task)
+    finally:
+        for task in (transaction_task, position_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(
+            transaction_task, position_task, return_exceptions=True
+        )
+
+
+@pytest.mark.asyncio
+async def test_issue224_gateway_start_failure_retries_without_replacing_publishers():
+    accounts_module = _load_accounts_service_module()
+    start_calls = 0
+    owned_tasks = set()
+
+    class GatewayPoller:
+        async def start(self):
+            nonlocal start_calls
+            start_calls += 1
+            if start_calls == 1:
+                raise RuntimeError("gateway-start-failed")
+
+        async def stop(self):
+            return None
+
+    service, _ = _issue224_publisher_probe_service(
+        accounts_module, GatewayPoller()
+    )
+
+    async def publisher():
+        await asyncio.Event().wait()
+
+    service.update_account_state_loop = publisher
+    service.order_status_polling_loop = publisher
+    try:
+        service.start()
+        update_task = service._update_account_state_task
+        order_task = service._order_status_polling_task
+        owned_tasks.update((update_task, order_task))
+        await asyncio.sleep(0)
+        CHECK.assertEqual(1, start_calls)
+        CHECK.assertFalse(service._gateway_poller_started)
+        CHECK.assertIsNone(service._gateway_poller_start_task)
+
+        service.start()
+        CHECK.assertIs(update_task, service._update_account_state_task)
+        CHECK.assertIs(order_task, service._order_status_polling_task)
+        await asyncio.sleep(0)
+        CHECK.assertEqual(2, start_calls)
+        CHECK.assertTrue(service._gateway_poller_started)
+        CHECK.assertIsNone(service._gateway_poller_start_task)
+        await service.stop()
+    finally:
+        for task in owned_tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*owned_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_issue224_accounts_stop_propagates_poller_failure_after_terminal_work():
+    accounts_module = _load_accounts_service_module()
+    publisher_tasks = []
+
+    class GatewayPoller:
+        async def start(self):
+            return None
+
+        async def stop(self):
+            CHECK.assertTrue(all(task.done() for task in publisher_tasks))
+            raise RuntimeError("gateway-poller-stop-failed")
+
+    service, events = _issue224_publisher_probe_service(
+        accounts_module, GatewayPoller()
+    )
+
+    async def publisher():
+        await asyncio.Event().wait()
+
+    service.update_account_state_loop = publisher
+    service.order_status_polling_loop = publisher
+    service.start()
+    publisher_tasks.extend(
+        (
+            service._update_account_state_task,
+            service._order_status_polling_task,
+        )
+    )
+    await asyncio.sleep(0)
+    try:
+        with pytest.raises(RuntimeError, match="gateway-poller-stop-failed"):
+            await service.stop()
+        CHECK.assertTrue(all(task.done() for task in publisher_tasks))
+        CHECK.assertEqual(
+            ["wallet-closed", "connectors-stopped"], events
+        )
+        CHECK.assertFalse(service._stopped)
+    finally:
+        for task in publisher_tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*publisher_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_issue224_executor_account_and_config_errors_are_typed_and_pure():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from models.connectors import CapabilityErrorResponse
+    from models.executors import CreateExecutorRequest
+    from routers import executors as executors_router
+    from services.connector_capabilities import ConnectorCapabilityError
+
+    route_calls = []
+
+    class RouteService:
+        async def create_executor(self, **kwargs):
+            route_calls.append(kwargs)
+            raise AssertionError("reserved account reached executor service")
+
+    app = FastAPI()
+    app.include_router(executors_router.router)
+    app.dependency_overrides[executors_router.get_executor_service] = RouteService
+    client = TestClient(app)
+    reserved = client.post(
+        "/executors/",
+        json={"account_name": "__data__", "executor_config": {}},
+    )
+    CHECK.assertEqual(400, reserved.status_code, reserved.text)
+    CHECK.assertEqual([], route_calls)
+    CHECK.assertEqual(
+        "invalid_account_resource_name", reserved.json()["detail"]["code"]
+    )
+    CapabilityErrorResponse.model_validate(reserved.json())
+    with pytest.raises(ConnectorCapabilityError):
+        CreateExecutorRequest(
+            account_name="__data__", executor_config={}
+        )
+
+    module = _load_executor_service_module()
+    interface_calls = []
+
+    class ConnectorService:
+        def require_capability(self, *args, **kwargs):
+            return None
+
+    class TradingService:
+        connector_service = ConnectorService()
+
+        def get_trading_interface(self, account_name):
+            interface_calls.append(account_name)
+            return types.SimpleNamespace(current_timestamp=123.0)
+
+    service = object.__new__(module.ExecutorService)
+    service._trading_service = TradingService()
+    service._trading_interfaces = {}
+    service.default_account = "master_account"
+
+    invalid_cases = (
+        ({}, "missing_type"),
+        ({"type": "PRIVATE-INVALID-TYPE"}, "unsupported_type"),
+    )
+    for config, reason in invalid_cases:
+        with pytest.raises(ConnectorCapabilityError) as captured:
+            await service.create_executor(config, account_name="master_account")
+        CHECK.assertEqual(reason, captured.value.detail["reason"])
+        CHECK.assertNotIn("PRIVATE", json.dumps(captured.value.detail))
+        CapabilityErrorResponse.model_validate(
+            {"detail": captured.value.detail}
+        )
+
+    class StrictConfig(BaseModel):
+        amount: int
+
+    service.EXECUTOR_REGISTRY = {
+        "position_executor": (object, StrictConfig)
+    }
+    with pytest.raises(ConnectorCapabilityError) as invalid_config:
+        await service.create_executor(
+            {"type": "position_executor", "amount": "PRIVATE-CONFIG"},
+            account_name="master_account",
+        )
+    CHECK.assertEqual(
+        "validation_failed", invalid_config.value.detail["reason"]
+    )
+    CHECK.assertNotIn("PRIVATE-CONFIG", json.dumps(invalid_config.value.detail))
+    CHECK.assertEqual([], interface_calls)
+    CHECK.assertEqual({}, service._trading_interfaces)
+
+    responses = app.openapi()["paths"]["/executors/"]["post"]["responses"]
+    CHECK.assertEqual(
+        "#/components/schemas/CapabilityErrorResponse",
+        responses["400"]["content"]["application/json"]["schema"]["$ref"],
+    )
