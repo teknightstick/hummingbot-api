@@ -111,6 +111,10 @@ class AccountsService:
         self.secrets_manager = ETHKeyFileSecretManger(settings.security.config_password)
         self.accounts_state = {}
         self._account_continuations = set()
+        self._stopping = False
+        self._stopped = False
+        self._stop_in_progress = False
+        self._stop_lock = asyncio.Lock()
         self.update_account_state_interval = account_update_interval * 60
         self.order_status_poll_interval = 60  # Poll order status every 1 minute
         self.default_quote = default_quote
@@ -155,6 +159,56 @@ class AccountsService:
             max_retry_age=3600  # Stop retrying after 1 hour
         )
         self._gateway_poller_started = False
+        self._gateway_poller_start_task: Optional[asyncio.Task] = None
+
+    def _ensure_account_shutdown_state(self) -> None:
+        """Initialize lifecycle state for normal and dependency-light instances."""
+        if not hasattr(self, "_account_continuations"):
+            self._account_continuations = set()
+        if not hasattr(self, "_stopping"):
+            self._stopping = False
+        if not hasattr(self, "_stopped"):
+            self._stopped = False
+        if not hasattr(self, "_stop_in_progress"):
+            self._stop_in_progress = False
+        if not hasattr(self, "_stop_lock"):
+            self._stop_lock = asyncio.Lock()
+
+    def _ensure_account_mutations_allowed(self) -> None:
+        self._ensure_account_shutdown_state()
+        if self._stopping:
+            raise RuntimeError("accounts_service_stopping")
+
+    async def _cancel_service_task(self, attribute: str, label: str) -> None:
+        task = getattr(self, attribute, None)
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.error("%s failed during shutdown (%s)", label, type(exc).__name__)
+        finally:
+            if getattr(self, attribute, None) is task:
+                setattr(self, attribute, None)
+
+    async def _quiesce_account_continuations(self) -> None:
+        """Request cancellation once, then wait for physical transaction truth."""
+        self._ensure_account_shutdown_state()
+        while True:
+            terminal = {
+                task for task in self._account_continuations if task.done()
+            }
+            self._account_continuations.difference_update(terminal)
+            live = tuple(self._account_continuations)
+            if not live:
+                return
+            for task in live:
+                task.cancel("accounts-service-stopping")
+            await asyncio.gather(*live, return_exceptions=True)
+            self._account_continuations.difference_update(live)
 
     def get_accounts_state(self):
         return self.accounts_state
@@ -191,6 +245,18 @@ class AccountsService:
         Note: Balance updates are now handled by manual connector state updates.
         :return:
         """
+        self._ensure_account_shutdown_state()
+        if self._stop_in_progress:
+            raise RuntimeError("accounts_service_stop_in_progress")
+        if any(not task.done() for task in self._account_continuations):
+            raise RuntimeError("account_continuations_not_quiescent")
+        if self._stopping and not self._stopped:
+            raise RuntimeError("accounts_service_stop_incomplete")
+        # A successful stop leaves the mutation gate closed. Only an explicit
+        # start reopens it, after proving no prior continuation can publish.
+        self._stopping = False
+        self._stopped = False
+
         # Start the update loop which will call check_all_connectors
         self._update_account_state_task = asyncio.create_task(self.update_account_state_loop())
 
@@ -200,7 +266,9 @@ class AccountsService:
 
         # Start Gateway transaction poller
         if not self._gateway_poller_started:
-            asyncio.create_task(self._start_gateway_poller())
+            self._gateway_poller_start_task = asyncio.create_task(
+                self._start_gateway_poller()
+            )
             self._gateway_poller_started = True
             logger.info("Gateway transaction poller startup initiated")
 
@@ -217,39 +285,62 @@ class AccountsService:
         Stop all accounts service tasks and cleanup resources.
         This is the main cleanup method that should be called during application shutdown.
         """
-        logger.info("Stopping AccountsService...")
-
-        # Stop the account state update loop
-        if self._update_account_state_task:
-            self._update_account_state_task.cancel()
-            self._update_account_state_task = None
-            logger.info("Stopped account state update loop")
-
-        # Stop the order status polling loop
-        if self._order_status_polling_task:
-            self._order_status_polling_task.cancel()
-            self._order_status_polling_task = None
-            logger.info("Stopped order status polling loop")
-
-        # Stop Gateway transaction poller
-        if self._gateway_poller_started:
+        self._ensure_account_shutdown_state()
+        # Close the gate before the first await so no mutation can race into the
+        # continuation registry while shutdown takes its terminal snapshot.
+        self._stopping = True
+        async with self._stop_lock:
+            self._stopping = True
+            self._stop_in_progress = True
+            self._stopped = False
+            logger.info("Stopping AccountsService...")
             try:
-                await self.gateway_tx_poller.stop()
-                logger.info("Gateway transaction poller stopped")
-                self._gateway_poller_started = False
-            except Exception as e:
-                logger.error(f"Error stopping Gateway transaction poller: {e}", exc_info=True)
+                await self._cancel_service_task(
+                    "_update_account_state_task", "Account state update loop"
+                )
+                await self._cancel_service_task(
+                    "_order_status_polling_task", "Order status polling loop"
+                )
+                await self._cancel_service_task(
+                    "_gateway_poller_start_task", "Gateway poller startup"
+                )
 
-        # Close the GeckoTerminal price source HTTP client
-        try:
-            await self.gateway_wallet_service.close()
-        except Exception as e:
-            logger.error(f"Error closing Gateway wallet service: {e}", exc_info=True)
+                # Credential/account continuations own unpublished candidates
+                # and transaction locks. They must reach terminal cleanup before
+                # stop_all takes its connector inventory.
+                await self._quiesce_account_continuations()
 
-        # Stop all connectors through the connector service
-        await self._connector_service.stop_all()
+                if getattr(self, "_gateway_poller_started", False):
+                    try:
+                        await self.gateway_tx_poller.stop()
+                        logger.info("Gateway transaction poller stopped")
+                        self._gateway_poller_started = False
+                    except Exception as e:
+                        logger.error(
+                            f"Error stopping Gateway transaction poller: {e}",
+                            exc_info=True,
+                        )
 
-        logger.info("AccountsService stopped successfully")
+                try:
+                    await self.gateway_wallet_service.close()
+                except Exception as e:
+                    logger.error(
+                        f"Error closing Gateway wallet service: {e}",
+                        exc_info=True,
+                    )
+
+                await self._connector_service.stop_all()
+
+                # Let terminal callbacks run, then prove the closed gate did not
+                # admit a late continuation or candidate publisher.
+                await asyncio.sleep(0)
+                await self._quiesce_account_continuations()
+                if self._account_continuations:
+                    raise RuntimeError("account_continuations_not_quiescent")
+                self._stopped = True
+                logger.info("AccountsService stopped successfully")
+            finally:
+                self._stop_in_progress = False
 
     async def _refresh_and_get_tokens_info(self, connector, connector_name: str, account_name: str) -> List[Dict]:
         """Refresh connector state from exchange, then get token info with prices.
@@ -318,10 +409,13 @@ class AccountsService:
                 self._mirror_gateway_state_to_accounts(gateway_meta)
 
                 await self.dump_account_state()
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error(f"Error updating account state: {e}")
-            finally:
-                await asyncio.sleep(self.update_account_state_interval)
+            if getattr(self, "_stopping", False):
+                return
+            await asyncio.sleep(self.update_account_state_interval)
 
     async def order_status_polling_loop(self):
         """
@@ -333,10 +427,13 @@ class AccountsService:
         while True:
             try:
                 await self._connector_service.sync_all_orders_to_database()
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error(f"Error syncing order state to database: {e}")
-            finally:
-                await asyncio.sleep(self.order_status_poll_interval)
+            if getattr(self, "_stopping", False):
+                return
+            await asyncio.sleep(self.order_status_poll_interval)
 
     async def dump_account_state(self):
         """
@@ -411,6 +508,8 @@ class AccountsService:
         Check all available credentials for all accounts and ensure connectors are initialized.
         This method is idempotent - it only initializes missing connectors.
         """
+        if getattr(self, "_stopping", False):
+            return
         for account_name in self.list_accounts():
             await self._ensure_account_connectors_initialized(account_name)
 
@@ -421,6 +520,8 @@ class AccountsService:
 
         :param account_name: The name of the account to initialize connectors for.
         """
+        if getattr(self, "_stopping", False):
+            return
         # Initialize missing connectors
         for connector_name in self._connector_service.list_available_credentials(account_name):
             try:
@@ -462,6 +563,7 @@ class AccountsService:
             connector_names: If provided, only update these connectors. If None, update all connectors.
                             For Gateway, this filters by chain-network (e.g., 'solana-mainnet-beta').
         """
+        self._ensure_account_mutations_allowed()
         all_connectors = {
             account_name: dict(connectors)
             for account_name, connectors in (
@@ -545,6 +647,8 @@ class AccountsService:
         Args:
             gateway_meta: (account_name, connector_name) pairs of Gateway connectors.
         """
+        if getattr(self, "_stopping", False):
+            return
         master_state = self.accounts_state.get("master_account", {})
         for account_name, connector_name in gateway_meta:
             if account_name == "master_account":
@@ -659,6 +763,7 @@ class AccountsService:
                         account_name=account_name,
                         authority_held=True,
                     )
+                    self._ensure_account_mutations_allowed()
                     self.accounts_state.setdefault(account_name, {})[
                         connector_name
                     ] = result
@@ -749,8 +854,13 @@ class AccountsService:
 
     async def _run_account_continuation(self, operation):
         """Return caller cancellation while a transaction child keeps its locks."""
-        if not hasattr(self, "_account_continuations"):
-            self._account_continuations = set()
+        try:
+            self._ensure_account_mutations_allowed()
+        except BaseException:
+            close = getattr(operation, "close", None)
+            if callable(close):
+                close()
+            raise
         continuation = asyncio.create_task(operation)
         self._account_continuations.add(continuation)
         continuation.add_done_callback(self._account_continuation_done)
@@ -789,6 +899,7 @@ class AccountsService:
         return None
 
     async def add_credentials(self, account_name: str, connector_name: str, credentials: dict):
+        self._ensure_account_mutations_allowed()
         validate_safe_name(account_name, "account name")
         validate_safe_name(connector_name, "connector name")
         return await self._run_account_continuation(
@@ -810,6 +921,7 @@ class AccountsService:
         """
         validate_safe_name(account_name, "account name")
         validate_safe_name(connector_name, "connector name")
+        self._ensure_account_mutations_allowed()
 
         # Snapshot rollback truth only after acquiring same-key authority. The staged
         # connector remains unpublished until validation and account-state refresh pass.
@@ -860,6 +972,7 @@ class AccountsService:
                 )
                 staged_state_ready = True
                 commit_started = True
+                self._ensure_account_mutations_allowed()
                 await self._connector_service.commit_staged_connector_keys_already_locked(
                     account_name, connector_name, stage
                 )
@@ -885,7 +998,7 @@ class AccountsService:
                         connector_name,
                         prior_connector_existed=prior_connector_existed,
                     )
-                    if terminal_success is True:
+                    if terminal_success is True and not self._stopping:
                         await self._connector_service.commit_staged_connector_keys_already_locked(
                             account_name, connector_name, stage
                         )
@@ -942,6 +1055,7 @@ class AccountsService:
     async def delete_credentials(self, account_name: str, connector_name: str):
         validate_safe_name(account_name, "account name")
         validate_safe_name(connector_name, "connector name")
+        self._ensure_account_mutations_allowed()
         return await self._run_account_continuation(
             self._delete_credentials_transaction(account_name, connector_name)
         )
@@ -957,6 +1071,7 @@ class AccountsService:
         """
         validate_safe_name(account_name, "account name")
         validate_safe_name(connector_name, "connector name")
+        self._ensure_account_mutations_allowed()
         async with self._connector_service.credential_transaction(
             account_name, connector_name
         ):
@@ -1018,6 +1133,7 @@ class AccountsService:
         :param account_name:
         :return:
         """
+        self._ensure_account_mutations_allowed()
         validate_safe_name(account_name, "account name")
         # Check if account already exists by looking at folders
         if account_name in self.list_accounts():
@@ -1033,6 +1149,7 @@ class AccountsService:
         self.accounts_state[account_name] = {}
 
     async def delete_account(self, account_name: str):
+        self._ensure_account_mutations_allowed()
         validate_safe_name(account_name, "account name")
         return await self._run_account_continuation(
             self._delete_account_transaction(account_name)
@@ -1045,6 +1162,7 @@ class AccountsService:
         :return:
         """
         validate_safe_name(account_name, "account name")
+        self._ensure_account_mutations_allowed()
         async with self._connector_service.account_transaction(account_name):
             account_state_existed = account_name in self.accounts_state
             original_account_state = (
@@ -1554,6 +1672,8 @@ class AccountsService:
                            If None, update all defaultNetworks for each chain.
         """
         try:
+            if getattr(self, "_stopping", False):
+                return
             # Check if Gateway is available
             if not await self.gateway_client.ping():
                 logger.debug("Gateway service is not available, skipping wallet balance update")
@@ -1563,6 +1683,8 @@ class AccountsService:
             chains_result = await self.gateway_client.get_chains()
             if not chains_result or "chains" not in chains_result:
                 logger.error("Could not get chains from Gateway")
+                return
+            if getattr(self, "_stopping", False):
                 return
 
             known_chains = {c["chain"] for c in chains_result["chains"]}
@@ -1593,6 +1715,8 @@ class AccountsService:
                 ],
                 return_exceptions=True,
             )
+            if getattr(self, "_stopping", False):
+                return
 
             # For each chain, build balance tasks from its resolved config
             for chain_info, config in zip(chains_with_networks, config_results):
@@ -1647,6 +1771,8 @@ class AccountsService:
             # Execute all balance queries in parallel
             if balance_tasks:
                 results = await asyncio.gather(*balance_tasks, return_exceptions=True)
+                if getattr(self, "_stopping", False):
+                    return
 
                 # Process results
                 for result, (chain, network, address) in zip(results, task_metadata):

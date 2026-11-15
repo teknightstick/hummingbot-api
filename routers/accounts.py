@@ -40,7 +40,11 @@ async def list_accounts(accounts_service: AccountsService = Depends(get_accounts
     return accounts_service.list_accounts()
 
 
-@router.get("/{account_name}/credentials", response_model=List[str])
+@router.get(
+    "/{account_name}/credentials",
+    response_model=List[str],
+    responses={400: {"model": CapabilityErrorResponse}},
+)
 async def list_account_credentials(account_name: str,
                                    accounts_service: AccountsService = Depends(get_accounts_service)):
     """
@@ -65,7 +69,11 @@ async def list_account_credentials(account_name: str,
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/add-account", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/add-account",
+    status_code=status.HTTP_201_CREATED,
+    responses={400: {"model": CapabilityErrorResponse}},
+)
 async def add_account(account_name: str, accounts_service: AccountsService = Depends(get_accounts_service)):
     """
     Create a new account with default configuration files.
@@ -83,8 +91,24 @@ async def add_account(account_name: str, accounts_service: AccountsService = Dep
     try:
         accounts_service.add_account(account_name)
         return {"message": "Account added successfully."}
+    except ConnectorCapabilityError:
+        raise
+    except HTTPException as exc:
+        if exc.status_code != 400:
+            raise
+        raise _account_mutation_error(
+            "account_create_failed",
+            "Unable to create the account",
+            account_name,
+            "account_create_failed",
+        ) from exc
     except FileExistsError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise _account_mutation_error(
+            "account_create_failed",
+            "Unable to create the account",
+            account_name,
+            "account_create_failed",
+        ) from e
 
 
 @router.post(

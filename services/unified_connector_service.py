@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 from hummingbot.client.config.config_crypt import ETHKeyFileSecretManger
 from hummingbot.client.config.config_helpers import ClientConfigAdapter, api_keys_from_connector_config_map, get_connector_class
+from hummingbot.client.config.security import Security
 from hummingbot.client.settings import AllConnectorSettings
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.connector.connector_metrics_collector import TradeVolumeMetricCollector
@@ -5438,6 +5439,18 @@ class UnifiedConnectorService:
             raise RuntimeError("account_transaction_authority_unavailable")
         return current_task
 
+    @staticmethod
+    def _require_exact_backend_api_security_root() -> asyncio.Task:
+        """Return the task holding the process-global security transaction."""
+        current_task = asyncio.current_task()
+        if (
+            current_task is None
+            or _BACKEND_API_SECURITY_TRANSACTION_OWNER is not current_task
+            or _BACKEND_API_SECURITY_TRANSACTION_DEPTH <= 0
+        ):
+            raise RuntimeError("security_transaction_authority_unavailable")
+        return current_task
+
     @asynccontextmanager
     async def credential_transaction(
         self, account_name: str, connector_name: str
@@ -5473,6 +5486,18 @@ class UnifiedConnectorService:
                 and hasattr(decryption_done, "is_set")
                 else None
             ),
+            "backend_secrets_manager_present": (
+                "secrets_manager" in BackendAPISecurity.__dict__
+            ),
+            "backend_secrets_manager": BackendAPISecurity.__dict__.get(
+                "secrets_manager"
+            ),
+            "security_secrets_manager_present": (
+                "secrets_manager" in Security.__dict__
+            ),
+            "security_secrets_manager": Security.__dict__.get(
+                "secrets_manager"
+            ),
         }
 
     def _credential_publication_snapshot(
@@ -5499,6 +5524,7 @@ class UnifiedConnectorService:
         connector_name: str,
         stage: Mapping[str, Any],
     ) -> None:
+        self._require_exact_backend_api_security_root()
         if stage.get("credentials_committed") or stage.get("credentials_rolled_back"):
             return
         snapshot = stage.get("credential_snapshot")
@@ -5528,6 +5554,20 @@ class UnifiedConnectorService:
                     decryption_done.set()
                 else:
                     decryption_done.clear()
+            for security_type, prefix in (
+                (BackendAPISecurity, "backend"),
+                (Security, "security"),
+            ):
+                present = security.get(f"{prefix}_secrets_manager_present")
+                if present is True:
+                    security_type.secrets_manager = security.get(
+                        f"{prefix}_secrets_manager"
+                    )
+                elif (
+                    present is False
+                    and "secrets_manager" in security_type.__dict__
+                ):
+                    delattr(security_type, "secrets_manager")
             connector_settings = snapshot.get("connector_settings")
             update_settings = getattr(
                 AllConnectorSettings, "update_connector_config_keys", None
@@ -5545,39 +5585,49 @@ class UnifiedConnectorService:
     ) -> Dict[str, Any]:
         """Validate a replacement connector without publishing file or cache state."""
         connector_key = self._connector_key(account_name, connector_name)
+        self._require_exact_backend_api_security_root()
         self._require_exact_market_root(connector_key)
         self._require_exact_account_root(account_name)
-        if not BackendAPISecurity.login_account(
-            account_name=account_name,
-            secrets_manager=self.secrets_manager,
-        ):
-            raise ValueError(f"Failed to authenticate for {account_name}")
-
-        connector_config = HummingbotAPIConfigAdapter(
-            copy.deepcopy(
-                AllConnectorSettings.get_connector_config_keys(connector_name)
-            )
-        )
-        for key, value in keys.items():
-            setattr(connector_config, key, value)
-        api_keys = api_keys_from_connector_config_map(connector_config)
-        connector = self._create_trading_connector(
-            account_name, connector_name, api_keys=api_keys
+        # Capture the complete rollback image before login_account can clear or
+        # repopulate the process-global security map. From this point until the
+        # synchronous commit marker, every failure path restores this image.
+        credential_snapshot = self._credential_publication_snapshot(
+            account_name, connector_name
         )
         stage = {
-            "connector": connector,
-            "config": connector_config,
+            "connector": None,
+            "config": None,
             "indices": {},
             "activated": False,
             "committed": False,
-            "credential_snapshot": self._credential_publication_snapshot(
-                account_name, connector_name
-            ),
+            "credential_snapshot": credential_snapshot,
             "credentials_touched": False,
             "credentials_committed": False,
             "credentials_rolled_back": False,
         }
         try:
+            # The touched marker is installed only after the snapshot exists and
+            # immediately before the first security mutation.
+            stage["credentials_touched"] = True
+            if not BackendAPISecurity.login_account(
+                account_name=account_name,
+                secrets_manager=self.secrets_manager,
+            ):
+                raise ValueError(f"Failed to authenticate for {account_name}")
+
+            connector_config = HummingbotAPIConfigAdapter(
+                copy.deepcopy(
+                    AllConnectorSettings.get_connector_config_keys(connector_name)
+                )
+            )
+            stage["config"] = connector_config
+            for key, value in keys.items():
+                setattr(connector_config, key, value)
+            api_keys = api_keys_from_connector_config_map(connector_config)
+            connector = self._create_trading_connector(
+                account_name, connector_name, api_keys=api_keys
+            )
+            stage["connector"] = connector
             await self._initialize_trading_connector_candidate(
                 connector, account_name, connector_name
             )
@@ -5588,7 +5638,6 @@ class UnifiedConnectorService:
                 staged_indices=stage["indices"],
             )
             stage["activated"] = True
-            stage["credentials_touched"] = True
             BackendAPISecurity.update_connector_keys(
                 account_name, stage["config"]
             )
@@ -5611,11 +5660,14 @@ class UnifiedConnectorService:
         self._require_exact_market_root(connector_key)
         self._require_exact_account_root(account_name)
         connector = stage.get("connector")
-        if connector is None or stage.get("discarded"):
+        if stage.get("discarded"):
             return
         if isinstance(stage, dict):
             stage["discarded"] = True
-        if self._cached_public_connector(connector_key) is connector:
+        if (
+            connector is not None
+            and self._cached_public_connector(connector_key) is connector
+        ):
             account_connectors = self._trading_connectors.get(account_name, {})
             account_connectors.pop(connector_name, None)
             if not account_connectors:
@@ -5631,15 +5683,16 @@ class UnifiedConnectorService:
                 )
             except BaseException as exc:
                 cleanup_error = cleanup_error or exc
-        try:
-            await self._stop_connector_network(
-                connector,
-                account_name,
-                connector_name,
-                owner_kind="credential_candidate_network",
-            )
-        except BaseException as exc:
-            cleanup_error = cleanup_error or exc
+        if connector is not None:
+            try:
+                await self._stop_connector_network(
+                    connector,
+                    account_name,
+                    connector_name,
+                    owner_kind="credential_candidate_network",
+                )
+            except BaseException as exc:
+                cleanup_error = cleanup_error or exc
         try:
             self._restore_staged_credential_publication(
                 account_name, connector_name, stage

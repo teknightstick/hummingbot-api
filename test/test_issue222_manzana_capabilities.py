@@ -1317,6 +1317,9 @@ def test_b2_unified_service_resolves_cached_instance_declaration():
     config_helpers.ClientConfigAdapter = type("ClientConfigAdapter", (), {})
     config_helpers.api_keys_from_connector_config_map = lambda value: {}
     config_helpers.get_connector_class = lambda name: object
+    security_module = _module("hummingbot.client.config.security")
+    if not hasattr(security_module, "Security"):
+        security_module.Security = type("Security", (), {})
     metrics = _module("hummingbot.connector.connector_metrics_collector")
     metrics.TradeVolumeMetricCollector = type("TradeVolumeMetricCollector", (), {})
     exchange = _module("hummingbot.connector.exchange_py_base")
@@ -2296,6 +2299,9 @@ def _load_unified_service_module():
     config_helpers.ClientConfigAdapter = type("ClientConfigAdapter", (), {})
     config_helpers.api_keys_from_connector_config_map = lambda value: {}
     config_helpers.get_connector_class = lambda name: object
+    security_module = _module("hummingbot.client.config.security")
+    if not hasattr(security_module, "Security"):
+        security_module.Security = type("Security", (), {})
     metrics = _module("hummingbot.connector.connector_metrics_collector")
     metrics.TradeVolumeMetricCollector = type("TradeVolumeMetricCollector", (), {})
     exchange = _module("hummingbot.connector.exchange_py_base")
@@ -11517,3 +11523,340 @@ async def test_issue224_security_snapshot_rollback_serializes_cross_account_comm
         {"baseline": "OLD", "account-b": "COMMITTED"},
         security._secure_configs,
     )
+
+
+@pytest.mark.asyncio
+async def test_issue224_security_snapshot_precedes_production_login_mutation(
+    monkeypatch,
+):
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    service.secrets_manager = object()
+    security = module.BackendAPISecurity
+    baseline = {"account-b": "COMMITTED"}
+    monkeypatch.setattr(security, "_secure_configs", dict(baseline), raising=False)
+    decryption_done = asyncio.Event()
+    decryption_done.set()
+    monkeypatch.setattr(
+        security, "_decryption_done", decryption_done, raising=False
+    )
+    monkeypatch.setattr(
+        module.AllConnectorSettings,
+        "get_connector_config_keys",
+        staticmethod(lambda connector_name: {"connector": connector_name}),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module.AllConnectorSettings,
+        "update_connector_config_keys",
+        staticmethod(lambda value: None),
+        raising=False,
+    )
+    events = []
+    captured = {}
+    original_snapshot = service._credential_publication_snapshot
+    original_discard = service.discard_staged_connector_already_locked
+
+    def ordered_snapshot(account_name, connector_name):
+        events.append("snapshot")
+        return original_snapshot(account_name, connector_name)
+
+    def failing_login(**kwargs):
+        events.append("login")
+        security._secure_configs.clear()
+        security._secure_configs["account-a"] = "LOGIN-PARTIAL"
+        decryption_done.clear()
+        raise RuntimeError("login-failed-after-map-mutation")
+
+    async def observed_discard(account_name, connector_name, stage):
+        captured.update(stage)
+        await original_discard(account_name, connector_name, stage)
+        captured.clear()
+        captured.update(stage)
+
+    service._credential_publication_snapshot = ordered_snapshot
+    service.discard_staged_connector_already_locked = observed_discard
+    monkeypatch.setattr(
+        security,
+        "login_account",
+        staticmethod(failing_login),
+        raising=False,
+    )
+
+    async with service.credential_transaction("account-a", "manzana"):
+        with pytest.raises(
+            RuntimeError, match="login-failed-after-map-mutation"
+        ):
+            await service.stage_connector_keys_already_locked(
+                "account-a", "manzana", {"api_key": "NEW"}
+            )
+
+    CHECK.assertEqual(["snapshot", "login"], events)
+    CHECK.assertIn("credential_snapshot", captured)
+    CHECK.assertTrue(captured["credentials_touched"])
+    CHECK.assertTrue(captured["credentials_rolled_back"])
+    CHECK.assertEqual(baseline, security._secure_configs)
+    CHECK.assertTrue(decryption_done.is_set())
+
+
+@pytest.mark.asyncio
+async def test_issue224_staging_cancellation_restores_prelogin_global_map(
+    monkeypatch,
+):
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    service.secrets_manager = object()
+    security = module.BackendAPISecurity
+    baseline = {"account-b": "COMMITTED"}
+    monkeypatch.setattr(security, "_secure_configs", dict(baseline), raising=False)
+    decryption_done = asyncio.Event()
+    decryption_done.set()
+    monkeypatch.setattr(
+        security, "_decryption_done", decryption_done, raising=False
+    )
+    monkeypatch.setattr(
+        module.AllConnectorSettings,
+        "get_connector_config_keys",
+        staticmethod(lambda connector_name: {"connector": connector_name}),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module.AllConnectorSettings,
+        "update_connector_config_keys",
+        staticmethod(lambda value: None),
+        raising=False,
+    )
+
+    class Config:
+        def __init__(self, value):
+            self.connector = value["connector"]
+
+    candidate = object()
+    initialize_entered = asyncio.Event()
+    discarded = []
+
+    def login(**kwargs):
+        security._secure_configs.clear()
+        security._secure_configs["account-a"] = "LOGIN-PARTIAL"
+        decryption_done.clear()
+        return True
+
+    async def initialize(*args):
+        initialize_entered.set()
+        await asyncio.Event().wait()
+
+    async def stop_candidate(*args, **kwargs):
+        discarded.append(candidate)
+
+    monkeypatch.setattr(
+        security, "login_account", staticmethod(login), raising=False
+    )
+    monkeypatch.setattr(module, "HummingbotAPIConfigAdapter", Config)
+    monkeypatch.setattr(
+        module, "api_keys_from_connector_config_map", lambda value: {}
+    )
+    service._create_trading_connector = lambda *args, **kwargs: candidate
+    service._initialize_trading_connector_candidate = initialize
+    service._stop_connector_network = stop_candidate
+
+    async def stage():
+        async with service.credential_transaction("account-a", "manzana"):
+            await service.stage_connector_keys_already_locked(
+                "account-a", "manzana", {"api_key": "NEW"}
+            )
+
+    operation = asyncio.create_task(stage())
+    await initialize_entered.wait()
+    operation.cancel("cancel-real-staging")
+    with pytest.raises(asyncio.CancelledError) as captured:
+        await asyncio.wait_for(operation, 0.2)
+
+    CHECK.assertEqual(("cancel-real-staging",), captured.value.args)
+    CHECK.assertEqual([candidate], discarded)
+    CHECK.assertEqual(baseline, security._secure_configs)
+    CHECK.assertTrue(decryption_done.is_set())
+
+
+@pytest.mark.asyncio
+async def test_issue224_global_security_lock_reentry_and_waiter_cancellation():
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    waiter_entered = asyncio.Event()
+
+    async def waiter():
+        async with service._backend_api_security_transaction():
+            waiter_entered.set()
+
+    async with service._backend_api_security_transaction():
+        owner = asyncio.current_task()
+        CHECK.assertIs(owner, module._BACKEND_API_SECURITY_TRANSACTION_OWNER)
+        CHECK.assertEqual(1, module._BACKEND_API_SECURITY_TRANSACTION_DEPTH)
+        async with service._backend_api_security_transaction():
+            CHECK.assertIs(
+                owner, module._BACKEND_API_SECURITY_TRANSACTION_OWNER
+            )
+            CHECK.assertEqual(2, module._BACKEND_API_SECURITY_TRANSACTION_DEPTH)
+
+        queued = asyncio.create_task(waiter())
+        await asyncio.sleep(0)
+        CHECK.assertFalse(waiter_entered.is_set())
+        queued.cancel("cancel-global-waiter")
+        with pytest.raises(asyncio.CancelledError) as captured:
+            await queued
+        CHECK.assertEqual(("cancel-global-waiter",), captured.value.args)
+        CHECK.assertIs(owner, module._BACKEND_API_SECURITY_TRANSACTION_OWNER)
+
+    successor = asyncio.create_task(waiter())
+    await asyncio.wait_for(successor, 0.2)
+    CHECK.assertTrue(waiter_entered.is_set())
+    CHECK.assertIsNone(module._BACKEND_API_SECURITY_TRANSACTION_OWNER)
+    CHECK.assertEqual(0, module._BACKEND_API_SECURITY_TRANSACTION_DEPTH)
+    CHECK.assertFalse(module._BACKEND_API_SECURITY_TRANSACTION_LOCK.locked())
+
+
+@pytest.mark.asyncio
+async def test_issue224_accounts_stop_waits_for_live_candidate_cleanup(
+    monkeypatch,
+):
+    from contextlib import asynccontextmanager
+
+    accounts_module = _load_accounts_service_module()
+    token_read_entered = asyncio.Event()
+    discard_entered = asyncio.Event()
+    release_discard = asyncio.Event()
+    events = []
+    candidate = object()
+
+    class ConnectorService:
+        @asynccontextmanager
+        async def credential_transaction(self, account_name, connector_name):
+            yield
+
+        def is_trading_connector_initialized(self, *args):
+            return False
+
+        async def stage_connector_keys_already_locked(self, *args):
+            return {"connector": candidate, "committed": False}
+
+        async def commit_staged_connector_keys_already_locked(self, *args):
+            events.append("publish")
+
+        async def discard_staged_connector_already_locked(self, *args):
+            events.append("discard-enter")
+            discard_entered.set()
+            await release_discard.wait()
+            events.append("discard-exit")
+
+        async def stop_all(self):
+            CHECK.assertFalse(service._account_continuations)
+            events.append("stop-all")
+
+    class WalletService:
+        async def close(self):
+            events.append("wallet-close")
+
+    service = object.__new__(accounts_module.AccountsService)
+    service._connector_service = ConnectorService()
+    service.gateway_wallet_service = WalletService()
+    service.accounts_state = {}
+    service._update_account_state_task = None
+    service._order_status_polling_task = None
+    service._gateway_poller_start_task = None
+    service._gateway_poller_started = False
+
+    async def blocked_token_read(*args, **kwargs):
+        token_read_entered.set()
+        await asyncio.Event().wait()
+
+    service._get_connector_tokens_info = blocked_token_read
+    monkeypatch.setattr(
+        accounts_module.fs_util,
+        "path_exists",
+        lambda path: False,
+        raising=False,
+    )
+
+    caller = asyncio.create_task(
+        service.add_credentials("acct", "manzana", {"api_key": "NEW"})
+    )
+    await token_read_entered.wait()
+    shutdown = asyncio.create_task(service.stop())
+    await discard_entered.wait()
+    CHECK.assertFalse(shutdown.done())
+
+    with pytest.raises(RuntimeError, match="accounts_service_stopping"):
+        service.add_account("late-account")
+
+    release_discard.set()
+    await asyncio.wait_for(shutdown, 0.2)
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+
+    CHECK.assertEqual(
+        ["discard-enter", "discard-exit", "wallet-close", "stop-all"],
+        events,
+    )
+    CHECK.assertFalse(service._account_continuations)
+    CHECK.assertTrue(service._stopping)
+    CHECK.assertTrue(service._stopped)
+    with pytest.raises(RuntimeError, match="accounts_service_stopping"):
+        await service.add_credentials(
+            "acct", "manzana", {"api_key": "TOO-LATE"}
+        )
+
+
+def test_issue224_reserved_account_routes_declare_exact_typed_400_refs():
+    from fastapi import FastAPI, HTTPException
+    from fastapi.testclient import TestClient
+
+    from models.connectors import CapabilityErrorResponse
+    from routers import accounts as accounts_router
+    from services.accounts_service import validate_safe_name
+
+    class Accounts:
+        def list_credentials(self, account_name):
+            validate_safe_name(account_name, "account name")
+            raise AssertionError("reserved account reached credential listing")
+
+        def add_account(self, account_name):
+            if account_name == "duplicate":
+                raise HTTPException(status_code=400, detail="private failure")
+            raise AssertionError("reserved account reached account creation")
+
+    app = FastAPI()
+    app.include_router(accounts_router.router)
+    app.dependency_overrides[accounts_router.get_accounts_service] = Accounts
+    client = TestClient(app)
+    responses = (
+        client.get("/accounts/__data__/credentials"),
+        client.post(
+            "/accounts/add-account", params={"account_name": "__data__"}
+        ),
+    )
+    for response in responses:
+        CHECK.assertEqual(400, response.status_code, response.text)
+        CHECK.assertEqual(
+            "invalid_account_resource_name", response.json()["detail"]["code"]
+        )
+        CapabilityErrorResponse.model_validate(response.json())
+
+    duplicate = client.post(
+        "/accounts/add-account", params={"account_name": "duplicate"}
+    )
+    CHECK.assertEqual(400, duplicate.status_code, duplicate.text)
+    CHECK.assertEqual("account_create_failed", duplicate.json()["detail"]["code"])
+    CHECK.assertNotIn("private failure", duplicate.text)
+    CapabilityErrorResponse.model_validate(duplicate.json())
+
+    paths = app.openapi()["paths"]
+    route_methods = (
+        ("/accounts/{account_name}/credentials", "get"),
+        ("/accounts/add-account", "post"),
+    )
+    for path, method in route_methods:
+        schema = paths[path][method]["responses"]["400"]["content"][
+            "application/json"
+        ]["schema"]
+        CHECK.assertEqual(
+            "#/components/schemas/CapabilityErrorResponse", schema["$ref"]
+        )
