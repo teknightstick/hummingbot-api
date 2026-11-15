@@ -544,7 +544,9 @@ class AccountsService:
             if account_name == "master_account":
                 continue
             if connector_name in master_state:
-                self.accounts_state[account_name][connector_name] = master_state[connector_name]
+                self.accounts_state.setdefault(account_name, {})[
+                    connector_name
+                ] = copy.deepcopy(master_state[connector_name])
 
     async def _get_connector_tokens_info(
         self,
@@ -910,25 +912,60 @@ class AccountsService:
                 else None
             )
             folder_snapshot = fs_util.snapshot_folder("credentials", account_name)
+            connector_names = sorted(
+                self._connector_service.list_account_connectors(account_name)
+            )
+            committed_connectors = set()
             folder_mutation_started = False
             try:
                 # Complete every fallible filesystem mutation before the first
-                # terminal connector stop. The in-memory snapshot is the rollback.
+                # terminal connector stop. After that boundary rollback is only
+                # allowed for keys whose connector is still live.
                 folder_mutation_started = True
                 fs_util.delete_folder("credentials", account_name)
-                for connector_name in sorted(
-                    self._connector_service.list_account_connectors(account_name)
-                ):
-                    await self._connector_service.stop_trading_connector(
-                        account_name, connector_name
-                    )
+                for connector_name in connector_names:
+                    try:
+                        result = await self._connector_service.stop_trading_connector(
+                            account_name, connector_name
+                        )
+                    except BaseException:
+                        live_connectors = set(
+                            self._connector_service.list_account_connectors(
+                                account_name
+                            )
+                        )
+                        if connector_name not in live_connectors:
+                            committed_connectors.add(connector_name)
+                        raise
+                    if result is not False:
+                        committed_connectors.add(connector_name)
+                    if account_name in self.accounts_state:
+                        self.accounts_state[account_name].pop(
+                            connector_name, None
+                        )
             except BaseException:
                 if folder_mutation_started:
+                    rollback_snapshot = copy.deepcopy(folder_snapshot)
+                    committed_paths = {
+                        f"connectors/{connector_name}.yml"
+                        for connector_name in committed_connectors
+                    }
+                    rollback_snapshot["files"] = {
+                        relative_path: content
+                        for relative_path, content in rollback_snapshot[
+                            "files"
+                        ].items()
+                        if str(relative_path).replace("\\", "/").lstrip("./")
+                        not in committed_paths
+                    }
                     fs_util.restore_folder_snapshot(
-                        "credentials", account_name, folder_snapshot
+                        "credentials", account_name, rollback_snapshot
                     )
                 if account_state_existed:
-                    self.accounts_state[account_name] = original_account_state
+                    rollback_state = copy.deepcopy(original_account_state)
+                    for connector_name in committed_connectors:
+                        rollback_state.pop(connector_name, None)
+                    self.accounts_state[account_name] = rollback_state
                 else:
                     self.accounts_state.pop(account_name, None)
                 raise
