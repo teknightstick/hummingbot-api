@@ -937,6 +937,7 @@ class UnifiedConnectorService:
             current_task = None
         if lease is None or current_task is None:
             return False
+        lease.reap_terminal_frames()
         return lease.root_task is current_task and not lease.frames
 
     def _exact_market_transaction_lease(
@@ -2202,7 +2203,7 @@ class UnifiedConnectorService:
             if detail is not None:
                 if (
                     account_name == "__data__"
-                    and detail.cleanup_code == "connector_cleanup_incomplete"
+                    and detail.code == "connector_cleanup_residual"
                 ):
                     detail = self._rejected_capability_cleanup_detail(
                         connector_name,
@@ -2641,7 +2642,7 @@ class UnifiedConnectorService:
                 account_name, connector_name
             )
         if cleanup_detail is not None:
-            if cleanup_detail.cleanup_code == "connector_cleanup_incomplete":
+            if cleanup_detail.code == "connector_cleanup_residual":
                 cleanup_detail = self._rejected_capability_cleanup_detail(
                     connector_name,
                     "connector_stop_failed",
@@ -3562,7 +3563,6 @@ class UnifiedConnectorService:
             if not await self._drain_owner_tasks(owner_key, tasks):
                 if phase.get("error_code") is None:
                     phase["error_code"] = "task_cleanup_pending"
-        self._unpublish_terminal_connector(owner_key, phase)
         connector_key = owner_key[:2]
         error_code = phase.get("error_code")
         for market_key, market_phase in tuple(
@@ -3586,34 +3586,54 @@ class UnifiedConnectorService:
                         self._consume_background_task_result(retained_task)
                 if not retained_market:
                     self._market_residual_tasks.pop(market_key, None)
-        if error_code is None:
-            if authority is not _OWNER_AUTHORITY_UNSET:
-                try:
-                    setattr(authority, "_api_network_stop_terminal", True)
-                except Exception:
-                    pass
-            self._prune_terminal_connector_state(
-                connector_key, owner_key, authority
-            )
+
+        stopped_indices = list(phase.get("stopped_indices", ()))
+        terminal_success = error_code is None and phase.get("result") is not False
+        if terminal_success:
+            if phase.get(
+                "commit_all_on_success", True
+            ) and not self._has_auxiliary_stop_state(connector_key, owner_key):
+                self._commit_terminal_connector_stop(
+                    connector_key, authority, stopped_indices
+                )
+            else:
+                self._unpublish_terminal_connector(owner_key, phase)
+                cache_key = self._index_key(*connector_key)
+                mappings = {
+                    "orders": self._orders_recorders,
+                    "funding": self._funding_recorders,
+                    "metrics": self._metrics_collectors,
+                }
+                for label, value in stopped_indices:
+                    mapping = mappings[label]
+                    if mapping.get(cache_key) is value:
+                        mapping.pop(cache_key, None)
+                self._connector_cleanup_indices.pop(connector_key, None)
+                if authority is not _OWNER_AUTHORITY_UNSET:
+                    try:
+                        setattr(authority, "_api_network_stop_terminal", True)
+                    except Exception:
+                        pass
+                self._prune_terminal_connector_state(
+                    connector_key, owner_key, authority
+                )
+                self._signal_market_state_change(connector_key)
+            phase["pre_stop_reconciled"] = True
             self._signal_market_state_change(connector_key)
             return
 
-        detail = CapabilityErrorDetail(
-            code="connector_cleanup_residual",
-            message=(
-                f"Connector cleanup is incomplete for "
-                f"'{connector_key[0]}:{connector_key[1]}'"
-            ),
-            connector=connector_key[1],
-            feature="connector_cleanup",
-            reason="cleanup_incomplete",
-            cleanup_scope="connector",
-            cleanup_code=error_code,
+        rollback_code = phase.get("rollback_code")
+        if not phase.get("pre_stop_reconciled"):
+            rollback_code = await self._resume_pre_stop_indices(
+                connector_key, stopped_indices
+            )
+            phase["rollback_code"] = rollback_code
+            phase["pre_stop_reconciled"] = True
+        self._retain_connector_cleanup_residual(
+            connector_key,
+            rollback_code or error_code or "connector_cleanup_incomplete",
+            phase.get("retained_indices", {}),
         )
-        self._connector_creation_residuals[connector_key] = detail.model_dump(
-            exclude_none=True
-        )
-        self._signal_market_state_change(connector_key)
 
     async def _owner_operation_wrapper(
         self,
@@ -3665,6 +3685,7 @@ class UnifiedConnectorService:
         authority=_OWNER_AUTHORITY_UNSET,
         authority_incarnation=_OWNER_AUTHORITY_UNSET,
         terminal_tasks: Optional[Set[asyncio.Task]] = None,
+        terminal_context: Optional[Mapping[str, Any]] = None,
     ):
         """Run one non-repeatable phase through a retained terminal wrapper."""
         self._ensure_connector_cleanup_state()
@@ -3682,6 +3703,19 @@ class UnifiedConnectorService:
                 phase["authority"] = authority
                 phase["authority_incarnation"] = authority_incarnation
                 phase["terminal_tasks"] = tuple(terminal_tasks or ())
+            if phase_name == "connector_stop":
+                terminal_context = terminal_context or {}
+                phase["stopped_indices"] = tuple(
+                    terminal_context.get("stopped_indices", ())
+                )
+                phase["retained_indices"] = dict(
+                    terminal_context.get("retained_indices", {})
+                )
+                phase["commit_all_on_success"] = terminal_context.get(
+                    "commit_all_on_success", True
+                )
+                phase["pre_stop_reconciled"] = False
+                phase["rollback_code"] = None
             owner_phases[phase_name] = phase
         elif authority is not _OWNER_AUTHORITY_UNSET:
             if (
@@ -3897,6 +3931,7 @@ class UnifiedConnectorService:
     ) -> Optional[str]:
         """Restore stopped auxiliary publishers while the connector stays live."""
         connector = self._cached_public_connector(connector_key)
+        rollback_codes = []
         for label, value in reversed(stopped_indices):
             try:
                 event_pairs = getattr(value, "_event_pairs", None)
@@ -3934,8 +3969,24 @@ class UnifiedConnectorService:
                     connector_key[0],
                     connector_key[1],
                 )
-                return f"{label}_rollback_incomplete"
-        return None
+                rollback_codes.append(f"{label}_rollback_incomplete")
+        return rollback_codes[0] if rollback_codes else None
+
+    async def _resume_pre_stop_indices_before_raise(
+        self,
+        connector_key: Tuple[str, str],
+        stopped_indices: list[Tuple[str, Any]],
+    ) -> Optional[str]:
+        """Finish rollback even when the transaction task is being cancelled."""
+        rollback_task = asyncio.create_task(
+            self._resume_pre_stop_indices(connector_key, stopped_indices)
+        )
+        while not rollback_task.done():
+            try:
+                await asyncio.shield(rollback_task)
+            except asyncio.CancelledError:
+                continue
+        return rollback_task.result()
 
     def _retain_connector_cleanup_residual(
         self,
@@ -4048,6 +4099,32 @@ class UnifiedConnectorService:
                 ):
                     return True
         return False
+
+    async def await_retained_connector_stop_already_locked(
+        self, account_name: str, connector_name: str
+    ) -> Optional[bool]:
+        """Wait for a retained physical stop while preserving account authority."""
+        self._require_exact_account_root(account_name)
+        connector_key = self._connector_key(account_name, connector_name)
+        owner_key = self._owner_key(account_name, connector_name, "network")
+        phase = self._connector_cleanup_phases.get(owner_key, {}).get(
+            "connector_stop"
+        )
+        if not isinstance(phase, dict):
+            return None
+        task = phase.get("task")
+        authority = phase.get("authority", _OWNER_AUTHORITY_UNSET)
+        if not isinstance(task, asyncio.Task):
+            return None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+        self._consume_background_task_result(task)
+        if authority is _OWNER_AUTHORITY_UNSET:
+            return phase.get("error_code") is None
+        return self._cached_public_connector(connector_key) is not authority
 
     async def _finalize_failed_connector_creation(
         self,
@@ -4413,6 +4490,9 @@ class UnifiedConnectorService:
         *,
         authority_incarnation=_OWNER_AUTHORITY_UNSET,
         owner_kind: str = "network",
+        stopped_indices: Optional[list[Tuple[str, Any]]] = None,
+        retained_indices: Optional[Mapping[str, Any]] = None,
+        commit_all_on_success: bool = True,
     ):
         """Stop connector tasks with a hard deadline and retain pending handles."""
         self._ensure_connector_cleanup_state()
@@ -4464,6 +4544,11 @@ class UnifiedConnectorService:
                     authority=connector,
                     authority_incarnation=authority_incarnation,
                     terminal_tasks=tasks,
+                    terminal_context={
+                        "stopped_indices": tuple(stopped_indices or ()),
+                        "retained_indices": dict(retained_indices or {}),
+                        "commit_all_on_success": commit_all_on_success,
+                    },
                 )
             except asyncio.CancelledError:
                 raise
@@ -4516,6 +4601,9 @@ class UnifiedConnectorService:
         *,
         collect_connector_tasks: bool = True,
         authority_incarnation=_OWNER_AUTHORITY_UNSET,
+        stopped_indices: Optional[list[Tuple[str, Any]]] = None,
+        retained_indices: Optional[Mapping[str, Any]] = None,
+        commit_all_on_success: bool = True,
     ) -> None:
         """Stop one published data connector without double-stopping its tracker."""
         self._ensure_connector_cleanup_state()
@@ -4545,6 +4633,11 @@ class UnifiedConnectorService:
             authority=connector,
             authority_incarnation=authority_incarnation,
             terminal_tasks=tasks,
+            terminal_context={
+                "stopped_indices": tuple(stopped_indices or ()),
+                "retained_indices": dict(retained_indices or {}),
+                "commit_all_on_success": commit_all_on_success,
+            },
         )
         if collect_connector_tasks:
             tasks.update(self._collect_connector_tasks(connector))
@@ -5701,33 +5794,58 @@ class UnifiedConnectorService:
         stopped_indices = []
         retained_indices = self._connector_cleanup_indices
         retained_for_key = retained_indices.get(connector_key, {})
+        network_owner_key = self._owner_key(
+            account_name,
+            connector_name,
+            "data_network" if account_name == "__data__" else "network",
+        )
+        network_phase = self._connector_cleanup_phases.get(
+            network_owner_key, {}
+        ).get("connector_stop")
         indices = (
             ("orders", self._orders_recorders),
             ("funding", self._funding_recorders),
             ("metrics", self._metrics_collectors),
         )
-        for label, mapping in indices:
-            value = mapping.get(cache_key)
-            if value is None:
-                value = retained_for_key.get(label)
-            if value is None:
-                value = self._connector_cleanup_owners.get(
-                    self._owner_key(account_name, connector_name, label)
-                )
-            if value is None:
-                continue
-            try:
-                await self._stop_owned_index(
-                    account_name, connector_name, label, value
-                )
-            except asyncio.CancelledError:
-                raise
-            except BaseException:
-                cleanup_codes.append(f"{label}_cleanup_incomplete")
-                retained_for_key[label] = value
-            else:
-                retained_for_key.pop(label, None)
-                stopped_indices.append((label, value))
+        if isinstance(network_phase, dict) and "stopped_indices" in network_phase:
+            stopped_indices = list(network_phase["stopped_indices"])
+            retained_for_key = dict(
+                network_phase.get("retained_indices", retained_for_key)
+            )
+        else:
+            for label, mapping in indices:
+                value = mapping.get(cache_key)
+                if value is None:
+                    value = retained_for_key.get(label)
+                if value is None:
+                    value = self._connector_cleanup_owners.get(
+                        self._owner_key(account_name, connector_name, label)
+                    )
+                if value is None:
+                    continue
+                try:
+                    await self._stop_owned_index(
+                        account_name, connector_name, label, value
+                    )
+                except BaseException as exc:
+                    if isinstance(exc, asyncio.CancelledError):
+                        rollback_code = (
+                            await self._resume_pre_stop_indices_before_raise(
+                                connector_key, stopped_indices
+                            )
+                        )
+                        if rollback_code is not None:
+                            self._retain_connector_cleanup_residual(
+                                connector_key,
+                                rollback_code,
+                                retained_for_key,
+                            )
+                        raise
+                    cleanup_codes.append(f"{label}_cleanup_incomplete")
+                    retained_for_key[label] = value
+                else:
+                    retained_for_key.pop(label, None)
+                    stopped_indices.append((label, value))
 
         if cleanup_codes:
             rollback_code = await self._resume_pre_stop_indices(
@@ -5750,11 +5868,22 @@ class UnifiedConnectorService:
             if owner_key[:2] == connector_key and owner_key[2] == "restart"
         }
         verified_restart_owners = set()
-        for owner_key in sorted(restart_owner_keys):
-            if await self._verify_restart_owner_phases(owner_key):
-                verified_restart_owners.add(owner_key)
-            else:
-                cleanup_codes.append("restart_cleanup_incomplete")
+        try:
+            for owner_key in sorted(restart_owner_keys):
+                if await self._verify_restart_owner_phases(owner_key):
+                    verified_restart_owners.add(owner_key)
+                else:
+                    cleanup_codes.append("restart_cleanup_incomplete")
+        except BaseException as exc:
+            if isinstance(exc, asyncio.CancelledError):
+                rollback_code = await self._resume_pre_stop_indices_before_raise(
+                    connector_key, stopped_indices
+                )
+                if rollback_code is not None:
+                    self._retain_connector_cleanup_residual(
+                        connector_key, rollback_code, retained_for_key
+                    )
+            raise
 
         restart_phase_failed = bool(
             restart_owner_keys - verified_restart_owners
@@ -5774,11 +5903,6 @@ class UnifiedConnectorService:
             if account_name == "__data__"
             else None
         )
-        network_owner_key = self._owner_key(
-            account_name,
-            connector_name,
-            "data_network" if account_name == "__data__" else "network",
-        )
         retained_network_owner = self._connector_cleanup_owners.get(
             network_owner_key
         )
@@ -5793,12 +5917,6 @@ class UnifiedConnectorService:
         stopped_connectors = []
         network_cleanup_failed = restart_phase_failed
         if connector is not None:
-            stopping_published_data = (
-                account_name == "__data__" and connector is data_connector
-            )
-            if stopping_published_data:
-                self._data_connectors.pop(connector_name, None)
-                self._data_connectors_started.pop(connector_name, None)
             try:
                 if account_name == "__data__" and (
                     connector is data_connector or connector is data_owner
@@ -5807,10 +5925,18 @@ class UnifiedConnectorService:
                         connector,
                         connector_name,
                         collect_connector_tasks=invoking_owner_key is None,
+                        stopped_indices=stopped_indices,
+                        retained_indices=retained_for_key,
+                        commit_all_on_success=invoking_owner_key is None,
                     )
                 else:
                     await self._stop_connector_network(
-                        connector, account_name, connector_name
+                        connector,
+                        account_name,
+                        connector_name,
+                        stopped_indices=stopped_indices,
+                        retained_indices=retained_for_key,
+                        commit_all_on_success=invoking_owner_key is None,
                     )
             except asyncio.CancelledError:
                 if (
@@ -5824,6 +5950,19 @@ class UnifiedConnectorService:
                         connector_key, connector, stopped_indices
                     )
                     return None
+                network_phase = self._connector_cleanup_phases.get(
+                    network_owner_key, {}
+                ).get("connector_stop")
+                if not isinstance(network_phase, dict):
+                    rollback_code = (
+                        await self._resume_pre_stop_indices_before_raise(
+                            connector_key, stopped_indices
+                        )
+                    )
+                    if rollback_code is not None:
+                        self._retain_connector_cleanup_residual(
+                            connector_key, rollback_code, retained_for_key
+                        )
                 raise
             except BaseException:
                 terminal_committed = getattr(
@@ -5845,12 +5984,33 @@ class UnifiedConnectorService:
                         connector_name,
                     )
                     return None
-                rollback_code = await self._resume_pre_stop_indices(
-                    connector_key, stopped_indices
-                )
+                network_phase = self._connector_cleanup_phases.get(
+                    network_owner_key, {}
+                ).get("connector_stop")
+                if isinstance(network_phase, dict):
+                    if not network_phase.get("complete"):
+                        cleanup_code = "connector_stop_pending"
+                    elif network_phase.get("pre_stop_reconciled"):
+                        cleanup_code = (
+                            network_phase.get("rollback_code")
+                            or network_phase.get("error_code")
+                            or "connector_cleanup_incomplete"
+                        )
+                    else:
+                        rollback_code = await self._resume_pre_stop_indices(
+                            connector_key, stopped_indices
+                        )
+                        cleanup_code = (
+                            rollback_code or "connector_cleanup_incomplete"
+                        )
+                else:
+                    rollback_code = await self._resume_pre_stop_indices(
+                        connector_key, stopped_indices
+                    )
+                    cleanup_code = rollback_code or "connector_cleanup_incomplete"
                 return self._retain_connector_cleanup_residual(
                     connector_key,
-                    rollback_code or "connector_cleanup_incomplete",
+                    cleanup_code,
                     retained_for_key,
                 )
             else:

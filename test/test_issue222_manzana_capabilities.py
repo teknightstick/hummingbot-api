@@ -3692,7 +3692,7 @@ async def test_public_transaction_cancellation_retains_failed_cleanup_residual()
         await task
 
     CHECK.assertEqual(("cleanup-must-not-eat-this",), cancelled.value.args)
-    CHECK.assertEqual({}, service._data_connectors)
+    CHECK.assertIs(connector, service._data_connectors["manzana"])
     residual = service._connector_creation_residuals[("__data__", "manzana")]
     CHECK.assertEqual("connector_capability_cleanup_residual", residual["code"])
     CHECK.assertNotIn("private-stop-failure", json.dumps(residual))
@@ -3809,7 +3809,7 @@ async def test_data_network_timeout_owner_completes_exact_task_on_stop_all_retry
         "connector_capability_cleanup_residual", residual.value.detail["code"]
     )
     CHECK.assertEqual(1, connector.stop_calls)
-    CHECK.assertEqual({}, service._data_connectors)
+    CHECK.assertIs(connector, service._data_connectors["manzana"])
     owner_key = ("__data__", "manzana", "data_network")
     retained_task = service._connector_cleanup_phases[owner_key]["connector_stop"][
         "task"
@@ -3858,9 +3858,11 @@ async def test_data_network_terminal_stop_failure_remains_truthful(terminal_kind
         with pytest.raises(module.ConnectorCapabilityError) as residual:
             await service.stop_all()
         CHECK.assertEqual("connector_cleanup_residual", residual.value.detail["code"])
-        CHECK.assertEqual(
-            "connector_cleanup_incomplete", residual.value.detail["cleanup_code"]
-        )
+        expected_code = {
+            "false": "connector_stop_returned_false",
+            "raise": "connector_stop_raised",
+        }[terminal_kind]
+        CHECK.assertEqual(expected_code, residual.value.detail["cleanup_code"])
 
     owner_key = ("__data__", "manzana", "data_network")
     CHECK.assertIn(owner_key, service._connector_cleanup_owners)
@@ -8568,7 +8570,10 @@ async def test_issue224_connector_stop_phase_keeps_exact_physical_owner(
         CHECK.assertIs(connector_a, service._connector_cleanup_owners[owner_key])
         CHECK.assertEqual(1, connector_a.stop_calls)
         CHECK.assertEqual(0, connector_b.stop_calls)
-        CHECK.assertNotIn("manzana", service._trading_connectors.get("acct", {}))
+        CHECK.assertIs(
+            connector_a,
+            service._trading_connectors.get("acct", {}).get("manzana"),
+        )
         CHECK.assertIn(market_key, service._market_cleanup_owners)
 
 
@@ -9658,11 +9663,11 @@ async def test_issue224_physical_wrapper_reconciles_before_lease_release(
             break
         await asyncio.sleep(0)
     CHECK.assertEqual({}, service._market_locks)
-    CHECK.assertIsNot(
-        connector,
-        service._trading_connectors.get("acct", {}).get("manzana"),
-    )
     if terminal_outcome == "success":
+        CHECK.assertIsNot(
+            connector,
+            service._trading_connectors.get("acct", {}).get("manzana"),
+        )
         CHECK.assertNotIn(connector_key, service._connector_creation_residuals)
         for registry in (
             service._connector_cleanup_owners,
@@ -9690,6 +9695,10 @@ async def test_issue224_physical_wrapper_reconciles_before_lease_release(
         )
         CHECK.assertEqual(0, replacement.stop_calls)
     else:
+        CHECK.assertIs(
+            connector,
+            service._trading_connectors.get("acct", {}).get("manzana"),
+        )
         expected_codes = {
             "false": "connector_stop_returned_false",
             "raise": "connector_stop_raised",
@@ -10651,3 +10660,544 @@ async def test_issue224_account_registry_pruning_ignores_repeated_cancellation()
     CHECK.assertEqual({}, service._account_transaction_lock_users)
     CHECK.assertEqual({}, service._account_transaction_locks)
     CHECK.assertEqual({}, service._account_transaction_owners)
+
+
+@pytest.mark.asyncio
+async def test_issue224_pre_stop_cancellation_rolls_back_every_stopped_index():
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    connector = Issue224RepairConnector()
+    connector_key = ("acct", "manzana")
+    cache_key = "acct:manzana"
+    metrics_entered = asyncio.Event()
+
+    class Index:
+        def __init__(self, label, block=False):
+            self.label = label
+            self.block = block
+            self.stop_calls = 0
+            self.start_calls = 0
+
+        async def stop(self):
+            self.stop_calls += 1
+            if self.block:
+                metrics_entered.set()
+                await asyncio.Event().wait()
+
+        async def start(self, *args):
+            self.start_calls += 1
+
+    orders = Index("orders")
+    funding = Index("funding")
+    metrics = Index("metrics", block=True)
+    service._trading_connectors = {"acct": {"manzana": connector}}
+    service._orders_recorders[cache_key] = orders
+    service._funding_recorders[cache_key] = funding
+    service._metrics_collectors[cache_key] = metrics
+    service._advance_connector_incarnation(connector_key)
+
+    operation = asyncio.create_task(
+        service._finalize_stop_trading_connector("acct", "manzana")
+    )
+    await metrics_entered.wait()
+    operation.cancel("exact-pre-stop-cancellation")
+    with pytest.raises(asyncio.CancelledError) as captured:
+        await operation
+
+    CHECK.assertEqual(("exact-pre-stop-cancellation",), captured.value.args)
+    CHECK.assertEqual(1, orders.stop_calls)
+    CHECK.assertEqual(1, funding.stop_calls)
+    CHECK.assertEqual(1, metrics.stop_calls)
+    CHECK.assertEqual(1, orders.start_calls)
+    CHECK.assertEqual(1, funding.start_calls)
+    CHECK.assertEqual(0, connector.stop_calls)
+    CHECK.assertIs(connector, service._trading_connectors["acct"]["manzana"])
+
+
+@pytest.mark.asyncio
+async def test_issue224_pre_stop_resume_attempts_every_index_after_failure():
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    connector = Issue224RepairConnector()
+    service._trading_connectors = {"acct": {"manzana": connector}}
+    events = []
+
+    class Index:
+        def __init__(self, label, fail=False):
+            self.label = label
+            self.fail = fail
+
+        async def start(self, *args):
+            events.append(self.label)
+            if self.fail:
+                raise RuntimeError(f"{self.label}-resume-failed")
+
+    rollback_code = await service._resume_pre_stop_indices(
+        ("acct", "manzana"),
+        [
+            ("orders", Index("orders")),
+            ("funding", Index("funding", fail=True)),
+            ("metrics", Index("metrics")),
+        ],
+    )
+
+    CHECK.assertEqual(["metrics", "funding", "orders"], events)
+    CHECK.assertEqual("funding_rollback_incomplete", rollback_code)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_outcome", ["false", "raise"])
+async def test_issue224_terminal_network_failure_keeps_publication_and_resumes(
+    terminal_outcome,
+):
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    connector_key = ("acct", "manzana")
+    cache_key = "acct:manzana"
+
+    class Connector(Issue224RepairConnector):
+        async def stop_network(self):
+            self.stop_calls += 1
+            if terminal_outcome == "false":
+                return False
+            raise RuntimeError("terminal-network-failure")
+
+    class Index:
+        def __init__(self):
+            self.stop_calls = 0
+            self.start_calls = 0
+
+        async def stop(self):
+            self.stop_calls += 1
+
+        async def start(self, connector):
+            self.start_calls += 1
+
+    connector = Connector()
+    orders = Index()
+    service._trading_connectors = {"acct": {"manzana": connector}}
+    service._orders_recorders[cache_key] = orders
+    service._advance_connector_incarnation(connector_key)
+
+    for _ in range(2):
+        with pytest.raises(module.ConnectorCapabilityError):
+            await service.stop_trading_connector("acct", "manzana")
+
+    CHECK.assertIs(connector, service._trading_connectors["acct"]["manzana"])
+    CHECK.assertIs(orders, service._orders_recorders[cache_key])
+    CHECK.assertEqual(1, orders.stop_calls)
+    CHECK.assertEqual(1, orders.start_calls)
+    CHECK.assertEqual(1, connector.stop_calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_outcome", ["success", "false", "raise"])
+async def test_issue224_pending_network_terminal_reconciles_pre_stop_snapshot_once(
+    terminal_outcome,
+):
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    connector_key = ("acct", "manzana")
+    cache_key = "acct:manzana"
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class Connector(Issue224RepairConnector):
+        async def stop_network(self):
+            self.stop_calls += 1
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await release.wait()
+            if terminal_outcome == "false":
+                return False
+            if terminal_outcome == "raise":
+                raise RuntimeError("terminal-network-failure")
+            return True
+
+    class Index:
+        def __init__(self):
+            self.stop_calls = 0
+            self.start_calls = 0
+
+        async def stop(self):
+            self.stop_calls += 1
+
+        async def start(self, connector):
+            self.start_calls += 1
+
+    connector = Connector()
+    orders = Index()
+    service._trading_connectors = {"acct": {"manzana": connector}}
+    service._orders_recorders[cache_key] = orders
+    service._advance_connector_incarnation(connector_key)
+
+    with pytest.raises(module.ConnectorCapabilityError):
+        await service.stop_trading_connector("acct", "manzana")
+    await entered.wait()
+    CHECK.assertEqual(1, orders.stop_calls)
+    CHECK.assertEqual(0, orders.start_calls)
+    CHECK.assertIs(connector, service._trading_connectors["acct"]["manzana"])
+
+    retry_detail = await service._finalize_stop_trading_connector(
+        "acct", "manzana"
+    )
+    CHECK.assertIsNotNone(retry_detail)
+    CHECK.assertEqual(1, orders.stop_calls)
+
+    release.set()
+    for _ in range(200):
+        if not service._market_locks:
+            break
+        await asyncio.sleep(0.001)
+
+    if terminal_outcome == "success":
+        CHECK.assertNotIn("acct", service._trading_connectors)
+        CHECK.assertNotIn(cache_key, service._orders_recorders)
+        CHECK.assertEqual(0, orders.start_calls)
+        CHECK.assertNotIn(connector_key, service._connector_cleanup_indices)
+    else:
+        CHECK.assertIs(connector, service._trading_connectors["acct"]["manzana"])
+        CHECK.assertIs(orders, service._orders_recorders[cache_key])
+        CHECK.assertEqual(1, orders.start_calls)
+    CHECK.assertEqual(1, orders.stop_calls)
+    CHECK.assertEqual(1, connector.stop_calls)
+
+
+def test_issue224_internal_account_names_are_typed_validation_errors():
+    accounts_module = _load_accounts_service_module()
+
+    for account_name in ("__data__", "__unscoped__", "__future_internal__"):
+        with pytest.raises(accounts_module.ConnectorCapabilityError) as failure:
+            accounts_module.validate_safe_name(account_name, "account name")
+        CHECK.assertEqual(
+            "invalid_account_resource_name", failure.value.detail["code"]
+        )
+        CHECK.assertEqual("reserved_name", failure.value.detail["reason"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_outcome", ["success", "false"])
+async def test_issue224_credential_delete_cancellation_has_terminal_guardian(
+    monkeypatch,
+    terminal_outcome,
+):
+    accounts_module = _load_accounts_service_module()
+    module, registry_type = _load_unified_service_module()
+    connector_service = _final_boundary_service(module, registry_type)
+    connector_key = ("acct", "manzana")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    file_state = {"exists": True, "content": "OLD"}
+
+    class Connector(Issue224RepairConnector):
+        async def stop_network(self):
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await release.wait()
+            return terminal_outcome == "success"
+
+    connector = Connector()
+    connector_service._trading_connectors = {"acct": {"manzana": connector}}
+    connector_service._advance_connector_incarnation(connector_key)
+    service = object.__new__(accounts_module.AccountsService)
+    service._connector_service = connector_service
+    service.accounts_state = {"acct": {"manzana": ["OLD-STATE"]}}
+
+    monkeypatch.setattr(
+        accounts_module.fs_util,
+        "path_exists",
+        lambda path: file_state["exists"],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        accounts_module.fs_util,
+        "read_file",
+        lambda path: file_state["content"],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        accounts_module.fs_util,
+        "delete_file",
+        lambda **kwargs: file_state.update(exists=False),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        accounts_module.fs_util,
+        "ensure_file_and_dump_text",
+        lambda path, content: file_state.update(exists=True, content=content),
+        raising=False,
+    )
+
+    caller = asyncio.create_task(service.delete_credentials("acct", "manzana"))
+    await entered.wait()
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(caller, 0.2)
+
+    CHECK.assertFalse(file_state["exists"])
+    release.set()
+    for _ in range(200):
+        connector_live = connector_service._trading_connectors.get("acct", {}).get(
+            "manzana"
+        )
+        terminal = (
+            connector_live is None
+            if terminal_outcome == "success"
+            else file_state["exists"]
+        )
+        if terminal:
+            break
+        await asyncio.sleep(0.001)
+    for _ in range(1000):
+        if not service._account_continuations:
+            break
+        await asyncio.sleep(0.001)
+    CHECK.assertEqual(set(), service._account_continuations)
+
+    if terminal_outcome == "success":
+        CHECK.assertFalse(file_state["exists"])
+        CHECK.assertNotIn("manzana", service.accounts_state.get("acct", {}))
+        CHECK.assertNotIn("acct", connector_service._trading_connectors)
+    else:
+        CHECK.assertEqual({"exists": True, "content": "OLD"}, file_state)
+        CHECK.assertEqual(
+            ["OLD-STATE"], service.accounts_state["acct"]["manzana"]
+        )
+        CHECK.assertIs(
+            connector,
+            connector_service._trading_connectors["acct"]["manzana"],
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_outcome", ["success", "false"])
+async def test_issue224_credential_update_cancellation_has_terminal_guardian(
+    monkeypatch,
+    terminal_outcome,
+):
+    accounts_module = _load_accounts_service_module()
+    module, registry_type = _load_unified_service_module()
+    connector_service = _final_boundary_service(module, registry_type)
+    connector_key = ("acct", "manzana")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    file_state = {"exists": True, "content": "OLD"}
+
+    class Connector(Issue224RepairConnector):
+        def __init__(self, retained=False):
+            super().__init__()
+            self.retained = retained
+
+        async def stop_network(self):
+            self.stop_calls += 1
+            if not self.retained:
+                return True
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await release.wait()
+            return terminal_outcome == "success"
+
+    old_connector = Connector(retained=True)
+    candidate = Connector()
+    connector_service._trading_connectors = {
+        "acct": {"manzana": old_connector}
+    }
+    connector_service._advance_connector_incarnation(connector_key)
+
+    async def stage(*args, **kwargs):
+        file_state["content"] = "NEW"
+        return {
+            "connector": candidate,
+            "indices": {},
+            "committed": False,
+            "discarded": False,
+            "credential_snapshot": {
+                "path": "credentials/acct/connectors/manzana.yml",
+                "existed": True,
+                "content": "OLD",
+                "security": {
+                    "secure_configs": None,
+                    "decryption_done": None,
+                },
+                "connector_settings": None,
+            },
+            "credentials_touched": True,
+            "credentials_committed": False,
+            "credentials_rolled_back": False,
+        }
+
+    connector_service.stage_connector_keys_already_locked = stage
+    service = object.__new__(accounts_module.AccountsService)
+    service._connector_service = connector_service
+    service.accounts_state = {"acct": {"manzana": ["OLD-STATE"]}}
+    service._get_connector_tokens_info = lambda *args, **kwargs: asyncio.sleep(
+        0, result=["NEW-STATE"]
+    )
+    monkeypatch.setattr(
+        accounts_module.fs_util,
+        "path_exists",
+        lambda path: file_state["exists"],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        accounts_module.fs_util,
+        "read_file",
+        lambda path: file_state["content"],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        accounts_module.fs_util,
+        "ensure_file_and_dump_text",
+        lambda path, content: file_state.update(exists=True, content=content),
+        raising=False,
+    )
+
+    caller = asyncio.create_task(
+        service.add_credentials("acct", "manzana", {"api_key": "NEW"})
+    )
+    await entered.wait()
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(caller, 0.2)
+
+    CHECK.assertEqual("NEW", file_state["content"])
+    release.set()
+    for _ in range(200):
+        published = connector_service._trading_connectors.get("acct", {}).get(
+            "manzana"
+        )
+        terminal = (
+            published is candidate
+            if terminal_outcome == "success"
+            else file_state["content"] == "OLD"
+        )
+        if terminal:
+            break
+        await asyncio.sleep(0.001)
+    for _ in range(1000):
+        if not service._account_continuations:
+            break
+        await asyncio.sleep(0.001)
+    CHECK.assertEqual(set(), service._account_continuations)
+
+    if terminal_outcome == "success":
+        CHECK.assertEqual("NEW", file_state["content"])
+        CHECK.assertEqual(
+            ["NEW-STATE"], service.accounts_state["acct"]["manzana"]
+        )
+        CHECK.assertIs(
+            candidate,
+            connector_service._trading_connectors["acct"]["manzana"],
+        )
+    else:
+        CHECK.assertEqual("OLD", file_state["content"])
+        CHECK.assertEqual(
+            ["OLD-STATE"], service.accounts_state["acct"]["manzana"]
+        )
+        CHECK.assertIs(
+            old_connector,
+            connector_service._trading_connectors["acct"]["manzana"],
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_outcome", ["success", "false"])
+async def test_issue224_account_delete_cancellation_has_terminal_guardian(
+    monkeypatch,
+    terminal_outcome,
+):
+    accounts_module = _load_accounts_service_module()
+    module, registry_type = _load_unified_service_module()
+    connector_service = _final_boundary_service(module, registry_type)
+    connector_key = ("acct", "manzana")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    folder_state = {
+        "directories": (".", "connectors"),
+        "files": {"connectors/manzana.yml": b"OLD"},
+    }
+    folder_snapshot = copy.deepcopy(folder_state)
+
+    class Connector(Issue224RepairConnector):
+        async def stop_network(self):
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await release.wait()
+            return terminal_outcome == "success"
+
+    connector = Connector()
+    connector_service._trading_connectors = {"acct": {"manzana": connector}}
+    connector_service._advance_connector_incarnation(connector_key)
+    service = object.__new__(accounts_module.AccountsService)
+    service._connector_service = connector_service
+    service.accounts_state = {"acct": {"manzana": ["OLD-STATE"]}}
+
+    monkeypatch.setattr(
+        accounts_module.fs_util,
+        "snapshot_folder",
+        lambda *args: copy.deepcopy(folder_snapshot),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        accounts_module.fs_util,
+        "delete_folder",
+        lambda *args: folder_state.update(directories=(), files={}),
+        raising=False,
+    )
+
+    def restore_folder(*args):
+        snapshot = args[-1]
+        folder_state["directories"] = snapshot["directories"]
+        folder_state["files"] = dict(snapshot["files"])
+
+    monkeypatch.setattr(
+        accounts_module.fs_util,
+        "restore_folder_snapshot",
+        restore_folder,
+        raising=False,
+    )
+
+    caller = asyncio.create_task(service.delete_account("acct"))
+    await entered.wait()
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(caller, 0.2)
+
+    CHECK.assertEqual({}, folder_state["files"])
+    release.set()
+    for _ in range(200):
+        terminal = (
+            "acct" not in service.accounts_state
+            if terminal_outcome == "success"
+            else bool(folder_state["files"])
+        )
+        if terminal:
+            break
+        await asyncio.sleep(0.001)
+    for _ in range(1000):
+        if not service._account_continuations:
+            break
+        await asyncio.sleep(0.001)
+    CHECK.assertEqual(set(), service._account_continuations)
+
+    if terminal_outcome == "success":
+        CHECK.assertEqual({}, folder_state["files"])
+        CHECK.assertNotIn("acct", service.accounts_state)
+        CHECK.assertNotIn("acct", connector_service._trading_connectors)
+    else:
+        CHECK.assertEqual(folder_snapshot, folder_state)
+        CHECK.assertEqual(
+            ["OLD-STATE"], service.accounts_state["acct"]["manzana"]
+        )
+        CHECK.assertIs(
+            connector,
+            connector_service._trading_connectors["acct"]["manzana"],
+        )

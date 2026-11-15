@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 # Safe single path component names: prevents path traversal via '/', '\' or '..'
 SAFE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+INTERNAL_ACCOUNT_PREFIX = "__"
 
 
 def validate_safe_name(name: str, label: str = "name") -> str:
@@ -52,6 +53,16 @@ def validate_safe_name(name: str, label: str = "name") -> str:
                 connector=name or "account",
                 feature="account_mutation",
                 reason="invalid_name",
+            )
+        )
+    if label == "account name" and name.startswith(INTERNAL_ACCOUNT_PREFIX):
+        raise ConnectorCapabilityError(
+            CapabilityErrorDetail(
+                code="invalid_account_resource_name",
+                message=f"Invalid {label}. Internal namespaces are reserved.",
+                connector=name,
+                feature="account_mutation",
+                reason="reserved_name",
             )
         )
     return name
@@ -107,6 +118,7 @@ class AccountsService:
         """
         self.secrets_manager = ETHKeyFileSecretManger(settings.security.config_password)
         self.accounts_state = {}
+        self._account_continuations = set()
         self.update_account_state_interval = account_update_interval * 60
         self.order_status_poll_interval = 60  # Poll order status every 1 minute
         self.default_quote = default_quote
@@ -486,6 +498,7 @@ class AccountsService:
             # Filter by account_names if specified
             if account_names and account_name not in account_names:
                 continue
+            self.accounts_state.setdefault(account_name, {})
 
             for connector_name, connector in connectors.items():
                 # Filter by connector_names if specified
@@ -512,6 +525,7 @@ class AccountsService:
         if skip_gateway:
             results = await asyncio.gather(*tasks, return_exceptions=True)
         else:
+            self.accounts_state.setdefault("master_account", {})
             # Pass connector_names filter to gateway for chain-network filtering
             results = await asyncio.gather(
                 *tasks,
@@ -729,7 +743,65 @@ class AccountsService:
         from services.unified_connector_service import UnifiedConnectorService
         return UnifiedConnectorService.get_connector_config_map(connector_name)
 
+    def _account_continuation_done(self, task: asyncio.Task) -> None:
+        self._account_continuations.discard(task)
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            return
+        if error is not None:
+            logger.error(
+                "Account transaction continuation failed (%s)",
+                type(error).__name__,
+            )
+
+    async def _run_account_continuation(self, operation):
+        """Return caller cancellation while a transaction child keeps its locks."""
+        if not hasattr(self, "_account_continuations"):
+            self._account_continuations = set()
+        continuation = asyncio.create_task(operation)
+        self._account_continuations.add(continuation)
+        continuation.add_done_callback(self._account_continuation_done)
+        try:
+            return await asyncio.shield(continuation)
+        except asyncio.CancelledError:
+            continuation.cancel()
+            raise
+
+    async def _retained_stop_succeeded(
+        self, account_name: str, connector_name: str
+    ) -> Optional[bool]:
+        waiter = getattr(
+            self._connector_service,
+            "await_retained_connector_stop_already_locked",
+            None,
+        )
+        if not callable(waiter):
+            return None
+        terminal_success = await waiter(account_name, connector_name)
+        if terminal_success is not None:
+            return terminal_success
+        is_initialized = getattr(
+            self._connector_service,
+            "is_trading_connector_initialized",
+            None,
+        )
+        if callable(is_initialized):
+            return not is_initialized(account_name, connector_name)
+        return None
+
     async def add_credentials(self, account_name: str, connector_name: str, credentials: dict):
+        validate_safe_name(account_name, "account name")
+        validate_safe_name(connector_name, "connector name")
+        return await self._run_account_continuation(
+            self._add_credentials_transaction(
+                account_name, connector_name, credentials
+            )
+        )
+
+    async def _add_credentials_transaction(
+        self, account_name: str, connector_name: str, credentials: dict
+    ):
         """
         Add or update connector credentials and initialize the connector with validation.
 
@@ -781,13 +853,25 @@ class AccountsService:
                 self.accounts_state.setdefault(account_name, {})[
                     connector_name
                 ] = staged_state
-            except BaseException:
+            except BaseException as exc:
                 logger.error(
                     "Error adding connector credentials for account %s",
                     account_name,
                 )
                 if stage is not None and stage.get("committed"):
                     raise
+                if isinstance(exc, asyncio.CancelledError) and stage is not None:
+                    terminal_success = await self._retained_stop_succeeded(
+                        account_name, connector_name
+                    )
+                    if terminal_success:
+                        await self._connector_service.commit_staged_connector_keys_already_locked(
+                            account_name, connector_name, stage
+                        )
+                        self.accounts_state.setdefault(account_name, {})[
+                            connector_name
+                        ] = staged_state
+                        raise
                 if stage is not None:
                     await self._connector_service.discard_staged_connector_already_locked(
                         account_name, connector_name, stage
@@ -835,6 +919,15 @@ class AccountsService:
             raise HTTPException(status_code=404, detail=str(e))
 
     async def delete_credentials(self, account_name: str, connector_name: str):
+        validate_safe_name(account_name, "account name")
+        validate_safe_name(connector_name, "connector name")
+        return await self._run_account_continuation(
+            self._delete_credentials_transaction(account_name, connector_name)
+        )
+
+    async def _delete_credentials_transaction(
+        self, account_name: str, connector_name: str
+    ):
         """
         Delete the credentials of the specified connector for the specified account.
         :param account_name:
@@ -868,7 +961,17 @@ class AccountsService:
                 )
                 if detail is not None:
                     raise ConnectorCapabilityError(detail)
-            except BaseException:
+            except BaseException as exc:
+                if isinstance(exc, asyncio.CancelledError):
+                    terminal_success = await self._retained_stop_succeeded(
+                        account_name, connector_name
+                    )
+                    if terminal_success:
+                        if account_name in self.accounts_state:
+                            self.accounts_state[account_name].pop(
+                                connector_name, None
+                            )
+                        raise
                 if file_mutation_started and original_content is not None:
                     fs_util.ensure_file_and_dump_text(
                         credentials_path, original_content
@@ -898,6 +1001,12 @@ class AccountsService:
         self.accounts_state[account_name] = {}
 
     async def delete_account(self, account_name: str):
+        validate_safe_name(account_name, "account name")
+        return await self._run_account_continuation(
+            self._delete_account_transaction(account_name)
+        )
+
+    async def _delete_account_transaction(self, account_name: str):
         """
         Delete the specified account.
         :param account_name:
@@ -916,6 +1025,7 @@ class AccountsService:
                 self._connector_service.list_account_connectors(account_name)
             )
             committed_connectors = set()
+            retained_cancellation = None
             folder_mutation_started = False
             try:
                 # Complete every fallible filesystem mutation before the first
@@ -928,7 +1038,19 @@ class AccountsService:
                         result = await self._connector_service.stop_trading_connector(
                             account_name, connector_name
                         )
-                    except BaseException:
+                    except BaseException as exc:
+                        if isinstance(exc, asyncio.CancelledError):
+                            terminal_success = await self._retained_stop_succeeded(
+                                account_name, connector_name
+                            )
+                            if terminal_success:
+                                retained_cancellation = exc
+                                committed_connectors.add(connector_name)
+                                if account_name in self.accounts_state:
+                                    self.accounts_state[account_name].pop(
+                                        connector_name, None
+                                    )
+                                continue
                         live_connectors = set(
                             self._connector_service.list_account_connectors(
                                 account_name
@@ -974,6 +1096,8 @@ class AccountsService:
                 account_name
             )
             self.accounts_state.pop(account_name, None)
+            if retained_cancellation is not None:
+                raise retained_cancellation
     
     async def get_account_current_state(self, account_name: str) -> Dict[str, List[Dict]]:
         """
