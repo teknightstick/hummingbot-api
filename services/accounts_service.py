@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import logging
 import re
 from datetime import datetime, timezone
@@ -284,14 +285,16 @@ class AccountsService:
                             )
                         except ConnectorCapabilityError:
                             continue
-                        if account_name not in self.accounts_state:
-                            self.accounts_state[account_name] = {}
                         # Gateway connectors only track the tokens of their trading pairs; the
                         # full wallet balance is fetched by _update_gateway_balances below.
                         if self._connector_service.is_gateway_connector(connector):
                             gateway_meta.append((account_name, connector_name))
                             continue
-                        tasks.append(self._refresh_and_get_tokens_info(connector, connector_name, account_name))
+                        tasks.append(
+                            self._refresh_account_connector_state(
+                                connector, connector_name, account_name
+                            )
+                        )
                         task_meta.append((account_name, connector_name))
 
                 has_connector_tasks = len(tasks) > 0
@@ -303,9 +306,6 @@ class AccountsService:
                 for (account_name, connector_name), result in zip(task_meta, connector_results):
                     if isinstance(result, Exception):
                         logger.error(f"Error updating {connector_name} in {account_name}: {result}")
-                        self.accounts_state[account_name][connector_name] = []
-                    else:
-                        self.accounts_state[account_name][connector_name] = result
 
                 gw_result = results[-1]
                 if isinstance(gw_result, Exception):
@@ -758,7 +758,9 @@ class AccountsService:
                 and connector_name in self.accounts_state[account_name]
             )
             original_connector_state = (
-                self.accounts_state[account_name][connector_name]
+                copy.deepcopy(
+                    self.accounts_state[account_name][connector_name]
+                )
                 if connector_state_existed
                 else None
             )
@@ -771,11 +773,9 @@ class AccountsService:
                     connector_name,
                     skip_balance_refresh=True,
                 )
-                connector = await self._connector_service.commit_staged_connector_keys_already_locked(
+                await self._connector_service.commit_staged_connector_keys_already_locked(
                     account_name, connector_name, stage
                 )
-                if connector is not stage["connector"]:
-                    raise RuntimeError("credential_connector_commit_mismatch")
                 self.accounts_state.setdefault(account_name, {})[
                     connector_name
                 ] = staged_state
@@ -784,6 +784,8 @@ class AccountsService:
                     "Error adding connector credentials for account %s",
                     account_name,
                 )
+                if stage is not None and stage.get("committed"):
+                    raise
                 if stage is not None:
                     await self._connector_service.discard_staged_connector_already_locked(
                         account_name, connector_name, stage
@@ -842,23 +844,34 @@ class AccountsService:
         async with self._connector_service.credential_transaction(
             account_name, connector_name
         ):
-            detail = await self._connector_service._stop_trading_connector_already_locked(
-                account_name, connector_name
-            )
-            if detail is not None:
-                raise ConnectorCapabilityError(detail)
-
             credentials_path = (
                 f"credentials/{account_name}/connectors/{connector_name}.yml"
             )
-            if fs_util.path_exists(credentials_path):
-                fs_util.delete_file(
-                    directory=f"credentials/{account_name}/connectors",
-                    file_name=f"{connector_name}.yml",
-                )
-            self._connector_service.clear_trading_connector_already_locked(
-                account_name, connector_name
+            credentials_existed = fs_util.path_exists(credentials_path)
+            original_content = (
+                fs_util.read_file(credentials_path)
+                if credentials_existed
+                else None
             )
+            file_mutation_started = False
+            try:
+                if credentials_existed:
+                    file_mutation_started = True
+                    fs_util.delete_file(
+                        directory=f"credentials/{account_name}/connectors",
+                        file_name=f"{connector_name}.yml",
+                    )
+                detail = await self._connector_service._stop_trading_connector_already_locked(
+                    account_name, connector_name
+                )
+                if detail is not None:
+                    raise ConnectorCapabilityError(detail)
+            except BaseException:
+                if file_mutation_started and original_content is not None:
+                    fs_util.ensure_file_and_dump_text(
+                        credentials_path, original_content
+                    )
+                raise
             if account_name in self.accounts_state:
                 self.accounts_state[account_name].pop(connector_name, None)
 
@@ -889,18 +902,41 @@ class AccountsService:
         :return:
         """
         validate_safe_name(account_name, "account name")
-        # Stop all connectors for this account
-        for connector_name in self._connector_service.list_account_connectors(account_name):
-            await self._connector_service.stop_trading_connector(account_name, connector_name)
-        # Clear all connectors for this account from cache
-        self._connector_service.clear_trading_connector(account_name)
+        async with self._connector_service.account_transaction(account_name):
+            account_state_existed = account_name in self.accounts_state
+            original_account_state = (
+                copy.deepcopy(self.accounts_state[account_name])
+                if account_state_existed
+                else None
+            )
+            folder_snapshot = fs_util.snapshot_folder("credentials", account_name)
+            folder_mutation_started = False
+            try:
+                # Complete every fallible filesystem mutation before the first
+                # terminal connector stop. The in-memory snapshot is the rollback.
+                folder_mutation_started = True
+                fs_util.delete_folder("credentials", account_name)
+                for connector_name in sorted(
+                    self._connector_service.list_account_connectors(account_name)
+                ):
+                    await self._connector_service.stop_trading_connector(
+                        account_name, connector_name
+                    )
+            except BaseException:
+                if folder_mutation_started:
+                    fs_util.restore_folder_snapshot(
+                        "credentials", account_name, folder_snapshot
+                    )
+                if account_state_existed:
+                    self.accounts_state[account_name] = original_account_state
+                else:
+                    self.accounts_state.pop(account_name, None)
+                raise
 
-        # Delete account folder
-        fs_util.delete_folder('credentials', account_name)
-
-        # Remove from account state
-        if account_name in self.accounts_state:
-            self.accounts_state.pop(account_name)
+            self._connector_service.clear_account_connectors_already_locked(
+                account_name
+            )
+            self.accounts_state.pop(account_name, None)
     
     async def get_account_current_state(self, account_name: str) -> Dict[str, List[Dict]]:
         """

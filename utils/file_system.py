@@ -156,6 +156,66 @@ class FileSystemUtil:
             raise NotADirectoryError(f"Path '{folder_name}' is not a directory")
         shutil.rmtree(folder_path)
 
+    def snapshot_folder(self, directory: str, folder_name: str) -> dict:
+        """Read a folder tree into memory before a transactional deletion."""
+        if (
+            not folder_name
+            or folder_name in (".", "..")
+            or "/" in folder_name
+            or "\\" in folder_name
+        ):
+            raise ValueError(f"Invalid folder name: '{folder_name}'")
+        folder_path = self._get_full_path(os.path.join(directory, folder_name))
+        if not os.path.exists(folder_path):
+            raise FileNotFoundError(
+                f"Folder '{folder_name}' not found in '{directory}'"
+            )
+        if not os.path.isdir(folder_path):
+            raise NotADirectoryError(f"Path '{folder_name}' is not a directory")
+
+        directories = []
+        files = {}
+        for root, dir_names, file_names in os.walk(folder_path):
+            relative_root = os.path.relpath(root, folder_path)
+            directories.append(relative_root)
+            for dir_name in dir_names:
+                directories.append(
+                    os.path.normpath(os.path.join(relative_root, dir_name))
+                )
+            for file_name in file_names:
+                relative_path = os.path.normpath(
+                    os.path.join(relative_root, file_name)
+                )
+                with open(os.path.join(root, file_name), "rb") as file:
+                    files[relative_path] = file.read()
+        return {"directories": tuple(dict.fromkeys(directories)), "files": files}
+
+    def restore_folder_snapshot(
+        self, directory: str, folder_name: str, snapshot: dict
+    ) -> None:
+        """Restore the exact directory names and file bytes from a snapshot."""
+        if (
+            not folder_name
+            or folder_name in (".", "..")
+            or "/" in folder_name
+            or "\\" in folder_name
+        ):
+            raise ValueError(f"Invalid folder name: '{folder_name}'")
+        folder_path = self._get_full_path(os.path.join(directory, folder_name))
+        if os.path.exists(folder_path):
+            if not os.path.isdir(folder_path):
+                raise NotADirectoryError(f"Path '{folder_name}' is not a directory")
+            shutil.rmtree(folder_path)
+        os.makedirs(folder_path, exist_ok=True)
+        for relative_path in snapshot["directories"]:
+            if relative_path != ".":
+                os.makedirs(os.path.join(folder_path, relative_path), exist_ok=True)
+        for relative_path, content in snapshot["files"].items():
+            full_path = os.path.join(folder_path, relative_path)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, "wb") as file:
+                file.write(content)
+
     def delete_file(self, directory: str, file_name: str) -> None:
         """
         Deletes a file in a specified directory.

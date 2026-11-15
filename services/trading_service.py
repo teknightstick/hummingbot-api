@@ -468,8 +468,16 @@ class AccountTradingInterface:
             self._connector_service, "_market_transaction_lock", None
         )
         if callable(shared_transaction):
-            async with shared_transaction(transaction_key, trading_pair):
-                yield
+            account_transaction = getattr(
+                self._connector_service, "account_transaction", None
+            )
+            if callable(account_transaction):
+                async with account_transaction(self._account_name):
+                    async with shared_transaction(transaction_key, trading_pair):
+                        yield
+            else:
+                async with shared_transaction(transaction_key, trading_pair):
+                    yield
             return
         async with self._market_locks_guard:
             lock = self._market_locks.setdefault(transaction_key, asyncio.Lock())

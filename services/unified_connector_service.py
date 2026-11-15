@@ -237,6 +237,10 @@ class UnifiedConnectorService:
         self._active_public_transaction_tokens: Dict[int, Dict[str, Any]] = {}
         self._connector_incarnations: Dict[Tuple[str, str], int] = {}
         self._connector_incarnation_sequence = 0
+        self._account_transaction_locks: Dict[str, asyncio.Lock] = {}
+        self._account_transaction_lock_users: Dict[str, int] = {}
+        self._account_transaction_owners: Dict[str, asyncio.Task] = {}
+        self._account_transaction_locks_guard = asyncio.Lock()
         self._market_locks: Dict[Tuple[str, str], asyncio.Lock] = {}
         self._market_lock_users: Dict[Tuple[str, str], int] = {}
         self._market_leases: Dict[
@@ -408,6 +412,15 @@ class UnifiedConnectorService:
         if not hasattr(self, "_connector_incarnation_sequence"):
             self._connector_incarnation_sequence = 0
 
+        if not hasattr(self, "_account_transaction_locks"):
+            self._account_transaction_locks = {}
+        if not hasattr(self, "_account_transaction_lock_users"):
+            self._account_transaction_lock_users = {}
+        if not hasattr(self, "_account_transaction_owners"):
+            self._account_transaction_owners = {}
+        if not hasattr(self, "_account_transaction_locks_guard"):
+            self._account_transaction_locks_guard = asyncio.Lock()
+
         if not hasattr(self, "_market_locks"):
             self._market_locks = {}
         if not hasattr(self, "_market_lock_users"):
@@ -523,10 +536,20 @@ class UnifiedConnectorService:
             Initialized trading connector
         """
         connector_key = self._connector_key(account_name, connector_name)
-        async with self._market_transaction_lock(connector_key):
+        exact_lease = self._exact_market_transaction_lease(connector_key)
+        if exact_lease is not None:
+            owner = self._account_transaction_owners.get(account_name)
+            if owner is not None and owner is not asyncio.current_task():
+                raise RuntimeError("account_transaction_active")
             return await self._get_trading_connector_already_locked(
                 account_name, connector_name
             )
+        self._raise_market_mutation_preflight(connector_key)
+        async with self.account_transaction(account_name):
+            async with self._market_transaction_lock(connector_key):
+                return await self._get_trading_connector_already_locked(
+                    account_name, connector_name
+                )
 
     async def _get_trading_connector_already_locked(
         self,
@@ -3327,6 +3350,7 @@ class UnifiedConnectorService:
         connector: ConnectorBase,
         account_name: str,
         connector_name: str,
+        staged_indices: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Start private runtime state before one synchronous publication."""
 
@@ -3336,20 +3360,42 @@ class UnifiedConnectorService:
 
         # Setup order and funding recorders
         cache_key = f"{account_name}:{connector_name}"
-        if self.db_manager and cache_key not in self._orders_recorders:
+        orders_missing = (
+            cache_key not in self._orders_recorders
+            if staged_indices is None
+            else "orders" not in staged_indices
+        )
+        if self.db_manager and orders_missing:
             from services.orders_recorder import OrdersRecorder
             orders_recorder = OrdersRecorder(self.db_manager, account_name, connector_name)
+            if staged_indices is not None:
+                staged_indices["orders"] = orders_recorder
             orders_recorder.start(connector)
-            self._orders_recorders[cache_key] = orders_recorder
+            if staged_indices is None:
+                self._orders_recorders[cache_key] = orders_recorder
 
             if self._is_perpetual_connector(connector):
                 from services.funding_recorder import FundingRecorder
                 funding_recorder = FundingRecorder(self.db_manager, account_name, connector_name)
+                if staged_indices is not None:
+                    staged_indices["funding"] = funding_recorder
                 funding_recorder.start(connector)
-                self._funding_recorders[cache_key] = funding_recorder
+                if staged_indices is None:
+                    self._funding_recorders[cache_key] = funding_recorder
 
         # Initialize metrics
-        self._initialize_metrics(connector, account_name, connector_name, cache_key)
+        if staged_indices is None:
+            self._initialize_metrics(
+                connector, account_name, connector_name, cache_key
+            )
+        else:
+            self._initialize_metrics(
+                connector,
+                account_name,
+                connector_name,
+                cache_key,
+                staged_indices=staged_indices,
+            )
 
         # Start network tasks
         await self._start_connector_network(connector)
@@ -3462,6 +3508,38 @@ class UnifiedConnectorService:
             if not account_connectors:
                 self._trading_connectors.pop(account_name, None)
 
+    def _prune_terminal_connector_state(
+        self,
+        connector_key: Tuple[str, str],
+        owner_key: Tuple[str, str, str],
+        authority,
+    ) -> None:
+        """Synchronously forget private truth owned by one terminal generation."""
+        if self._cached_public_connector(connector_key) is not None:
+            return
+
+        self._finish_owner_cleanup(owner_key)
+        self._connector_creation_residuals.pop(connector_key, None)
+        for market_key in tuple(self._market_cleanup_phases):
+            if market_key[:2] == connector_key and market_key[2:3] == (
+                "remote_cleanup",
+            ):
+                self._market_cleanup_phases.pop(market_key, None)
+                self._market_residual_tasks.pop(market_key, None)
+        for market_key, market_owner in tuple(
+            self._market_cleanup_owners.items()
+        ):
+            owned_connector = (
+                market_owner.get("connector")
+                if isinstance(market_owner, dict)
+                else None
+            )
+            if market_key[:2] == connector_key and owned_connector is authority:
+                self._market_cleanup_owners.pop(market_key, None)
+                self._market_cleanup_residuals.pop(market_key, None)
+        if not self._connector_has_private_state(connector_key):
+            self._connector_incarnations.pop(connector_key, None)
+
     async def _reconcile_owner_operation_terminal(
         self,
         owner_key: Tuple[str, str, str],
@@ -3509,7 +3587,14 @@ class UnifiedConnectorService:
                 if not retained_market:
                     self._market_residual_tasks.pop(market_key, None)
         if error_code is None:
-            self._connector_creation_residuals.pop(connector_key, None)
+            if authority is not _OWNER_AUTHORITY_UNSET:
+                try:
+                    setattr(authority, "_api_network_stop_terminal", True)
+                except Exception:
+                    pass
+            self._prune_terminal_connector_state(
+                connector_key, owner_key, authority
+            )
             self._signal_market_state_change(connector_key)
             return
 
@@ -4168,10 +4253,13 @@ class UnifiedConnectorService:
         connector_name: str = "__unscoped__",
         *,
         authority_incarnation=_OWNER_AUTHORITY_UNSET,
+        owner_kind: str = "network",
     ):
         """Stop connector tasks with a hard deadline and retain pending handles."""
         self._ensure_connector_cleanup_state()
-        owner_key = self._owner_key(account_name, connector_name, "network")
+        if getattr(connector, "_api_network_stop_terminal", False):
+            return
+        owner_key = self._owner_key(account_name, connector_name, owner_kind)
         self._claim_connector_stop_owner(owner_key, connector)
         if authority_incarnation is _OWNER_AUTHORITY_UNSET:
             authority_incarnation = self._connector_incarnation(
@@ -4272,6 +4360,8 @@ class UnifiedConnectorService:
     ) -> None:
         """Stop one published data connector without double-stopping its tracker."""
         self._ensure_connector_cleanup_state()
+        if getattr(connector, "_api_network_stop_terminal", False):
+            return
         owner_key = self._owner_key("__data__", connector_name, "data_network")
         self._claim_connector_stop_owner(owner_key, connector)
         if authority_incarnation is _OWNER_AUTHORITY_UNSET:
@@ -4837,26 +4927,22 @@ class UnifiedConnectorService:
     # Metrics
     # =========================================================================
 
-    def _initialize_metrics(
+    def _create_metrics_collector(
         self,
         connector: ConnectorBase,
         account_name: str,
         connector_name: str,
-        cache_key: str
-    ):
-        """Initialize trade volume metrics collector."""
-        if cache_key in self._metrics_collectors:
-            return
-
+    ) -> Optional[TradeVolumeMetricCollector]:
+        """Construct one collector without starting or publishing it."""
         if "_paper_trade" in connector_name:
-            return
+            return None
 
         try:
             instance_id = f"{account_name}_hbotapi"
             rate_provider = self._rate_provider
             if rate_provider is None:
                 logger.debug(f"No rate provider set, skipping trade-volume metrics for {connector_name}")
-                return
+                return None
 
             metrics_collector = TradeVolumeMetricCollector(
                 connector=connector,
@@ -4865,24 +4951,106 @@ class UnifiedConnectorService:
                 instance_id=instance_id,
                 valuation_token=self.METRICS_VALUATION_TOKEN
             )
-            metrics_collector.start()
-            self._metrics_collectors[cache_key] = metrics_collector
+            return metrics_collector
 
         except Exception as e:
             logger.warning(f"Failed to init metrics for {connector_name}: {e}")
+            return None
+
+    def _initialize_metrics(
+        self,
+        connector: ConnectorBase,
+        account_name: str,
+        connector_name: str,
+        cache_key: str,
+        *,
+        staged_indices: Optional[Dict[str, Any]] = None,
+    ):
+        """Initialize and publish a trade volume metrics collector."""
+        if staged_indices is None and cache_key in self._metrics_collectors:
+            return
+        metrics_collector = self._create_metrics_collector(
+            connector, account_name, connector_name
+        )
+        if metrics_collector is not None:
+            if staged_indices is not None:
+                staged_indices["metrics"] = metrics_collector
+            try:
+                metrics_collector.start()
+            except Exception as error:
+                if staged_indices is not None:
+                    raise
+                logger.warning(
+                    f"Failed to start metrics for {connector_name}: {error}"
+                )
+                return
+            if staged_indices is None:
+                self._metrics_collectors[cache_key] = metrics_collector
 
     # =========================================================================
     # Credentials and Configuration
     # =========================================================================
 
     @asynccontextmanager
+    async def account_transaction(self, account_name: str):
+        """Serialize every connector-key publication for one whole account."""
+        self._ensure_connector_cleanup_state()
+        current_task = asyncio.current_task()
+        if current_task is None:
+            raise RuntimeError("account_transaction_task_unavailable")
+        if self._account_transaction_owners.get(account_name) is current_task:
+            yield
+            return
+
+        async with self._account_transaction_locks_guard:
+            lock = self._account_transaction_locks.setdefault(
+                account_name, asyncio.Lock()
+            )
+            self._account_transaction_lock_users[account_name] = (
+                self._account_transaction_lock_users.get(account_name, 0) + 1
+            )
+        acquired = False
+        try:
+            await lock.acquire()
+            acquired = True
+            self._account_transaction_owners[account_name] = current_task
+            yield
+        finally:
+            if self._account_transaction_owners.get(account_name) is current_task:
+                self._account_transaction_owners.pop(account_name, None)
+            if acquired and lock.locked():
+                lock.release()
+            async with self._account_transaction_locks_guard:
+                users = max(
+                    self._account_transaction_lock_users.get(account_name, 1) - 1,
+                    0,
+                )
+                if users:
+                    self._account_transaction_lock_users[account_name] = users
+                else:
+                    self._account_transaction_lock_users.pop(account_name, None)
+                    if self._account_transaction_locks.get(account_name) is lock:
+                        self._account_transaction_locks.pop(account_name, None)
+
+    def _require_exact_account_root(self, account_name: str) -> asyncio.Task:
+        current_task = asyncio.current_task()
+        if (
+            current_task is None
+            or self._account_transaction_owners.get(account_name) is not current_task
+        ):
+            raise RuntimeError("account_transaction_authority_unavailable")
+        return current_task
+
+    @asynccontextmanager
     async def credential_transaction(
         self, account_name: str, connector_name: str
     ):
-        """Hold exact connector authority across file, cache, and account state."""
+        """Hold account and exact connector authority across one credential commit."""
         connector_key = self._connector_key(account_name, connector_name)
-        async with self._market_transaction_lock(connector_key) as token:
-            yield token
+        self._raise_market_mutation_preflight(connector_key)
+        async with self.account_transaction(account_name):
+            async with self._market_transaction_lock(connector_key) as token:
+                yield token
 
     def _require_exact_market_root(
         self, connector_key: Tuple[str, str]
@@ -4891,6 +5059,86 @@ class UnifiedConnectorService:
         if lease is None:
             raise RuntimeError("market_transaction_authority_unavailable")
         return lease
+
+    @staticmethod
+    def _security_state_snapshot() -> Dict[str, Any]:
+        secure_configs = getattr(BackendAPISecurity, "_secure_configs", None)
+        decryption_done = getattr(BackendAPISecurity, "_decryption_done", None)
+        return {
+            "secure_configs": (
+                copy.deepcopy(secure_configs)
+                if secure_configs is not None
+                else None
+            ),
+            "decryption_done": (
+                decryption_done.is_set()
+                if decryption_done is not None
+                and hasattr(decryption_done, "is_set")
+                else None
+            ),
+        }
+
+    def _credential_publication_snapshot(
+        self, account_name: str, connector_name: str
+    ) -> Dict[str, Any]:
+        credentials_path = (
+            f"credentials/{account_name}/connectors/{connector_name}.yml"
+        )
+        existed = fs_util.path_exists(credentials_path)
+        connector_settings = copy.deepcopy(
+            AllConnectorSettings.get_connector_config_keys(connector_name)
+        )
+        return {
+            "path": credentials_path,
+            "existed": existed,
+            "content": fs_util.read_file(credentials_path) if existed else None,
+            "security": self._security_state_snapshot(),
+            "connector_settings": connector_settings,
+        }
+
+    def _restore_staged_credential_publication(
+        self,
+        account_name: str,
+        connector_name: str,
+        stage: Mapping[str, Any],
+    ) -> None:
+        if stage.get("credentials_committed") or stage.get("credentials_rolled_back"):
+            return
+        snapshot = stage.get("credential_snapshot")
+        if snapshot is None or not stage.get("credentials_touched"):
+            return
+
+        credentials_path = snapshot["path"]
+        try:
+            if snapshot["existed"]:
+                fs_util.ensure_file_and_dump_text(
+                    credentials_path, snapshot["content"]
+                )
+            elif fs_util.path_exists(credentials_path):
+                fs_util.delete_file(
+                    directory=f"credentials/{account_name}/connectors",
+                    file_name=f"{connector_name}.yml",
+                )
+        finally:
+            security = snapshot["security"]
+            secure_configs = getattr(BackendAPISecurity, "_secure_configs", None)
+            if secure_configs is not None and security["secure_configs"] is not None:
+                secure_configs.clear()
+                secure_configs.update(security["secure_configs"])
+            decryption_done = getattr(BackendAPISecurity, "_decryption_done", None)
+            if decryption_done is not None and security["decryption_done"] is not None:
+                if security["decryption_done"]:
+                    decryption_done.set()
+                else:
+                    decryption_done.clear()
+            connector_settings = snapshot.get("connector_settings")
+            update_settings = getattr(
+                AllConnectorSettings, "update_connector_config_keys", None
+            )
+            if connector_settings is not None and callable(update_settings):
+                update_settings(connector_settings)
+            if isinstance(stage, dict):
+                stage["credentials_rolled_back"] = True
 
     async def stage_connector_keys_already_locked(
         self,
@@ -4901,6 +5149,7 @@ class UnifiedConnectorService:
         """Validate a replacement connector without publishing file or cache state."""
         connector_key = self._connector_key(account_name, connector_name)
         self._require_exact_market_root(connector_key)
+        self._require_exact_account_root(account_name)
         if not BackendAPISecurity.login_account(
             account_name=account_name,
             secrets_manager=self.secrets_manager,
@@ -4908,7 +5157,9 @@ class UnifiedConnectorService:
             raise ValueError(f"Failed to authenticate for {account_name}")
 
         connector_config = HummingbotAPIConfigAdapter(
-            AllConnectorSettings.get_connector_config_keys(connector_name)
+            copy.deepcopy(
+                AllConnectorSettings.get_connector_config_keys(connector_name)
+            )
         )
         for key, value in keys.items():
             setattr(connector_config, key, value)
@@ -4919,13 +5170,32 @@ class UnifiedConnectorService:
         stage = {
             "connector": connector,
             "config": connector_config,
+            "indices": {},
             "activated": False,
             "committed": False,
+            "credential_snapshot": self._credential_publication_snapshot(
+                account_name, connector_name
+            ),
+            "credentials_touched": False,
+            "credentials_committed": False,
+            "credentials_rolled_back": False,
         }
         try:
             await self._initialize_trading_connector_candidate(
                 connector, account_name, connector_name
             )
+            await self._activate_trading_connector_candidate(
+                connector,
+                account_name,
+                connector_name,
+                staged_indices=stage["indices"],
+            )
+            stage["activated"] = True
+            stage["credentials_touched"] = True
+            BackendAPISecurity.update_connector_keys(
+                account_name, stage["config"]
+            )
+            BackendAPISecurity.decrypt_all(account_name=account_name)
         except BaseException:
             await self.discard_staged_connector_already_locked(
                 account_name, connector_name, stage
@@ -4939,9 +5209,10 @@ class UnifiedConnectorService:
         connector_name: str,
         stage: Mapping[str, Any],
     ) -> None:
-        """Stop only the exact unpublished/rejected replacement candidate."""
+        """Undo every private candidate delta and restore credential publication."""
         connector_key = self._connector_key(account_name, connector_name)
         self._require_exact_market_root(connector_key)
+        self._require_exact_account_root(account_name)
         connector = stage.get("connector")
         if connector is None or stage.get("discarded"):
             return
@@ -4952,9 +5223,34 @@ class UnifiedConnectorService:
             account_connectors.pop(connector_name, None)
             if not account_connectors:
                 self._trading_connectors.pop(account_name, None)
-        await self._stop_connector_network(
-            connector, account_name, connector_name
-        )
+        cleanup_error = None
+        for label, value in tuple(stage.get("indices", {}).items()):
+            try:
+                await self._stop_owned_index(
+                    account_name,
+                    connector_name,
+                    f"credential_candidate_{label}",
+                    value,
+                )
+            except BaseException as exc:
+                cleanup_error = cleanup_error or exc
+        try:
+            await self._stop_connector_network(
+                connector,
+                account_name,
+                connector_name,
+                owner_kind="credential_candidate_network",
+            )
+        except BaseException as exc:
+            cleanup_error = cleanup_error or exc
+        try:
+            self._restore_staged_credential_publication(
+                account_name, connector_name, stage
+            )
+        except BaseException as exc:
+            cleanup_error = cleanup_error or exc
+        if cleanup_error is not None:
+            raise cleanup_error
 
     async def commit_staged_connector_keys_already_locked(
         self,
@@ -4962,9 +5258,10 @@ class UnifiedConnectorService:
         connector_name: str,
         stage: Dict[str, Any],
     ) -> ConnectorBase:
-        """Stop the old generation, activate the candidate, then publish atomically."""
+        """Stop the old generation, then publish only synchronous staged state."""
         connector_key = self._connector_key(account_name, connector_name)
         self._require_exact_market_root(connector_key)
+        self._require_exact_account_root(account_name)
         connector = stage["connector"]
         detail = await self._stop_trading_connector_already_locked(
             account_name, connector_name
@@ -4972,19 +5269,21 @@ class UnifiedConnectorService:
         if detail is not None:
             raise ConnectorCapabilityError(detail)
 
-        await self._activate_trading_connector_candidate(
-            connector, account_name, connector_name
-        )
-        stage["activated"] = True
-        BackendAPISecurity.update_connector_keys(
-            account_name, stage["config"]
-        )
-        BackendAPISecurity.decrypt_all(account_name=account_name)
         self._trading_connectors.setdefault(account_name, {})[
             connector_name
         ] = connector
+        cache_key = self._index_key(account_name, connector_name)
+        for label, mapping in (
+            ("orders", self._orders_recorders),
+            ("funding", self._funding_recorders),
+            ("metrics", self._metrics_collectors),
+        ):
+            value = stage["indices"].get(label)
+            if value is not None:
+                mapping[cache_key] = value
         self._advance_connector_incarnation(connector_key)
         self._connector_creation_residuals.pop(connector_key, None)
+        stage["credentials_committed"] = True
         stage["committed"] = True
         self._signal_market_state_change(connector_key)
         return connector
@@ -4996,8 +5295,7 @@ class UnifiedConnectorService:
         keys: dict
     ) -> ConnectorBase:
         """Update API keys and recreate connector."""
-        connector_key = self._connector_key(account_name, connector_name)
-        async with self._market_transaction_lock(connector_key):
+        async with self.credential_transaction(account_name, connector_name):
             stage = await self.stage_connector_keys_already_locked(
                 account_name, connector_name, keys
             )
@@ -5024,12 +5322,26 @@ class UnifiedConnectorService:
             if not account_connectors:
                 self._trading_connectors.pop(account_name, None)
 
+    def clear_account_connectors_already_locked(self, account_name: str) -> None:
+        """Clear one account only for the exact account-transaction root."""
+        self._require_exact_account_root(account_name)
+        self._trading_connectors.pop(account_name, None)
+
     def clear_trading_connector(
         self,
         account_name: Optional[str] = None,
         connector_name: Optional[str] = None
     ):
         """Clear terminal cache state; live physical owners reject the mutation."""
+        self._ensure_connector_cleanup_state()
+        if account_name is not None:
+            owner = self._account_transaction_owners.get(account_name)
+            try:
+                current_task = asyncio.current_task()
+            except RuntimeError:
+                current_task = None
+            if owner is not None and owner is not current_task:
+                raise RuntimeError("account_transaction_active")
         keys = []
         if account_name and connector_name:
             keys.append((account_name, connector_name))
@@ -5151,9 +5463,24 @@ class UnifiedConnectorService:
         """Stop a trading connector, exposing any residual instead of hiding it."""
         connector_key = self._connector_key(account_name, connector_name)
         self._ensure_connector_cleanup_state()
-        detail = await self._locked_stop_trading_connector(
-            account_name, connector_name
-        )
+        exact_lease = self._exact_market_transaction_lease(connector_key)
+        if exact_lease is not None:
+            owner = self._account_transaction_owners.get(account_name)
+            if owner is not None and owner is not asyncio.current_task():
+                raise RuntimeError("account_transaction_active")
+            detail = await self._stop_trading_connector_already_locked(
+                account_name, connector_name
+            )
+            if detail is not None:
+                raise ConnectorCapabilityError(detail)
+            return True
+        if self._active_market_transaction_lease(connector_key) is not None:
+            raise RuntimeError("market_transaction_authority_unavailable")
+        self._raise_market_mutation_preflight(connector_key)
+        async with self.account_transaction(account_name):
+            detail = await self._locked_stop_trading_connector(
+                account_name, connector_name
+            )
         if detail is not None:
             raise ConnectorCapabilityError(detail)
         return True

@@ -8,6 +8,7 @@ each test. Behavioral fakes implement the same pinned OrderBook primitive contra
 
 import asyncio
 import ast
+import copy
 import importlib
 import json
 import math
@@ -59,6 +60,23 @@ def _install_import_contract(*, force: bool = False) -> None:
     services.__path__ = [str(Path(__file__).resolve().parents[1] / "services")]
     models = _module("models")
     models.__path__ = [str(Path(__file__).resolve().parents[1] / "models")]
+    models.GatewayWalletCredential = type(
+        "GatewayWalletCredential",
+        (BaseModel,),
+        {
+            "__annotations__": {
+                "chain": str,
+                "private_key": str,
+                "set_default": bool,
+            },
+            "set_default": True,
+        },
+    )
+    models.SetDefaultWalletRequest = type(
+        "SetDefaultWalletRequest",
+        (BaseModel,),
+        {"__annotations__": {"chain": str, "address": str}},
+    )
     routers = _module("routers")
     routers.__path__ = [str(Path(__file__).resolve().parents[1] / "routers")]
 
@@ -75,9 +93,30 @@ def _install_import_contract(*, force: bool = False) -> None:
     deps.get_connector_service = lambda: None
     deps.get_market_data_service = lambda: None
     deps.get_trading_history_service = lambda: None
+    deps.require_gateway_online = lambda: None
 
     accounts_service = _module("services.accounts_service")
     accounts_service.AccountsService = type("AccountsService", (), {})
+
+    def validate_safe_name(name, label="name"):
+        import re
+
+        if not name or re.fullmatch(r"[A-Za-z0-9_-]+", name) is None:
+            from models.connectors import CapabilityErrorDetail
+            from services.connector_capabilities import ConnectorCapabilityError
+
+            raise ConnectorCapabilityError(
+                CapabilityErrorDetail(
+                    code="invalid_account_resource_name",
+                    message=f"Invalid {label}",
+                    connector=name or "account",
+                    feature="account_mutation",
+                    reason="invalid_name",
+                )
+            )
+        return name
+
+    accounts_service.validate_safe_name = validate_safe_name
     history_service = _module("services.trading_history_service")
     history_service.TradingHistoryService = type("TradingHistoryService", (), {})
 
@@ -1300,7 +1339,12 @@ def test_b2_unified_service_resolves_cached_instance_declaration():
     async_utils = _module("hummingbot.core.utils.async_utils")
     async_utils.safe_ensure_future = asyncio.ensure_future
     file_system = _module("utils.file_system")
-    file_system.fs_util = types.SimpleNamespace()
+    file_system.fs_util = types.SimpleNamespace(
+        path_exists=lambda path: False,
+        read_file=lambda path: "",
+        ensure_file_and_dump_text=lambda path, content: None,
+        delete_file=lambda **kwargs: None,
+    )
     config_adapter = _module("utils.hummingbot_api_config_adapter")
     config_adapter.HummingbotAPIConfigAdapter = type("HummingbotAPIConfigAdapter", (), {})
     security = _module("utils.security")
@@ -2270,7 +2314,12 @@ def _load_unified_service_module():
     async_utils = _module("hummingbot.core.utils.async_utils")
     async_utils.safe_ensure_future = asyncio.ensure_future
     file_system = _module("utils.file_system")
-    file_system.fs_util = types.SimpleNamespace()
+    file_system.fs_util = types.SimpleNamespace(
+        path_exists=lambda path: False,
+        read_file=lambda path: "",
+        ensure_file_and_dump_text=lambda path, content: None,
+        delete_file=lambda **kwargs: None,
+    )
     config_adapter = _module("utils.hummingbot_api_config_adapter")
     config_adapter.HummingbotAPIConfigAdapter = type("HummingbotAPIConfigAdapter", (), {})
     security = _module("utils.security")
@@ -9316,7 +9365,7 @@ async def test_issue224_delete_credentials_commits_only_after_terminal_stop(
 
     accounts_module = _load_accounts_service_module()
     events = []
-    file_state = {"exists": True}
+    file_state = {"exists": True, "content": "OLD-CREDENTIAL"}
     detail = CapabilityErrorDetail(
         code="connector_cleanup_residual",
         message="Connector cleanup is incomplete for 'acct:manzana'",
@@ -9346,15 +9395,17 @@ async def test_issue224_delete_credentials_commits_only_after_terminal_stop(
                 return detail
             return None
 
-        def clear_trading_connector_already_locked(
-            self, account_name, connector_name
-        ):
-            events.append("clear")
-
     connector_service = ConnectorService()
     service = object.__new__(accounts_module.AccountsService)
     service._connector_service = connector_service
     service.accounts_state = {"acct": {"manzana": ["balance"]}}
+
+    monkeypatch.setattr(
+        accounts_module.fs_util,
+        "read_file",
+        lambda path: file_state["content"],
+        raising=False,
+    )
 
     monkeypatch.setattr(
         accounts_module.fs_util,
@@ -9374,9 +9425,20 @@ async def test_issue224_delete_credentials_commits_only_after_terminal_stop(
         raising=False,
     )
 
+    def restore_file(path, content):
+        events.append("restore")
+        file_state.update(exists=True, content=content)
+
+    monkeypatch.setattr(
+        accounts_module.fs_util,
+        "ensure_file_and_dump_text",
+        restore_file,
+        raising=False,
+    )
+
     with pytest.raises(ConnectorCapabilityError):
         await service.delete_credentials("acct", "manzana")
-    CHECK.assertEqual(["enter", "stop", "exit"], events)
+    CHECK.assertEqual(["enter", "delete", "stop", "restore", "exit"], events)
     CHECK.assertTrue(file_state["exists"])
     CHECK.assertEqual(["balance"], service.accounts_state["acct"]["manzana"])
 
@@ -9385,12 +9447,13 @@ async def test_issue224_delete_credentials_commits_only_after_terminal_stop(
     CHECK.assertEqual(
         [
             "enter",
+            "delete",
             "stop",
+            "restore",
             "exit",
             "enter",
-            "stop",
             "delete",
-            "clear",
+            "stop",
             "exit",
         ],
         events,
@@ -9601,12 +9664,31 @@ async def test_issue224_physical_wrapper_reconciles_before_lease_release(
     )
     if terminal_outcome == "success":
         CHECK.assertNotIn(connector_key, service._connector_creation_residuals)
-        phase = service._connector_cleanup_phases[
-            (*connector_key, "network")
-        ]["connector_stop"]
-        CHECK.assertTrue(phase["complete"])
-        CHECK.assertIs(phase["result"], True)
-        CHECK.assertIsNone(phase["error_code"])
+        for registry in (
+            service._connector_cleanup_owners,
+            service._connector_cleanup_phases,
+            service._connector_residual_tasks,
+            service._market_cleanup_residuals,
+            service._market_cleanup_owners,
+            service._market_residual_tasks,
+            service._market_cleanup_phases,
+        ):
+            CHECK.assertFalse(
+                any(key[:2] == connector_key for key in registry), registry
+            )
+        CHECK.assertNotIn(connector_key, service._connector_incarnations)
+
+        replacement = Issue224RepairConnector()
+
+        async def create_replacement(account_name, connector_name):
+            return replacement
+
+        service._create_and_initialize_trading_connector = create_replacement
+        CHECK.assertIs(
+            replacement,
+            await service.get_trading_connector("acct", "manzana"),
+        )
+        CHECK.assertEqual(0, replacement.stop_calls)
     else:
         expected_codes = {
             "false": "connector_stop_returned_false",
@@ -9835,3 +9917,413 @@ async def test_issue224_balance_refresh_retries_identity_and_commits_under_autho
     CHECK.assertEqual(1, current.balance_calls)
     CHECK.assertEqual(result, service.accounts_state["acct"]["manzana"])
     CHECK.assertFalse(connector_service.authority)
+
+
+@pytest.mark.asyncio
+async def test_issue224_credential_candidate_is_fully_staged_and_exactly_discarded(
+    monkeypatch,
+):
+    from models.connectors import CapabilityErrorDetail
+    from services.connector_capabilities import ConnectorCapabilityError
+
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    service.secrets_manager = object()
+    service._conn_settings = {"manzana": object()}
+    old_connector = object()
+    candidate = object()
+    old_indices = {
+        "orders": object(),
+        "funding": object(),
+        "metrics": object(),
+    }
+    candidate_indices = {
+        "orders": object(),
+        "funding": object(),
+        "metrics": object(),
+    }
+    cache_key = "acct:manzana"
+    connector_key = ("acct", "manzana")
+    service._trading_connectors = {"acct": {"manzana": old_connector}}
+    service._orders_recorders[cache_key] = old_indices["orders"]
+    service._funding_recorders[cache_key] = old_indices["funding"]
+    service._metrics_collectors[cache_key] = old_indices["metrics"]
+    service._advance_connector_incarnation(connector_key)
+    events = []
+    file_state = {"exists": True, "content": "OLD"}
+    settings_state = {
+        "value": {"connector": "manzana", "api_key": "OLD"}
+    }
+
+    monkeypatch.setattr(
+        module.BackendAPISecurity,
+        "login_account",
+        staticmethod(lambda **kwargs: True),
+        raising=False,
+    )
+
+    def update_keys(account_name, config):
+        events.append("file")
+        file_state.update(exists=True, content="NEW")
+
+    monkeypatch.setattr(
+        module.BackendAPISecurity,
+        "update_connector_keys",
+        staticmethod(update_keys),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module.BackendAPISecurity,
+        "decrypt_all",
+        staticmethod(lambda **kwargs: events.append("decrypt")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module.AllConnectorSettings,
+        "get_connector_config_keys",
+        staticmethod(lambda connector_name: settings_state["value"]),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module.AllConnectorSettings,
+        "update_connector_config_keys",
+        staticmethod(lambda value: settings_state.update(value=value)),
+        raising=False,
+    )
+
+    class Config:
+        pass
+
+    monkeypatch.setattr(module, "HummingbotAPIConfigAdapter", lambda value: Config())
+    monkeypatch.setattr(module, "api_keys_from_connector_config_map", lambda value: {})
+    service._create_trading_connector = lambda *args, **kwargs: candidate
+
+    async def initialize(*args):
+        events.append("initialize")
+
+    async def activate(connector, account_name, connector_name, staged_indices=None):
+        events.append("activate")
+        staged_indices.update(candidate_indices)
+
+    service._initialize_trading_connector_candidate = initialize
+    service._activate_trading_connector_candidate = activate
+    monkeypatch.setattr(
+        module.fs_util,
+        "path_exists",
+        lambda path: file_state["exists"],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module.fs_util,
+        "read_file",
+        lambda path: file_state["content"],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module.fs_util,
+        "ensure_file_and_dump_text",
+        lambda path, content: file_state.update(exists=True, content=content),
+        raising=False,
+    )
+
+    detail = CapabilityErrorDetail(
+        code="connector_cleanup_residual",
+        message="prior stop failed",
+        connector="manzana",
+        feature="connector_cleanup",
+        reason="cleanup_incomplete",
+        cleanup_scope="connector",
+        cleanup_code="connector_stop_returned_false",
+    )
+
+    async def stop_prior(account_name, connector_name):
+        events.append("stop-prior")
+        CHECK.assertEqual(
+            ["initialize", "activate", "file", "decrypt"], events[:-1]
+        )
+        return detail
+
+    async def stop_index(account_name, connector_name, owner_kind, value):
+        events.append((owner_kind, value))
+
+    async def stop_candidate(*args, **kwargs):
+        events.append("stop-candidate")
+
+    service._stop_trading_connector_already_locked = stop_prior
+    service._stop_owned_index = stop_index
+    service._stop_connector_network = stop_candidate
+
+    async with service.credential_transaction("acct", "manzana"):
+        stage = await service.stage_connector_keys_already_locked(
+            "acct", "manzana", {"api_key": "NEW"}
+        )
+        with pytest.raises(ConnectorCapabilityError):
+            await service.commit_staged_connector_keys_already_locked(
+                "acct", "manzana", stage
+            )
+        await service.discard_staged_connector_already_locked(
+            "acct", "manzana", stage
+        )
+
+    CHECK.assertEqual("OLD", file_state["content"])
+    CHECK.assertEqual(
+        {"connector": "manzana", "api_key": "OLD"},
+        settings_state["value"],
+    )
+    CHECK.assertIs(old_connector, service._trading_connectors["acct"]["manzana"])
+    CHECK.assertEqual(old_indices["orders"], service._orders_recorders[cache_key])
+    CHECK.assertEqual(old_indices["funding"], service._funding_recorders[cache_key])
+    CHECK.assertEqual(old_indices["metrics"], service._metrics_collectors[cache_key])
+    for label, value in candidate_indices.items():
+        CHECK.assertIn((f"credential_candidate_{label}", value), events)
+    CHECK.assertIn("stop-candidate", events)
+
+
+@pytest.mark.asyncio
+async def test_issue224_credential_delete_file_failure_restores_before_stop(
+    monkeypatch,
+):
+    from contextlib import asynccontextmanager
+
+    accounts_module = _load_accounts_service_module()
+    events = []
+    file_state = {"exists": True, "content": "EXACT-OLD"}
+
+    class ConnectorService:
+        @asynccontextmanager
+        async def credential_transaction(self, account_name, connector_name):
+            events.append("enter")
+            try:
+                yield
+            finally:
+                events.append("exit")
+
+        async def _stop_trading_connector_already_locked(self, *args):
+            events.append("stop")
+            return None
+
+    service = object.__new__(accounts_module.AccountsService)
+    service._connector_service = ConnectorService()
+    service.accounts_state = {"acct": {"manzana": ["EXACT-STATE"]}}
+    monkeypatch.setattr(accounts_module.fs_util, "path_exists", lambda path: True, raising=False)
+    monkeypatch.setattr(
+        accounts_module.fs_util,
+        "read_file",
+        lambda path: file_state["content"],
+        raising=False,
+    )
+
+    def fail_after_delete(**kwargs):
+        events.append("delete")
+        file_state["exists"] = False
+        raise PermissionError("DELETE-FAILED")
+
+    monkeypatch.setattr(
+        accounts_module.fs_util, "delete_file", fail_after_delete, raising=False
+    )
+
+    def restore(path, content):
+        events.append("restore")
+        file_state.update(exists=True, content=content)
+
+    monkeypatch.setattr(
+        accounts_module.fs_util,
+        "ensure_file_and_dump_text",
+        restore,
+        raising=False,
+    )
+
+    with pytest.raises(PermissionError, match="DELETE-FAILED"):
+        await service.delete_credentials("acct", "manzana")
+    CHECK.assertEqual(["enter", "delete", "restore", "exit"], events)
+    CHECK.assertEqual({"exists": True, "content": "EXACT-OLD"}, file_state)
+    CHECK.assertEqual(["EXACT-STATE"], service.accounts_state["acct"]["manzana"])
+
+
+@pytest.mark.asyncio
+async def test_issue224_account_delete_excludes_successor_through_final_commit(
+    monkeypatch,
+):
+    accounts_module = _load_accounts_service_module()
+    module, registry_type = _load_unified_service_module()
+    connector_service = _final_boundary_service(module, registry_type)
+    connector_service._trading_connectors = {
+        "acct": {"zeta": object(), "alpha": object()}
+    }
+    service = object.__new__(accounts_module.AccountsService)
+    service._connector_service = connector_service
+    service.accounts_state = {"acct": {"alpha": ["A"], "zeta": ["Z"]}}
+    events = []
+    first_stop_entered = asyncio.Event()
+    release_first_stop = asyncio.Event()
+    folder_state = {"exists": True}
+
+    monkeypatch.setattr(
+        accounts_module.fs_util,
+        "snapshot_folder",
+        lambda *args: {"directories": (".",), "files": {"key": b"secret"}},
+        raising=False,
+    )
+
+    def delete_folder(*args):
+        events.append("delete-folder")
+        folder_state["exists"] = False
+
+    monkeypatch.setattr(
+        accounts_module.fs_util, "delete_folder", delete_folder, raising=False
+    )
+
+    async def controlled_stop(account_name, connector_name):
+        events.append(f"stop-{connector_name}")
+        if connector_name == "alpha":
+            first_stop_entered.set()
+            await release_first_stop.wait()
+        return True
+
+    connector_service.stop_trading_connector = controlled_stop
+    delete_task = asyncio.create_task(service.delete_account("acct"))
+    await first_stop_entered.wait()
+
+    async def publish_successor():
+        async with connector_service.credential_transaction("acct", "successor"):
+            CHECK.assertNotIn("acct", service.accounts_state)
+            CHECK.assertFalse(folder_state["exists"])
+            events.append("publish-successor")
+
+    successor = asyncio.create_task(publish_successor())
+    await asyncio.sleep(0)
+    CHECK.assertFalse(successor.done())
+    release_first_stop.set()
+    await delete_task
+    await successor
+    CHECK.assertEqual(
+        [
+            "delete-folder",
+            "stop-alpha",
+            "stop-zeta",
+            "publish-successor",
+        ],
+        events,
+    )
+    CHECK.assertEqual({}, connector_service._account_transaction_locks)
+
+
+@pytest.mark.asyncio
+async def test_issue224_account_delete_filesystem_failure_restores_exact_snapshot(
+    monkeypatch,
+):
+    from contextlib import asynccontextmanager
+
+    accounts_module = _load_accounts_service_module()
+    events = []
+    account_state = {"manzana": [{"token": "USD", "units": 7}]}
+    folder_state = {"files": {"connectors/manzana.yml": b"EXACT"}}
+    snapshot = {
+        "directories": (".", "connectors"),
+        "files": dict(folder_state["files"]),
+    }
+
+    class ConnectorService:
+        @asynccontextmanager
+        async def account_transaction(self, account_name):
+            events.append("enter")
+            try:
+                yield
+            finally:
+                events.append("exit")
+
+        def list_account_connectors(self, account_name):
+            return ["manzana"]
+
+        async def stop_trading_connector(self, account_name, connector_name):
+            events.append("stop")
+
+        def clear_account_connectors_already_locked(self, account_name):
+            events.append("clear")
+
+    service = object.__new__(accounts_module.AccountsService)
+    service._connector_service = ConnectorService()
+    service.accounts_state = {"acct": copy.deepcopy(account_state)}
+    monkeypatch.setattr(
+        accounts_module.fs_util,
+        "snapshot_folder",
+        lambda *args: copy.deepcopy(snapshot),
+        raising=False,
+    )
+
+    def fail_delete(*args):
+        events.append("delete")
+        folder_state["files"].clear()
+        raise PermissionError("FOLDER-DELETE-FAILED")
+
+    def restore(*args):
+        events.append("restore")
+        folder_state["files"] = dict(args[-1]["files"])
+
+    monkeypatch.setattr(
+        accounts_module.fs_util, "delete_folder", fail_delete, raising=False
+    )
+    monkeypatch.setattr(
+        accounts_module.fs_util,
+        "restore_folder_snapshot",
+        restore,
+        raising=False,
+    )
+
+    with pytest.raises(PermissionError, match="FOLDER-DELETE-FAILED"):
+        await service.delete_account("acct")
+    CHECK.assertEqual(["enter", "delete", "restore", "exit"], events)
+    CHECK.assertEqual(snapshot["files"], folder_state["files"])
+    CHECK.assertEqual(account_state, service.accounts_state["acct"])
+
+
+@pytest.mark.asyncio
+async def test_issue224_periodic_balance_failure_preserves_prior_state(monkeypatch):
+    accounts_module = _load_accounts_service_module()
+    good = object()
+    stale = object()
+    calls = []
+
+    class ConnectorService:
+        def get_all_trading_connectors(self):
+            return {"acct": {"good": good, "stale": stale}}
+
+        def is_gateway_connector(self, connector):
+            return False
+
+    service = object.__new__(accounts_module.AccountsService)
+    service._connector_service = ConnectorService()
+    service.accounts_state = {
+        "acct": {"good": ["OLD-GOOD"], "stale": ["OLD-STALE"]}
+    }
+    service.update_account_state_interval = 1
+    service.require_capability = lambda *args, **kwargs: None
+
+    async def no_op():
+        return None
+
+    service.check_all_connectors = no_op
+    service._update_gateway_balances = no_op
+    service._mirror_gateway_state_to_accounts = lambda meta: None
+    service.dump_account_state = no_op
+
+    async def refresh(connector, connector_name, account_name):
+        calls.append((connector, connector_name, account_name))
+        if connector is stale:
+            raise RuntimeError("STALE-INCARNATION")
+        service.accounts_state[account_name][connector_name] = ["NEW-GOOD"]
+        return ["NEW-GOOD"]
+
+    service._refresh_account_connector_state = refresh
+
+    async def stop_loop(delay):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(accounts_module.asyncio, "sleep", stop_loop)
+    with pytest.raises(asyncio.CancelledError):
+        await service.update_account_state_loop()
+    CHECK.assertEqual(["NEW-GOOD"], service.accounts_state["acct"]["good"])
+    CHECK.assertEqual(["OLD-STALE"], service.accounts_state["acct"]["stale"])
+    CHECK.assertEqual(
+        [(good, "good", "acct"), (stale, "stale", "acct")], calls
+    )
