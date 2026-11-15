@@ -3,6 +3,8 @@ from typing import Annotated, Any, Dict, List, Optional
 
 from pydantic import BaseModel, BeforeValidator, Field
 
+from utils.account_names import AccountName
+
 
 def _reject_boolean_number(value):
     """Reject JSON booleans before Pydantic can coerce them to 1.0/0.0."""
@@ -190,7 +192,10 @@ class AddTradingPairRequest(BaseModel):
     """Request model for adding a trading pair to order book tracking"""
     connector_name: str = Field(description="Name of the connector (e.g., 'binance', 'binance_perpetual')")
     trading_pair: str = Field(description="Trading pair to add (e.g., 'BTC-USDT')")
-    account_name: Optional[str] = Field(default=None, description="Optional account name for trading connector preference")
+    account_name: Optional[AccountName] = Field(
+        default=None,
+        description="Optional account name for trading connector preference",
+    )
     timeout: float = Field(default=30.0, ge=1.0, le=120.0, description="Timeout in seconds for order book initialization")
 
 
@@ -198,7 +203,10 @@ class RemoveTradingPairRequest(BaseModel):
     """Request model for removing a trading pair from order book tracking"""
     connector_name: str = Field(description="Name of the connector")
     trading_pair: str = Field(description="Trading pair to remove")
-    account_name: Optional[str] = Field(default=None, description="Optional account name for trading connector preference")
+    account_name: Optional[AccountName] = Field(
+        default=None,
+        description="Optional account name for trading connector preference",
+    )
 
 
 class TradingPairResponse(BaseModel):

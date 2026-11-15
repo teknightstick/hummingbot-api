@@ -44,6 +44,7 @@ from services.market_data_service import MarketDataService
 from services.ticker_sources import TickerFetchError, TickerUnsupportedError
 from services.unified_connector_service import UnknownConnectorError
 from utils.trading_pair import split_trading_pair
+from utils.account_names import AccountName
 
 logger = logging.getLogger(__name__)
 
@@ -1233,7 +1234,7 @@ async def remove_trading_pair(
 )
 async def get_order_book_diagnostics(
         connector_name: str,
-        account_name: str = None,
+        account_name: Optional[AccountName] = None,
         market_data_service: MarketDataService = Depends(get_market_data_service)
 ):
     """
@@ -1286,7 +1287,7 @@ async def get_order_book_diagnostics(
 )
 async def restart_order_book_tracker(
         connector_name: str,
-        account_name: str = None,
+        account_name: Optional[AccountName] = None,
         market_data_service: MarketDataService = Depends(get_market_data_service)
 ):
     """

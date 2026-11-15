@@ -40,6 +40,7 @@ from services.connector_capabilities import (
     ConnectorCapabilityRegistry,
     ConnectorFeature,
 )
+from utils.account_names import validate_account_name
 from utils.file_system import fs_util
 from utils.hummingbot_api_config_adapter import HummingbotAPIConfigAdapter
 from utils.security import BackendAPISecurity
@@ -71,6 +72,9 @@ _MARKET_TRANSACTION_CONTEXT = ContextVar(
 _PUBLIC_TASK_FACTORY_STATES: Dict[Any, Dict[str, Any]] = {}
 _PUBLIC_TRANSACTION_TOKEN_IDS = count(1)
 _OWNER_AUTHORITY_UNSET = object()
+_BACKEND_API_SECURITY_TRANSACTION_LOCK = asyncio.Lock()
+_BACKEND_API_SECURITY_TRANSACTION_OWNER: Optional[asyncio.Task] = None
+_BACKEND_API_SECURITY_TRANSACTION_DEPTH = 0
 
 
 class _PublicTransactionToken:
@@ -535,6 +539,7 @@ class UnifiedConnectorService:
         Returns:
             Initialized trading connector
         """
+        validate_account_name(account_name)
         connector_key = self._connector_key(account_name, connector_name)
         exact_lease = self._exact_market_transaction_lease(connector_key)
         if exact_lease is not None:
@@ -1013,6 +1018,7 @@ class UnifiedConnectorService:
         Returns:
             Dict mapping connector_name -> ConnectorBase for this account
         """
+        validate_account_name(account_name)
         return self._trading_connectors.get(account_name, {})
 
     def is_trading_connector_initialized(
@@ -1021,6 +1027,7 @@ class UnifiedConnectorService:
         connector_name: str
     ) -> bool:
         """Check if a trading connector is already initialized."""
+        validate_account_name(account_name)
         return (
             account_name in self._trading_connectors and
             connector_name in self._trading_connectors[account_name]
@@ -1225,6 +1232,7 @@ class UnifiedConnectorService:
         self, connector_name: str, account_name: Optional[str]
     ) -> Tuple[str, str]:
         if account_name is not None:
+            validate_account_name(account_name)
             return self._connector_key(account_name, connector_name)
         for owner_account, connectors in getattr(
             self, "_trading_connectors", {}
@@ -2702,6 +2710,8 @@ class UnifiedConnectorService:
         Returns:
             Best available connector for market operations
         """
+        if account_name is not None:
+            validate_account_name(account_name)
         # An explicit account is an authority boundary, not a preference. Falling
         # through here can read or mutate another account's connector and tracker.
         if account_name is not None:
@@ -2768,6 +2778,8 @@ class UnifiedConnectorService:
     ) -> bool:
         """Read existing feed state without constructing or mutating a connector."""
         if account_name is not None:
+            validate_account_name(account_name)
+        if account_name is not None:
             connector = self._trading_connectors.get(account_name, {}).get(
                 connector_name
             )
@@ -2806,6 +2818,8 @@ class UnifiedConnectorService:
         timeout: float = 30.0
     ) -> bool:
         """Serialize the complete public-data transaction under its physical owner."""
+        if account_name is not None:
+            validate_account_name(account_name)
         while True:
             connector_key = self._resolve_public_connector_key(
                 connector_name, account_name
@@ -3109,6 +3123,8 @@ class UnifiedConnectorService:
         Returns:
             True if successfully removed, False otherwise
         """
+        if account_name is not None:
+            validate_account_name(account_name)
         self.require_capability(
             connector_name, ConnectorFeature.DYNAMIC_SUBSCRIPTION, trading_pair
         )
@@ -3554,6 +3570,37 @@ class UnifiedConnectorService:
             retained.discard(task)
             if not retained:
                 self._connector_residual_tasks.pop(owner_key, None)
+        if phase_name == "index_stop":
+            if (
+                not phase.get("rollback_requested")
+                or phase.get("resume_in_progress")
+                or phase.get("pre_stop_reconciled")
+            ):
+                return
+            phase["resume_in_progress"] = True
+            connector_key = owner_key[:2]
+            unresolved = list(phase.get("unresolved_resume_indices", ()))
+            try:
+                rollback_code, unresolved = (
+                    await self._resume_pre_stop_indices_with_truth(
+                        connector_key, unresolved
+                    )
+                )
+            finally:
+                phase["resume_in_progress"] = False
+            phase["rollback_code"] = rollback_code
+            phase["unresolved_resume_indices"] = tuple(unresolved)
+            phase["pre_stop_reconciled"] = not unresolved
+            if unresolved:
+                self._retain_connector_cleanup_residual(
+                    connector_key,
+                    rollback_code or "index_rollback_incomplete",
+                    phase.get("retained_indices", {}),
+                )
+            else:
+                self._finish_owner_cleanup(owner_key)
+            return
+
         if phase_name != "connector_stop":
             return
 
@@ -3618,17 +3665,24 @@ class UnifiedConnectorService:
                     connector_key, owner_key, authority
                 )
                 self._signal_market_state_change(connector_key)
+            phase["unresolved_resume_indices"] = ()
             phase["pre_stop_reconciled"] = True
             self._signal_market_state_change(connector_key)
             return
 
         rollback_code = phase.get("rollback_code")
         if not phase.get("pre_stop_reconciled"):
-            rollback_code = await self._resume_pre_stop_indices(
-                connector_key, stopped_indices
+            unresolved = list(
+                phase.get("unresolved_resume_indices", stopped_indices)
+            )
+            rollback_code, unresolved = (
+                await self._resume_pre_stop_indices_with_truth(
+                    connector_key, unresolved
+                )
             )
             phase["rollback_code"] = rollback_code
-            phase["pre_stop_reconciled"] = True
+            phase["unresolved_resume_indices"] = tuple(unresolved)
+            phase["pre_stop_reconciled"] = not unresolved
         self._retain_connector_cleanup_residual(
             connector_key,
             rollback_code or error_code or "connector_cleanup_incomplete",
@@ -3692,6 +3746,7 @@ class UnifiedConnectorService:
         owner_phases = self._connector_cleanup_phases.setdefault(owner_key, {})
         phase = owner_phases.get(phase_name)
         if phase is None:
+            terminal_context = terminal_context or {}
             phase = {
                 "task": None,
                 "complete": False,
@@ -3704,16 +3759,29 @@ class UnifiedConnectorService:
                 phase["authority_incarnation"] = authority_incarnation
                 phase["terminal_tasks"] = tuple(terminal_tasks or ())
             if phase_name == "connector_stop":
-                terminal_context = terminal_context or {}
                 phase["stopped_indices"] = tuple(
                     terminal_context.get("stopped_indices", ())
                 )
+                phase["unresolved_resume_indices"] = phase[
+                    "stopped_indices"
+                ]
                 phase["retained_indices"] = dict(
                     terminal_context.get("retained_indices", {})
                 )
                 phase["commit_all_on_success"] = terminal_context.get(
                     "commit_all_on_success", True
                 )
+                phase["pre_stop_reconciled"] = False
+                phase["rollback_code"] = None
+            elif phase_name == "index_stop":
+                phase["unresolved_resume_indices"] = tuple(
+                    terminal_context.get("rollback_indices", ())
+                )
+                phase["retained_indices"] = dict(
+                    terminal_context.get("retained_indices", {})
+                )
+                phase["rollback_requested"] = False
+                phase["resume_in_progress"] = False
                 phase["pre_stop_reconciled"] = False
                 phase["rollback_code"] = None
             owner_phases[phase_name] = phase
@@ -3781,13 +3849,22 @@ class UnifiedConnectorService:
                 _, pending = await asyncio.wait({task}, timeout=timeout)
             except asyncio.CancelledError:
                 if (
-                    phase_name == "connector_stop"
+                    phase_name == "index_stop"
+                    and phase.get("unresolved_resume_indices")
+                ):
+                    phase["rollback_requested"] = True
+                if (
+                    phase_name in {"connector_stop", "index_stop"}
                     and not phase["cancel_requested"]
                     and task.cancelling() == 0
                 ):
                     task.cancel()
                     phase["cancel_requested"] = True
                 self._connector_residual_tasks.setdefault(owner_key, set()).add(task)
+                if phase_name == "index_stop" and task.done():
+                    await self._reconcile_owner_operation_terminal(
+                        owner_key, phase_name, phase
+                    )
                 raise
             if pending:
                 if not phase["cancel_requested"] and task.cancelling() == 0:
@@ -3909,6 +3986,9 @@ class UnifiedConnectorService:
         connector_name: str,
         owner_kind: str,
         value,
+        *,
+        rollback_indices: Optional[list[Tuple[str, Any]]] = None,
+        retained_indices: Optional[Mapping[str, Any]] = None,
     ) -> None:
         self._ensure_connector_cleanup_state()
         owner_key = self._owner_key(account_name, connector_name, owner_kind)
@@ -3919,19 +3999,28 @@ class UnifiedConnectorService:
         if stop is None:
             self._finish_owner_cleanup(owner_key)
             return
-        await self._run_owner_operation(owner_key, "index_stop", stop)
+        await self._run_owner_operation(
+            owner_key,
+            "index_stop",
+            stop,
+            terminal_context={
+                "rollback_indices": tuple(rollback_indices or ()),
+                "retained_indices": dict(retained_indices or {}),
+            },
+        )
         if not await self._drain_owner_tasks(owner_key):
             raise RuntimeError("index_cleanup_pending")
         self._finish_owner_cleanup(owner_key)
 
-    async def _resume_pre_stop_indices(
+    async def _resume_pre_stop_indices_with_truth(
         self,
         connector_key: Tuple[str, str],
         stopped_indices: list[Tuple[str, Any]],
-    ) -> Optional[str]:
-        """Restore stopped auxiliary publishers while the connector stays live."""
+    ) -> Tuple[Optional[str], list[Tuple[str, Any]]]:
+        """Resume every supplied index and return only the unresolved subset."""
         connector = self._cached_public_connector(connector_key)
         rollback_codes = []
+        unresolved = []
         for label, value in reversed(stopped_indices):
             try:
                 event_pairs = getattr(value, "_event_pairs", None)
@@ -3970,7 +4059,23 @@ class UnifiedConnectorService:
                     connector_key[1],
                 )
                 rollback_codes.append(f"{label}_rollback_incomplete")
-        return rollback_codes[0] if rollback_codes else None
+                unresolved.append((label, value))
+        unresolved.reverse()
+        return (
+            rollback_codes[0] if rollback_codes else None,
+            unresolved,
+        )
+
+    async def _resume_pre_stop_indices(
+        self,
+        connector_key: Tuple[str, str],
+        stopped_indices: list[Tuple[str, Any]],
+    ) -> Optional[str]:
+        """Restore stopped auxiliary publishers while the connector stays live."""
+        rollback_code, _ = await self._resume_pre_stop_indices_with_truth(
+            connector_key, stopped_indices
+        )
+        return rollback_code
 
     async def _resume_pre_stop_indices_before_raise(
         self,
@@ -4656,6 +4761,8 @@ class UnifiedConnectorService:
         Delegates to the internal _update_connector_state implementation so callers
         in sibling services don't depend on the underscore-prefixed helper.
         """
+        if account_name is not None:
+            validate_account_name(account_name)
         async with self.connector_state_authority(
             connector, connector_name, account_name
         ):
@@ -4671,6 +4778,8 @@ class UnifiedConnectorService:
         account_name: Optional[str] = None,
     ):
         """Keep one exact live connector stable through refresh, reads, and commit."""
+        if account_name is not None:
+            validate_account_name(account_name)
         connector_key = self._connector_key(
             account_name or "__data__", connector_name
         )
@@ -5244,8 +5353,41 @@ class UnifiedConnectorService:
     # =========================================================================
 
     @asynccontextmanager
+    async def _backend_api_security_transaction(self):
+        """Serialize process-global security snapshots before account/market locks.
+
+        Lock order is security -> account -> market -> connector. The lock is
+        process-global because ``BackendAPISecurity`` stores one shared mapping;
+        task re-entry permits an account transaction to call credential helpers.
+        """
+        global _BACKEND_API_SECURITY_TRANSACTION_DEPTH
+        global _BACKEND_API_SECURITY_TRANSACTION_OWNER
+
+        current_task = asyncio.current_task()
+        if current_task is None:
+            raise RuntimeError("security_transaction_task_unavailable")
+        if _BACKEND_API_SECURITY_TRANSACTION_OWNER is current_task:
+            _BACKEND_API_SECURITY_TRANSACTION_DEPTH += 1
+            try:
+                yield
+            finally:
+                _BACKEND_API_SECURITY_TRANSACTION_DEPTH -= 1
+            return
+
+        await _BACKEND_API_SECURITY_TRANSACTION_LOCK.acquire()
+        _BACKEND_API_SECURITY_TRANSACTION_OWNER = current_task
+        _BACKEND_API_SECURITY_TRANSACTION_DEPTH = 1
+        try:
+            yield
+        finally:
+            _BACKEND_API_SECURITY_TRANSACTION_DEPTH = 0
+            _BACKEND_API_SECURITY_TRANSACTION_OWNER = None
+            _BACKEND_API_SECURITY_TRANSACTION_LOCK.release()
+
+    @asynccontextmanager
     async def account_transaction(self, account_name: str):
-        """Serialize every connector-key publication for one whole account."""
+        """Serialize global security, then every publication for one account."""
+        validate_account_name(account_name)
         self._ensure_connector_cleanup_state()
         current_task = asyncio.current_task()
         if current_task is None:
@@ -5254,37 +5396,38 @@ class UnifiedConnectorService:
             yield
             return
 
-        async with self._account_transaction_locks_guard:
-            lock = self._account_transaction_locks.setdefault(
-                account_name, asyncio.Lock()
-            )
-            self._account_transaction_lock_users[account_name] = (
-                self._account_transaction_lock_users.get(account_name, 0) + 1
-            )
-        acquired = False
-        try:
-            await lock.acquire()
-            acquired = True
-            self._account_transaction_owners[account_name] = current_task
-            yield
-        finally:
-            if self._account_transaction_owners.get(account_name) is current_task:
-                self._account_transaction_owners.pop(account_name, None)
-            if acquired and lock.locked():
-                lock.release()
-            # No await is allowed after releasing the physical account lock.
-            # These registry mutations are one event-loop-atomic operation, so
-            # repeated caller cancellation cannot strand a zero-owner entry.
-            users = max(
-                self._account_transaction_lock_users.get(account_name, 1) - 1,
-                0,
-            )
-            if users:
-                self._account_transaction_lock_users[account_name] = users
-            else:
-                self._account_transaction_lock_users.pop(account_name, None)
-                if self._account_transaction_locks.get(account_name) is lock:
-                    self._account_transaction_locks.pop(account_name, None)
+        async with self._backend_api_security_transaction():
+            async with self._account_transaction_locks_guard:
+                lock = self._account_transaction_locks.setdefault(
+                    account_name, asyncio.Lock()
+                )
+                self._account_transaction_lock_users[account_name] = (
+                    self._account_transaction_lock_users.get(account_name, 0) + 1
+                )
+            acquired = False
+            try:
+                await lock.acquire()
+                acquired = True
+                self._account_transaction_owners[account_name] = current_task
+                yield
+            finally:
+                if self._account_transaction_owners.get(account_name) is current_task:
+                    self._account_transaction_owners.pop(account_name, None)
+                if acquired and lock.locked():
+                    lock.release()
+                # No await is allowed after releasing the physical account lock.
+                # These registry mutations are one event-loop-atomic operation, so
+                # repeated caller cancellation cannot strand a zero-owner entry.
+                users = max(
+                    self._account_transaction_lock_users.get(account_name, 1) - 1,
+                    0,
+                )
+                if users:
+                    self._account_transaction_lock_users[account_name] = users
+                else:
+                    self._account_transaction_lock_users.pop(account_name, None)
+                    if self._account_transaction_locks.get(account_name) is lock:
+                        self._account_transaction_locks.pop(account_name, None)
 
     def _require_exact_account_root(self, account_name: str) -> asyncio.Task:
         current_task = asyncio.current_task()
@@ -5587,6 +5730,8 @@ class UnifiedConnectorService:
         connector_name: Optional[str] = None
     ):
         """Clear terminal cache state; live physical owners reject the mutation."""
+        if account_name is not None:
+            validate_account_name(account_name)
         self._ensure_connector_cleanup_state()
         if account_name is not None:
             owner = self._account_transaction_owners.get(account_name)
@@ -5622,10 +5767,12 @@ class UnifiedConnectorService:
 
     def list_account_connectors(self, account_name: str) -> List[str]:
         """List initialized connectors for an account."""
+        validate_account_name(account_name)
         return list(self._trading_connectors.get(account_name, {}).keys())
 
     def list_available_credentials(self, account_name: str) -> List[str]:
         """List connector credentials available for an account."""
+        validate_account_name(account_name)
         try:
             files = fs_util.list_files(f"credentials/{account_name}/connectors")
             return [f.replace(".yml", "") for f in files if f.endswith(".yml")]
@@ -5715,6 +5862,7 @@ class UnifiedConnectorService:
 
     async def stop_trading_connector(self, account_name: str, connector_name: str):
         """Stop a trading connector, exposing any residual instead of hiding it."""
+        validate_account_name(account_name)
         connector_key = self._connector_key(account_name, connector_name)
         self._ensure_connector_cleanup_state()
         exact_lease = self._exact_market_transaction_lease(connector_key)
@@ -5755,6 +5903,22 @@ class UnifiedConnectorService:
             return await self._stop_trading_connector_already_locked(
                 account_name, connector_name
             )
+
+    async def _stop_data_connector(
+        self, connector_name: str
+    ) -> Optional[CapabilityErrorDetail]:
+        """Stop an internal data owner without crossing a public account API."""
+        connector_key = self._connector_key("__data__", connector_name)
+        self._ensure_connector_cleanup_state()
+        exact_lease = self._exact_market_transaction_lease(connector_key)
+        if exact_lease is not None:
+            return await self._finalize_stop_data_connector(connector_name)
+        if self._active_market_transaction_lease(connector_key) is not None:
+            raise RuntimeError("market_transaction_authority_unavailable")
+        self._raise_market_mutation_preflight(connector_key)
+        async with self._market_transaction_lock(connector_key):
+            async with self._connector_creation_lock(connector_key):
+                return await self._finalize_stop_data_connector(connector_name)
 
     async def _stop_trading_connector_already_locked(
         self, account_name: str, connector_name: str
@@ -5825,27 +5989,51 @@ class UnifiedConnectorService:
                     continue
                 try:
                     await self._stop_owned_index(
-                        account_name, connector_name, label, value
+                        account_name,
+                        connector_name,
+                        label,
+                        value,
+                        rollback_indices=[
+                            *stopped_indices,
+                            (label, value),
+                        ],
+                        retained_indices=retained_for_key,
                     )
                 except BaseException as exc:
                     if isinstance(exc, asyncio.CancelledError):
-                        rollback_code = (
-                            await self._resume_pre_stop_indices_before_raise(
-                                connector_key, stopped_indices
-                            )
-                        )
-                        if rollback_code is not None:
-                            self._retain_connector_cleanup_residual(
-                                connector_key,
-                                rollback_code,
-                                retained_for_key,
-                            )
+                        # The retained index-stop child owns the exact current
+                        # stop truth and resumes this full prefix at terminal.
                         raise
                     cleanup_codes.append(f"{label}_cleanup_incomplete")
                     retained_for_key[label] = value
                 else:
                     retained_for_key.pop(label, None)
                     stopped_indices.append((label, value))
+
+        if (
+            isinstance(network_phase, dict)
+            and network_phase.get("complete")
+            and network_phase.get("error_code") is not None
+            and not network_phase.get("pre_stop_reconciled")
+        ):
+            unresolved = list(
+                network_phase.get("unresolved_resume_indices", ())
+            )
+            rollback_code, unresolved = (
+                await self._resume_pre_stop_indices_with_truth(
+                    connector_key, unresolved
+                )
+            )
+            network_phase["rollback_code"] = rollback_code
+            network_phase["unresolved_resume_indices"] = tuple(unresolved)
+            network_phase["pre_stop_reconciled"] = not unresolved
+            return self._retain_connector_cleanup_residual(
+                connector_key,
+                rollback_code
+                or network_phase.get("error_code")
+                or "connector_cleanup_incomplete",
+                retained_for_key,
+            )
 
         if cleanup_codes:
             rollback_code = await self._resume_pre_stop_indices(
@@ -5997,11 +6185,10 @@ class UnifiedConnectorService:
                             or "connector_cleanup_incomplete"
                         )
                     else:
-                        rollback_code = await self._resume_pre_stop_indices(
-                            connector_key, stopped_indices
-                        )
                         cleanup_code = (
-                            rollback_code or "connector_cleanup_incomplete"
+                            network_phase.get("rollback_code")
+                            or network_phase.get("error_code")
+                            or "connector_cleanup_incomplete"
                         )
                 else:
                     rollback_code = await self._resume_pre_stop_indices(
@@ -6275,7 +6462,12 @@ class UnifiedConnectorService:
         failures = []
         for account_name, connector_name in sorted(connector_keys):
             try:
-                await self.stop_trading_connector(account_name, connector_name)
+                if account_name == "__data__":
+                    detail = await self._stop_data_connector(connector_name)
+                    if detail is not None:
+                        raise ConnectorCapabilityError(detail)
+                else:
+                    await self.stop_trading_connector(account_name, connector_name)
             except BaseException as exc:
                 failures.append(exc)
                 logger.error(
@@ -6317,6 +6509,8 @@ class UnifiedConnectorService:
         Returns:
             Dictionary with diagnostic information
         """
+        if account_name is not None:
+            validate_account_name(account_name)
         self.require_capability(connector_name, ConnectorFeature.LIVE_ORDER_BOOK)
         connector = self.get_best_connector_for_market(connector_name, account_name)
 
@@ -6453,6 +6647,8 @@ class UnifiedConnectorService:
         account_name: Optional[str] = None
     ) -> Dict:
         """Restart one tracker as a durable owner-scoped transaction."""
+        if account_name is not None:
+            validate_account_name(account_name)
         self.require_capability(connector_name, ConnectorFeature.LIVE_ORDER_BOOK)
         self._ensure_connector_cleanup_state()
         while True:

@@ -10710,6 +10710,7 @@ async def test_issue224_pre_stop_cancellation_rolls_back_every_stopped_index():
     CHECK.assertEqual(1, metrics.stop_calls)
     CHECK.assertEqual(1, orders.start_calls)
     CHECK.assertEqual(1, funding.start_calls)
+    CHECK.assertEqual(1, metrics.start_calls)
     CHECK.assertEqual(0, connector.stop_calls)
     CHECK.assertIs(connector, service._trading_connectors["acct"]["manzana"])
 
@@ -11201,3 +11202,318 @@ async def test_issue224_account_delete_cancellation_has_terminal_guardian(
             connector,
             connector_service._trading_connectors["acct"]["manzana"],
         )
+
+
+@pytest.mark.asyncio
+async def test_issue224_current_pre_stop_index_is_reconciled_after_cancellation():
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    connector = Issue224RepairConnector()
+    connector_key = ("acct", "manzana")
+    cache_key = "acct:manzana"
+    stop_entered = asyncio.Event()
+    release_stop = asyncio.Event()
+
+    class Index:
+        def __init__(self):
+            self.stopped = False
+            self.stop_calls = 0
+            self.start_calls = 0
+
+        async def stop(self):
+            self.stop_calls += 1
+            self.stopped = True
+            stop_entered.set()
+            await release_stop.wait()
+
+        async def start(self):
+            self.start_calls += 1
+            self.stopped = False
+
+    metrics = Index()
+    service._trading_connectors = {"acct": {"manzana": connector}}
+    service._metrics_collectors[cache_key] = metrics
+    service._advance_connector_incarnation(connector_key)
+
+    operation = asyncio.create_task(
+        service._finalize_stop_trading_connector("acct", "manzana")
+    )
+    await stop_entered.wait()
+    operation.cancel("current-index-cancel")
+    with pytest.raises(asyncio.CancelledError) as captured:
+        await asyncio.wait_for(operation, 0.2)
+    CHECK.assertEqual(("current-index-cancel",), captured.value.args)
+
+    release_stop.set()
+    for _ in range(1000):
+        if metrics.start_calls == 1:
+            break
+        await asyncio.sleep(0.001)
+
+    CHECK.assertEqual(1, metrics.stop_calls)
+    CHECK.assertEqual(1, metrics.start_calls)
+    CHECK.assertFalse(metrics.stopped)
+    CHECK.assertEqual(0, connector.stop_calls)
+    CHECK.assertIs(metrics, service._metrics_collectors[cache_key])
+    CHECK.assertIs(connector, service._trading_connectors["acct"]["manzana"])
+
+
+@pytest.mark.asyncio
+async def test_issue224_resume_retry_only_replays_the_unresolved_subset():
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    connector_key = ("acct", "manzana")
+    cache_key = "acct:manzana"
+
+    class Connector(Issue224RepairConnector):
+        async def stop_network(self):
+            self.stop_calls += 1
+            return False
+
+    class Index:
+        def __init__(self, fail_once=False):
+            self.fail_once = fail_once
+            self.stop_calls = 0
+            self.start_calls = 0
+
+        async def stop(self):
+            self.stop_calls += 1
+
+        async def start(self, connector):
+            self.start_calls += 1
+            if self.fail_once and self.start_calls == 1:
+                raise RuntimeError("one-shot-resume-failure")
+
+    connector = Connector()
+    orders = Index()
+    funding = Index(fail_once=True)
+    service._trading_connectors = {"acct": {"manzana": connector}}
+    service._orders_recorders[cache_key] = orders
+    service._funding_recorders[cache_key] = funding
+    service._advance_connector_incarnation(connector_key)
+
+    for _ in range(2):
+        with pytest.raises(module.ConnectorCapabilityError):
+            await service.stop_trading_connector("acct", "manzana")
+
+    owner_key = ("acct", "manzana", "network")
+    phase = service._connector_cleanup_phases[owner_key]["connector_stop"]
+    CHECK.assertEqual(1, connector.stop_calls)
+    CHECK.assertEqual(1, orders.stop_calls)
+    CHECK.assertEqual(1, funding.stop_calls)
+    CHECK.assertEqual(1, orders.start_calls)
+    CHECK.assertEqual(2, funding.start_calls)
+    CHECK.assertEqual((), tuple(phase["unresolved_resume_indices"]))
+    CHECK.assertTrue(phase["pre_stop_reconciled"])
+
+
+@pytest.mark.asyncio
+async def test_issue224_first_credential_cancellation_rolls_back_uncommitted_stage():
+    from contextlib import asynccontextmanager
+
+    accounts_module = _load_accounts_service_module()
+    token_read_entered = asyncio.Event()
+    candidate = object()
+    publication = {
+        "candidate": None,
+        "file": None,
+        "security": {"baseline": "OLD"},
+    }
+    calls = []
+
+    class ConnectorService:
+        @asynccontextmanager
+        async def credential_transaction(self, account_name, connector_name):
+            yield
+
+        async def stage_connector_keys_already_locked(self, *args):
+            publication["file"] = "NEW"
+            publication["security"] = {"manzana": "NEW"}
+            return {"connector": candidate, "committed": False}
+
+        async def await_retained_connector_stop_already_locked(self, *args):
+            calls.append("await-retained-stop")
+            return None
+
+        def is_trading_connector_initialized(self, *args):
+            return False
+
+        async def commit_staged_connector_keys_already_locked(self, *args):
+            calls.append("commit")
+            publication["candidate"] = candidate
+
+        async def discard_staged_connector_already_locked(self, *args):
+            calls.append("discard")
+            publication["candidate"] = None
+            publication["file"] = None
+            publication["security"] = {"baseline": "OLD"}
+
+    service = object.__new__(accounts_module.AccountsService)
+    service._connector_service = ConnectorService()
+    service.accounts_state = {}
+
+    async def blocked_token_read(*args, **kwargs):
+        token_read_entered.set()
+        await asyncio.Event().wait()
+
+    service._get_connector_tokens_info = blocked_token_read
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        accounts_module.fs_util, "path_exists", lambda path: False, raising=False
+    )
+    monkeypatch.setattr(
+        accounts_module.fs_util,
+        "delete_file",
+        lambda **kwargs: publication.update(file=None),
+        raising=False,
+    )
+    try:
+        caller = asyncio.create_task(
+            service.add_credentials("acct", "manzana", {"api_key": "NEW"})
+        )
+        await token_read_entered.wait()
+        caller.cancel("first-credential-cancel")
+        with pytest.raises(asyncio.CancelledError) as captured:
+            await asyncio.wait_for(caller, 0.2)
+        CHECK.assertEqual(("first-credential-cancel",), captured.value.args)
+
+        for _ in range(1000):
+            if not service._account_continuations:
+                break
+            await asyncio.sleep(0.001)
+    finally:
+        monkeypatch.undo()
+
+    CHECK.assertEqual(set(), service._account_continuations)
+    CHECK.assertEqual(["discard"], calls)
+    CHECK.assertEqual(
+        {"candidate": None, "file": None, "security": {"baseline": "OLD"}},
+        publication,
+    )
+    CHECK.assertEqual({}, service.accounts_state)
+
+
+def test_issue224_reserved_accounts_fail_at_model_router_service_and_unified_boundaries():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from models.market_data import AddTradingPairRequest, RemoveTradingPairRequest
+    from routers import market_data as market_data_router
+    from services.connector_capabilities import ConnectorCapabilityError
+    from services.market_data_service import MarketDataService
+
+    for model in (AddTradingPairRequest, RemoveTradingPairRequest):
+        with pytest.raises(ConnectorCapabilityError):
+            model(
+                connector_name="manzana",
+                trading_pair="BTC-USD",
+                account_name="__data__",
+            )
+
+    class GuardedMarketData:
+        def require_capability(self, *args, **kwargs):
+            raise AssertionError("reserved account reached connector capability work")
+
+    app = FastAPI()
+    app.include_router(market_data_router.router)
+    app.dependency_overrides[market_data_router.get_market_data_service] = (
+        GuardedMarketData
+    )
+    client = TestClient(app)
+    responses = (
+        client.post(
+            "/market-data/trading-pair/add",
+            json={
+                "connector_name": "manzana",
+                "trading_pair": "BTC-USD",
+                "account_name": "__data__",
+            },
+        ),
+        client.get(
+            "/market-data/order-book/diagnostics/manzana",
+            params={"account_name": "__data__"},
+        ),
+        client.post(
+            "/market-data/order-book/restart/manzana",
+            params={"account_name": "__data__"},
+        ),
+    )
+    for response in responses:
+        CHECK.assertEqual(400, response.status_code)
+        CHECK.assertEqual(
+            "invalid_account_resource_name", response.json()["detail"]["code"]
+        )
+
+    class GuardedConnectorService:
+        def require_capability(self, *args, **kwargs):
+            return None
+
+        def get_best_connector_for_market(self, *args, **kwargs):
+            raise AssertionError("reserved account reached connector resolution")
+
+    market_data = MarketDataService(GuardedConnectorService())
+    with pytest.raises(ConnectorCapabilityError):
+        market_data.get_order_book("manzana", "BTC-USD", "__data__")
+
+    module, registry_type = _load_unified_service_module()
+    unified = _final_boundary_service(module, registry_type)
+    unified._data_connectors["manzana"] = object()
+    with pytest.raises(ConnectorCapabilityError):
+        unified.get_best_connector_for_market("manzana", "__data__")
+    with pytest.raises(ConnectorCapabilityError):
+        unified._resolve_public_connector_key("manzana", "__future_internal__")
+
+
+@pytest.mark.asyncio
+async def test_issue224_security_snapshot_rollback_serializes_cross_account_commit():
+    module, registry_type = _load_unified_service_module()
+    service = _final_boundary_service(module, registry_type)
+    security = module.BackendAPISecurity
+    security._secure_configs = {"baseline": "OLD"}
+    security._decryption_done = asyncio.Event()
+    security._decryption_done.set()
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+    second_entered = asyncio.Event()
+
+    async def rollback_first():
+        async with service.credential_transaction("account-a", "manzana"):
+            snapshot = service._security_state_snapshot()
+            security._secure_configs["account-a"] = "UNCOMMITTED"
+            first_entered.set()
+            await release_first.wait()
+            service._restore_staged_credential_publication(
+                "account-a",
+                "manzana",
+                {
+                    "credential_snapshot": {
+                        "path": "credentials/account-a/connectors/manzana.yml",
+                        "existed": False,
+                        "content": None,
+                        "security": snapshot,
+                        "connector_settings": None,
+                    },
+                    "credentials_touched": True,
+                    "credentials_committed": False,
+                    "credentials_rolled_back": False,
+                },
+            )
+
+    async def commit_second():
+        async with service.credential_transaction("account-b", "manzana"):
+            second_entered.set()
+            security._secure_configs["account-b"] = "COMMITTED"
+
+    first = asyncio.create_task(rollback_first())
+    await first_entered.wait()
+    second = asyncio.create_task(commit_second())
+    await asyncio.sleep(0.01)
+    second_was_blocked = not second_entered.is_set()
+    release_first.set()
+    await asyncio.gather(first, second)
+
+    CHECK.assertTrue(second_was_blocked)
+    CHECK.assertEqual(
+        {"baseline": "OLD", "account-b": "COMMITTED"},
+        security._secure_configs,
+    )

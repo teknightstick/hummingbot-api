@@ -25,13 +25,13 @@ from services.connector_capabilities import (
 )
 from utils.file_system import fs_util
 from utils.gateway_certs import build_client_ssl_context
+from utils.account_names import validate_account_name
 
 # Create module-specific logger
 logger = logging.getLogger(__name__)
 
 # Safe single path component names: prevents path traversal via '/', '\' or '..'
 SAFE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
-INTERNAL_ACCOUNT_PREFIX = "__"
 
 
 def validate_safe_name(name: str, label: str = "name") -> str:
@@ -42,6 +42,8 @@ def validate_safe_name(name: str, label: str = "name") -> str:
     :return: The validated name.
     :raises ConnectorCapabilityError: Typed HTTP 400 if the name is invalid.
     """
+    if label == "account name":
+        return validate_account_name(name)
     if not name or not SAFE_NAME_PATTERN.fullmatch(name):
         raise ConnectorCapabilityError(
             CapabilityErrorDetail(
@@ -53,16 +55,6 @@ def validate_safe_name(name: str, label: str = "name") -> str:
                 connector=name or "account",
                 feature="account_mutation",
                 reason="invalid_name",
-            )
-        )
-    if label == "account name" and name.startswith(INTERNAL_ACCOUNT_PREFIX):
-        raise ConnectorCapabilityError(
-            CapabilityErrorDetail(
-                code="invalid_account_resource_name",
-                message=f"Invalid {label}. Internal namespaces are reserved.",
-                connector=name,
-                feature="account_mutation",
-                reason="reserved_name",
             )
         )
     return name
@@ -769,7 +761,11 @@ class AccountsService:
             raise
 
     async def _retained_stop_succeeded(
-        self, account_name: str, connector_name: str
+        self,
+        account_name: str,
+        connector_name: str,
+        *,
+        prior_connector_existed: bool,
     ) -> Optional[bool]:
         waiter = getattr(
             self._connector_service,
@@ -781,6 +777,8 @@ class AccountsService:
         terminal_success = await waiter(account_name, connector_name)
         if terminal_success is not None:
             return terminal_success
+        if not prior_connector_existed:
+            return None
         is_initialized = getattr(
             self._connector_service,
             "is_trading_connector_initialized",
@@ -817,6 +815,10 @@ class AccountsService:
         # connector remains unpublished until validation and account-state refresh pass.
         credentials_path = f"credentials/{account_name}/connectors/{connector_name}.yml"
         stage = None
+        staged_state = None
+        staged_state_ready = False
+        commit_started = False
+        prior_connector_existed = False
         async with self._connector_service.credential_transaction(
             account_name, connector_name
         ):
@@ -838,6 +840,15 @@ class AccountsService:
                 if connector_state_existed
                 else None
             )
+            is_initialized = getattr(
+                self._connector_service,
+                "is_trading_connector_initialized",
+                None,
+            )
+            if callable(is_initialized):
+                prior_connector_existed = is_initialized(
+                    account_name, connector_name
+                )
             try:
                 stage = await self._connector_service.stage_connector_keys_already_locked(
                     account_name, connector_name, credentials
@@ -847,6 +858,8 @@ class AccountsService:
                     connector_name,
                     skip_balance_refresh=True,
                 )
+                staged_state_ready = True
+                commit_started = True
                 await self._connector_service.commit_staged_connector_keys_already_locked(
                     account_name, connector_name, stage
                 )
@@ -860,11 +873,19 @@ class AccountsService:
                 )
                 if stage is not None and stage.get("committed"):
                     raise
-                if isinstance(exc, asyncio.CancelledError) and stage is not None:
+                if (
+                    isinstance(exc, asyncio.CancelledError)
+                    and stage is not None
+                    and staged_state_ready
+                    and commit_started
+                    and prior_connector_existed
+                ):
                     terminal_success = await self._retained_stop_succeeded(
-                        account_name, connector_name
+                        account_name,
+                        connector_name,
+                        prior_connector_existed=prior_connector_existed,
                     )
-                    if terminal_success:
+                    if terminal_success is True:
                         await self._connector_service.commit_staged_connector_keys_already_locked(
                             account_name, connector_name, stage
                         )
@@ -948,6 +969,15 @@ class AccountsService:
                 if credentials_existed
                 else None
             )
+            is_initialized = getattr(
+                self._connector_service,
+                "is_trading_connector_initialized",
+                None,
+            )
+            prior_connector_existed = bool(
+                callable(is_initialized)
+                and is_initialized(account_name, connector_name)
+            )
             file_mutation_started = False
             try:
                 if credentials_existed:
@@ -964,7 +994,9 @@ class AccountsService:
             except BaseException as exc:
                 if isinstance(exc, asyncio.CancelledError):
                     terminal_success = await self._retained_stop_succeeded(
-                        account_name, connector_name
+                        account_name,
+                        connector_name,
+                        prior_connector_existed=prior_connector_existed,
                     )
                     if terminal_success:
                         if account_name in self.accounts_state:
@@ -1041,7 +1073,9 @@ class AccountsService:
                     except BaseException as exc:
                         if isinstance(exc, asyncio.CancelledError):
                             terminal_success = await self._retained_stop_succeeded(
-                                account_name, connector_name
+                                account_name,
+                                connector_name,
+                                prior_connector_existed=True,
                             )
                             if terminal_success:
                                 retained_cancellation = exc

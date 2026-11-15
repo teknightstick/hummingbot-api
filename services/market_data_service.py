@@ -22,6 +22,7 @@ from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from models.connectors import CapabilityErrorDetail
 from services.connector_capabilities import ConnectorCapabilityError, ConnectorFeature
 from services.ticker_sources import Ticker, TickerFetchError, TickerUnsupportedError, fetch_tickers
+from utils.account_names import validate_account_name
 from services.unified_connector_service import UnknownConnectorError
 from utils.rate_finder import find_rate
 
@@ -207,6 +208,8 @@ class MarketDataService:
             account_name: Optional[str] = None,
     ) -> bool:
         """Validate an existing live feed without adding or removing anything."""
+        if account_name is not None:
+            validate_account_name(account_name)
         self._require_capability(
             connector_name, ConnectorFeature.LIVE_ORDER_BOOK, trading_pair
         )
@@ -239,6 +242,8 @@ class MarketDataService:
         Returns:
             True if order book is ready, False otherwise
         """
+        if account_name is not None:
+            validate_account_name(account_name)
         # A live initialization mutates subscriptions, so dynamic support must be
         # declared before connector resolution or any local feed bookkeeping.
         self._require_capability(
@@ -276,6 +281,8 @@ class MarketDataService:
         Returns:
             True if successfully removed, False otherwise
         """
+        if account_name is not None:
+            validate_account_name(account_name)
         self._require_capability(
             connector_name, ConnectorFeature.DYNAMIC_SUBSCRIPTION, trading_pair
         )
@@ -325,6 +332,8 @@ class MarketDataService:
         Returns:
             OrderBook instance or None
         """
+        if account_name is not None:
+            validate_account_name(account_name)
         self._require_capability(connector_name, ConnectorFeature.ORDER_BOOK, trading_pair)
         feed_key = self._generate_feed_key(FeedType.ORDER_BOOK, connector_name, trading_pair)
         self._last_access_times[feed_key] = time.time()
@@ -359,6 +368,8 @@ class MarketDataService:
         Returns:
             Tuple of (bids_df, asks_df) or None
         """
+        if account_name is not None:
+            validate_account_name(account_name)
         order_book = self.get_order_book(connector_name, trading_pair, account_name)
         if order_book:
             try:
@@ -388,6 +399,8 @@ class MarketDataService:
         Returns:
             Dictionary with bids, asks, and metadata
         """
+        if account_name is not None:
+            validate_account_name(account_name)
         self._require_capability(connector_name, ConnectorFeature.ORDER_BOOK, trading_pair)
         try:
             connector = self._connector_service.get_best_connector_for_market(
@@ -474,6 +487,8 @@ class MarketDataService:
         Returns:
             Query result dictionary
         """
+        if account_name is not None:
+            validate_account_name(account_name)
         self._require_capability(connector_name, ConnectorFeature.ORDER_BOOK_QUERY, trading_pair)
         query_keys = ("volume", "price", "quote_volume", "quote_price", "vwap_volume")
         supplied = [key for key in query_keys if key in kwargs]
@@ -791,6 +806,8 @@ class MarketDataService:
         Returns:
             Dictionary mapping trading pairs to prices
         """
+        if account_name is not None:
+            validate_account_name(account_name)
         for trading_pair in trading_pairs:
             self._require_capability(
                 connector_name, ConnectorFeature.LAST_TRADE, trading_pair
@@ -1170,6 +1187,8 @@ class MarketDataService:
         Returns:
             Dictionary mapping trading pairs to their rules
         """
+        if account_name is not None:
+            validate_account_name(account_name)
         if trading_pairs:
             for trading_pair in trading_pairs:
                 self._require_capability(
@@ -1251,6 +1270,8 @@ class MarketDataService:
         Returns:
             Dictionary with funding information
         """
+        if account_name is not None:
+            validate_account_name(account_name)
         self._require_capability(connector_name, ConnectorFeature.PERPETUAL, trading_pair)
         try:
             connector = self._connector_service.get_best_connector_for_market(
@@ -1423,6 +1444,8 @@ class MarketDataService:
         Returns:
             Dictionary with diagnostic information
         """
+        if account_name is not None:
+            validate_account_name(account_name)
         self._require_capability(connector_name, ConnectorFeature.LIVE_ORDER_BOOK)
         return self._connector_service.get_order_book_tracker_diagnostics(
             connector_name=connector_name,
@@ -1444,6 +1467,8 @@ class MarketDataService:
         Returns:
             Dictionary with restart status
         """
+        if account_name is not None:
+            validate_account_name(account_name)
         self._require_capability(connector_name, ConnectorFeature.LIVE_ORDER_BOOK)
         return await self._connector_service.restart_order_book_tracker(
             connector_name=connector_name,
