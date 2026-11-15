@@ -435,12 +435,14 @@ class AccountsService:
                     finally:
                         self._gateway_poller_started = False
 
+                wallet_failure = None
                 try:
                     await self.gateway_wallet_service.close()
-                except Exception as e:
+                except BaseException as e:
+                    wallet_failure = e
                     logger.error(
-                        f"Error closing Gateway wallet service: {e}",
-                        exc_info=True,
+                        "Gateway wallet service close failed (%s)",
+                        type(e).__name__,
                     )
 
                 await self._connector_service.stop_all()
@@ -453,6 +455,12 @@ class AccountsService:
                     raise RuntimeError("account_continuations_not_quiescent")
                 if any(not task.done() for task in self._publisher_tasks):
                     raise RuntimeError("account_publishers_not_quiescent")
+                if wallet_failure is not None:
+                    if isinstance(wallet_failure, asyncio.CancelledError):
+                        raise wallet_failure
+                    raise RuntimeError(
+                        "gateway_wallet_close_failed"
+                    ) from None
                 if poller_failure is not None:
                     raise poller_failure
                 self._stopped = True

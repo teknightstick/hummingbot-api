@@ -766,6 +766,64 @@ class ExecutorService:
             self._trading_interfaces[account_name] = self._trading_service.get_trading_interface(account_name)
         return self._trading_interfaces[account_name]
 
+    def _get_trading_interface_candidate(
+        self, account_name: str
+    ) -> tuple[AccountTradingInterface, bool]:
+        """Return an existing interface or build an unpublished candidate."""
+        trading_interface = self._trading_interfaces.get(account_name)
+        if trading_interface is not None:
+            return trading_interface, False
+
+        get_cached = getattr(
+            self._trading_service, "get_cached_trading_interface", None
+        )
+        if get_cached is not None:
+            trading_interface = get_cached(account_name)
+        else:
+            shared_cache = getattr(
+                self._trading_service, "_trading_interfaces", {}
+            )
+            trading_interface = shared_cache.get(account_name)
+        if trading_interface is not None:
+            return trading_interface, False
+
+        create_candidate = getattr(
+            self._trading_service,
+            "create_trading_interface_candidate",
+            None,
+        )
+        if create_candidate is not None:
+            trading_interface = create_candidate(account_name)
+        else:
+            trading_interface = AccountTradingInterface(
+                connector_service=self._trading_service.connector_service,
+                market_data_service=self._trading_service.market_data_service,
+                account_name=account_name,
+            )
+        return trading_interface, True
+
+    def _publish_trading_interface(
+        self,
+        account_name: str,
+        trading_interface: AccountTradingInterface,
+    ) -> AccountTradingInterface:
+        """Publish a constructor-validated interface to both service caches."""
+        publish = getattr(
+            self._trading_service, "publish_trading_interface", None
+        )
+        if publish is not None:
+            trading_interface = publish(account_name, trading_interface)
+        else:
+            shared_cache = getattr(
+                self._trading_service, "_trading_interfaces", None
+            )
+            if shared_cache is not None:
+                trading_interface = shared_cache.setdefault(
+                    account_name, trading_interface
+                )
+        self._trading_interfaces[account_name] = trading_interface
+        return trading_interface
+
     @classmethod
     def _extract_executor_markets(cls, value: Any) -> List[tuple[str, Optional[str]]]:
         """Recursively extract top-level and nested connector/pair configs."""
@@ -840,7 +898,7 @@ class ExecutorService:
             else "executor"
         )
         executor_type = executor_config.get("type")
-        if not executor_type:
+        if executor_type is None or executor_type == "":
             raise ConnectorCapabilityError(
                 CapabilityErrorDetail(
                     code="invalid_executor_config",
@@ -848,6 +906,17 @@ class ExecutorService:
                     connector=error_connector,
                     feature="executor_creation",
                     reason="missing_type",
+                )
+            )
+
+        if not isinstance(executor_type, str) or not executor_type.strip():
+            raise ConnectorCapabilityError(
+                CapabilityErrorDetail(
+                    code="invalid_executor_config",
+                    message="Executor type must be a non-empty string.",
+                    connector=error_connector,
+                    feature="executor_creation",
+                    reason="invalid_type",
                 )
             )
 
@@ -881,50 +950,67 @@ class ExecutorService:
 
         return executor_class, config_class, typed_config
 
-    async def _prepare_market(self, account: str, connector_name: Optional[str], trading_pair: Optional[str]):
+    async def _prepare_market(
+        self,
+        trading_interface: AccountTradingInterface,
+        connector_name: Optional[str],
+        trading_pair: Optional[str],
+    ):
         """Ensure the connector and market for the executor are ready on the account's trading interface."""
-        trading_interface = self._get_trading_interface(account)
         if connector_name:
             if trading_pair:
                 await trading_interface.add_market(connector_name, trading_pair)
             else:
                 await trading_interface.ensure_connector(connector_name)
 
-    def _instantiate_and_register(
+    def _construct_executor(
         self,
         executor_class: Type[ExecutorBase],
         typed_config: ExecutorConfigBase,
         trading_interface: AccountTradingInterface,
-        metadata: Dict[str, Any]
+    ) -> ExecutorBase:
+        """Run accepted-core constructor validation with a sanitized failure."""
+        try:
+            return executor_class(
+                strategy=trading_interface,
+                config=typed_config,
+                update_interval=self.update_interval,
+                max_retries=self.max_retries,
+            )
+        except Exception as exc:
+            connector_name = getattr(typed_config, "connector_name", None)
+            raise ConnectorCapabilityError(
+                CapabilityErrorDetail(
+                    code="invalid_executor_config",
+                    message="Executor configuration failed constructor validation.",
+                    connector=(
+                        connector_name
+                        if isinstance(connector_name, str) and connector_name
+                        else "executor"
+                    ),
+                    feature="executor_creation",
+                    reason="constructor_failed",
+                )
+            ) from exc
+
+    def _register_and_start_executor(
+        self,
+        executor: ExecutorBase,
+        typed_config: ExecutorConfigBase,
+        metadata: Dict[str, Any],
     ) -> tuple[str, ExecutorBase]:
         """
-        Instantiate the executor, register it in memory and start it.
+        Register an already constructed executor in memory and start it.
 
         Args:
-            executor_class: Executor class to instantiate
+            executor: Constructor-validated executor instance
             typed_config: Validated typed executor config
-            trading_interface: Trading interface acting as the executor's strategy
             metadata: Metadata dict to register for the executor
 
         Returns:
             Tuple of (executor_id, executor)
 
-        Raises:
-            HTTPException: 400 if the executor fails to instantiate
         """
-        try:
-            executor = executor_class(
-                strategy=trading_interface,
-                config=typed_config,
-                update_interval=self.update_interval,
-                max_retries=self.max_retries
-            )
-        except Exception as e:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Failed to create executor: {str(e)}"
-            )
-
         executor_id = typed_config.id
         self._active_executors[executor_id] = executor
         self._executor_metadata[executor_id] = metadata
@@ -952,9 +1038,9 @@ class ExecutorService:
         Returns:
             Dictionary with executor_id and initial status
         """
-        account = validate_account_name(account_name or self.default_account)
-        markets = self._extract_executor_markets(executor_config)
-        self._require_executor_market_capabilities(markets)
+        account = validate_account_name(
+            self.default_account if account_name is None else account_name
+        )
 
         # Validation adds a default timestamp. Keep caller-owned request data exact.
         config_data = copy.deepcopy(executor_config)
@@ -965,13 +1051,40 @@ class ExecutorService:
             config_data, default_timestamp=time.time()
         )
         executor_type = config_data["type"]
-        trading_interface = self._get_trading_interface(account)
+
+        # Connector gates are deterministic only after the complete executor
+        # config has passed pure validation.
+        markets = self._extract_executor_markets(config_data)
+        self._require_executor_market_capabilities(markets)
+
+        # Constructors can reject relationships that Pydantic accepts (for
+        # example DCA amount/price lengths). Run that validation against an
+        # unpublished interface before caching it or preparing any market.
+        trading_interface, candidate_unpublished = (
+            self._get_trading_interface_candidate(account)
+        )
+        executor = self._construct_executor(
+            executor_class, typed_config, trading_interface
+        )
+        if candidate_unpublished:
+            published_interface = self._publish_trading_interface(
+                account, trading_interface
+            )
+            if published_interface is not trading_interface:
+                trading_interface = published_interface
+                executor = self._construct_executor(
+                    executor_class, typed_config, trading_interface
+                )
+        else:
+            self._trading_interfaces.setdefault(account, trading_interface)
 
         # Ensure connector and market are ready
         connector_name = config_data.get("connector_name")
         trading_pair = config_data.get("trading_pair")
         for market_connector, market_pair in markets:
-            await self._prepare_market(account, market_connector, market_pair)
+            await self._prepare_market(
+                trading_interface, market_connector, market_pair
+            )
 
         # Instantiate the executor, register it in memory and start it
         controller_id = controller_id or getattr(typed_config, "controller_id", "main") or "main"
@@ -984,7 +1097,9 @@ class ExecutorService:
             "created_at": datetime.now(timezone.utc),
             "config": config_data
         }
-        executor_id, executor = self._instantiate_and_register(executor_class, typed_config, trading_interface, metadata)
+        executor_id, executor = self._register_and_start_executor(
+            executor, typed_config, metadata
+        )
 
         # Persist to database
         await self._persist_executor_created(executor_id, executor)

@@ -1421,6 +1421,32 @@ class TradingService:
 
     # ==================== Trading Interface ====================
 
+    def get_cached_trading_interface(
+        self, account_name: str
+    ) -> Optional[AccountTradingInterface]:
+        """Return a published account interface without creating one."""
+        return self._trading_interfaces.get(account_name)
+
+    def create_trading_interface_candidate(
+        self, account_name: str
+    ) -> AccountTradingInterface:
+        """Build an interface candidate without publishing it to the cache."""
+        return AccountTradingInterface(
+            connector_service=self._connector_service,
+            market_data_service=self._market_data_service,
+            account_name=account_name,
+        )
+
+    def publish_trading_interface(
+        self,
+        account_name: str,
+        trading_interface: AccountTradingInterface,
+    ) -> AccountTradingInterface:
+        """Publish a validated candidate, preserving an existing exact owner."""
+        return self._trading_interfaces.setdefault(
+            account_name, trading_interface
+        )
+
     def get_trading_interface(self, account_name: str) -> AccountTradingInterface:
         """
         Get or create a trading interface for the specified account.
@@ -1434,13 +1460,13 @@ class TradingService:
         Returns:
             AccountTradingInterface instance for the account
         """
-        if account_name not in self._trading_interfaces:
-            self._trading_interfaces[account_name] = AccountTradingInterface(
-                connector_service=self._connector_service,
-                market_data_service=self._market_data_service,
-                account_name=account_name
+        trading_interface = self.get_cached_trading_interface(account_name)
+        if trading_interface is None:
+            trading_interface = self.publish_trading_interface(
+                account_name,
+                self.create_trading_interface_candidate(account_name),
             )
-        return self._trading_interfaces[account_name]
+        return trading_interface
 
     def get_all_trading_interfaces(self) -> Dict[str, AccountTradingInterface]:
         """Get all active trading interfaces."""

@@ -54,60 +54,132 @@ class GatewayTransactionPoller:
         self._running = False
         self._poll_task: Optional[asyncio.Task] = None
         self._position_poll_task: Optional[asyncio.Task] = None
+        self._lifecycle_lock = asyncio.Lock()
+        self._lifecycle_generation = 0
         self._last_position_poll: Optional[datetime] = None
         # Consecutive position-info misses per position. A single 404/500 can be a
         # transient RPC problem (Gateway 500s on upstream hiccups), so a position is
         # only marked CLOSED after MISSING_STRIKES_TO_CLOSE consecutive misses.
         self._position_missing_strikes: Dict[str, int] = {}
 
-    async def start(self):
-        """Start the polling service."""
-        if self._running:
-            logger.warning("GatewayTransactionPoller already running")
-            return
+    def _ensure_lifecycle_state(self) -> None:
+        """Initialize lifecycle state for normal and dependency-light instances."""
+        if not hasattr(self, "_lifecycle_lock"):
+            self._lifecycle_lock = asyncio.Lock()
+        if not hasattr(self, "_lifecycle_generation"):
+            self._lifecycle_generation = 0
 
-        self._running = True
-        self._poll_task = asyncio.create_task(self._poll_loop())
-        self._position_poll_task = asyncio.create_task(self._position_poll_loop())
-        logger.info(f"GatewayTransactionPoller started (tx_poll={self.poll_interval}s, pos_poll={self.position_poll_interval}s)")
+    @staticmethod
+    def _create_publisher_task(coroutine) -> asyncio.Task:
+        """Create a task without leaking an unawaited coroutine on failure."""
+        try:
+            return asyncio.create_task(coroutine)
+        except BaseException:
+            close = getattr(coroutine, "close", None)
+            if close is not None:
+                close()
+            raise
+
+    @staticmethod
+    async def _cancel_and_drain(tasks) -> list[BaseException]:
+        """Cancel a complete generation and retrieve every terminal outcome."""
+        tasks = tuple(task for task in tasks if task is not None)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if not tasks:
+            return []
+        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+        return [
+            outcome
+            for outcome in outcomes
+            if isinstance(outcome, BaseException)
+            and not isinstance(outcome, asyncio.CancelledError)
+        ]
+
+    async def start(self):
+        """Start exactly one complete publisher generation."""
+        self._ensure_lifecycle_state()
+        requested_generation = self._lifecycle_generation
+        async with self._lifecycle_lock:
+            # A stop that completed while this call waited owns the later lifecycle
+            # decision. A fresh explicit start can retry against the new generation.
+            if requested_generation != self._lifecycle_generation:
+                logger.info(
+                    "GatewayTransactionPoller ignored a stale start request"
+                )
+                return
+
+            current_tasks = (self._poll_task, self._position_poll_task)
+            complete_live_generation = (
+                self._running
+                and all(task is not None for task in current_tasks)
+                and all(not task.done() for task in current_tasks)
+            )
+            if complete_live_generation:
+                logger.warning("GatewayTransactionPoller already running")
+                return
+
+            # A terminal/live or otherwise partial generation is not running truth.
+            # Reap both handles before a retry publishes either replacement.
+            self._running = False
+            prior_failures = await self._cancel_and_drain(current_tasks)
+            self._poll_task = None
+            self._position_poll_task = None
+            if prior_failures:
+                logger.error(
+                    "GatewayTransactionPoller reaped %d failed publisher(s)",
+                    len(prior_failures),
+                )
+
+            transaction_task = None
+            position_task = None
+            self._running = True
+            try:
+                transaction_task = self._create_publisher_task(
+                    self._poll_loop()
+                )
+                position_task = self._create_publisher_task(
+                    self._position_poll_loop()
+                )
+            except BaseException:
+                self._running = False
+                await self._cancel_and_drain(
+                    (transaction_task, position_task)
+                )
+                self._poll_task = None
+                self._position_poll_task = None
+                self._lifecycle_generation += 1
+                raise
+
+            self._poll_task = transaction_task
+            self._position_poll_task = position_task
+            self._lifecycle_generation += 1
+            logger.info(
+                "GatewayTransactionPoller started "
+                "(tx_poll=%ss, pos_poll=%ss)",
+                self.poll_interval,
+                self.position_poll_interval,
+            )
 
     async def stop(self):
         """Stop the polling service."""
-        self._running = False
-        tasks = (
-            ("_poll_task", self._poll_task),
-            ("_position_poll_task", self._position_poll_task),
-        )
+        self._ensure_lifecycle_state()
+        async with self._lifecycle_lock:
+            self._running = False
+            transaction_task = self._poll_task
+            position_task = self._position_poll_task
+            failures = await self._cancel_and_drain(
+                (transaction_task, position_task)
+            )
+            if self._poll_task is transaction_task:
+                self._poll_task = None
+            if self._position_poll_task is position_task:
+                self._position_poll_task = None
+            # Invalidates every start request that was queued before or during
+            # this complete drain. Only a later explicit start may replace it.
+            self._lifecycle_generation += 1
 
-        async def cancel_and_drain(attribute, task):
-            if task is None:
-                return None
-            try:
-                if not task.done():
-                    task.cancel()
-                outcome = (
-                    await asyncio.gather(task, return_exceptions=True)
-                )[0]
-                if isinstance(outcome, asyncio.CancelledError):
-                    return None
-                return outcome if isinstance(outcome, BaseException) else None
-            finally:
-                if getattr(self, attribute, None) is task:
-                    setattr(self, attribute, None)
-
-        # Each drain owns its own finally path. A failure from one publisher is
-        # only raised after both tasks have been cancelled and reached terminal
-        # state, so the other publisher can never be skipped.
-        failures = await asyncio.gather(
-            *(cancel_and_drain(attribute, task) for attribute, task in tasks),
-            return_exceptions=True,
-        )
-        failures = [
-            failure
-            for failure in failures
-            if isinstance(failure, BaseException)
-            and not isinstance(failure, asyncio.CancelledError)
-        ]
         if failures:
             logger.error(
                 "GatewayTransactionPoller stopped with %d task failure(s)",

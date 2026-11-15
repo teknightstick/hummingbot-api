@@ -5322,7 +5322,7 @@ async def test_residual_b7_account_refresh_rejects_before_all_state_and_network_
 
 
 @pytest.mark.asyncio
-async def test_residual_b7_nested_executor_configs_reject_before_interface_or_config_mutation():
+async def test_residual_b7_nested_executor_configs_validate_before_capability_rejection():
     from services.connector_capabilities import (
         ConnectorCapabilityError,
         ConnectorCapabilityRegistry,
@@ -5349,11 +5349,11 @@ async def test_residual_b7_nested_executor_configs_reject_before_interface_or_co
     service.default_account = "master"
     service._trading_interfaces = {}
 
-    def forbidden_validation(*args, **kwargs):
+    def validate_without_mutation(*args, **kwargs):
         calls.append(("validate", None))
-        raise AssertionError("config validation preceded capability rejection")
+        return object, object, object()
 
-    service._validate_executor_config = forbidden_validation
+    service._validate_executor_config = validate_without_mutation
     cases = (
         {
             "type": "arbitrage_executor",
@@ -5383,7 +5383,10 @@ async def test_residual_b7_nested_executor_configs_reject_before_interface_or_co
         with pytest.raises(ConnectorCapabilityError):
             await service.create_executor(config, account_name="master")
         CHECK.assertEqual(original, config)
-    CHECK.assertEqual([], calls)
+    CHECK.assertEqual(
+        [("validate", None), ("validate", None)],
+        calls,
+    )
     CHECK.assertEqual({}, service._trading_interfaces)
 
 
@@ -8308,6 +8311,413 @@ async def test_issue224_pair_raise_is_typed_and_sanitized_through_public_callers
         "#/components/schemas/CapabilityErrorResponse",
         responses["400"]["content"]["application/json"]["schema"]["$ref"],
     )
+
+
+@pytest.mark.asyncio
+async def test_issue224_gateway_lifecycle_rejects_start_queued_during_stop():
+    module = _load_gateway_transaction_poller_module()
+    release_drain = asyncio.Event()
+    transaction_cancelled = asyncio.Event()
+    position_cancelled = asyncio.Event()
+    owned_tasks = set()
+
+    async def cancellation_resistant(cancelled):
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release_drain.wait()
+
+    async def replacement_publisher():
+        owned_tasks.add(asyncio.current_task())
+        await asyncio.Event().wait()
+
+    transaction_task = asyncio.create_task(
+        cancellation_resistant(transaction_cancelled)
+    )
+    position_task = asyncio.create_task(
+        cancellation_resistant(position_cancelled)
+    )
+    owned_tasks.update((transaction_task, position_task))
+    poller = object.__new__(module.GatewayTransactionPoller)
+    poller._running = True
+    poller._poll_task = transaction_task
+    poller._position_poll_task = position_task
+    poller._poll_loop = replacement_publisher
+    poller._position_poll_loop = replacement_publisher
+    poller.poll_interval = 1
+    poller.position_poll_interval = 1
+
+    stop_task = asyncio.create_task(poller.stop())
+    start_task = None
+    try:
+        await asyncio.wait_for(transaction_cancelled.wait(), timeout=1)
+        await asyncio.wait_for(position_cancelled.wait(), timeout=1)
+        start_task = asyncio.create_task(poller.start())
+        await asyncio.sleep(0)
+        CHECK.assertFalse(start_task.done())
+        CHECK.assertIs(transaction_task, poller._poll_task)
+        CHECK.assertIs(position_task, poller._position_poll_task)
+
+        release_drain.set()
+        await stop_task
+        await start_task
+        CHECK.assertFalse(poller._running)
+        CHECK.assertIsNone(poller._poll_task)
+        CHECK.assertIsNone(poller._position_poll_task)
+
+        await poller.start()
+        CHECK.assertTrue(poller._running)
+        CHECK.assertIsNotNone(poller._poll_task)
+        CHECK.assertIsNotNone(poller._position_poll_task)
+        CHECK.assertIsNot(poller._poll_task, transaction_task)
+        CHECK.assertIsNot(poller._position_poll_task, position_task)
+        await poller.stop()
+    finally:
+        release_drain.set()
+        for task in tuple(owned_tasks) + tuple(
+            task
+            for task in (stop_task, start_task)
+            if task is not None
+        ):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *owned_tasks,
+            stop_task,
+            *(task for task in (start_task,) if task is not None),
+            return_exceptions=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_issue224_gateway_start_is_transactional_and_retryable(monkeypatch):
+    module = _load_gateway_transaction_poller_module()
+    created_tasks = []
+
+    async def publisher():
+        await asyncio.Event().wait()
+
+    poller = object.__new__(module.GatewayTransactionPoller)
+    poller._running = False
+    poller._poll_task = None
+    poller._position_poll_task = None
+    poller._poll_loop = publisher
+    poller._position_poll_loop = publisher
+    poller.poll_interval = 1
+    poller.position_poll_interval = 1
+    original_create_task = asyncio.create_task
+    calls = 0
+
+    def fail_second_create(coroutine):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("second-publisher-create-failed")
+        task = original_create_task(coroutine)
+        created_tasks.append(task)
+        return task
+
+    try:
+        with monkeypatch.context() as patcher:
+            patcher.setattr(module.asyncio, "create_task", fail_second_create)
+            with pytest.raises(
+                RuntimeError, match="second-publisher-create-failed"
+            ):
+                await poller.start()
+        CHECK.assertFalse(poller._running)
+        CHECK.assertIsNone(poller._poll_task)
+        CHECK.assertIsNone(poller._position_poll_task)
+        CHECK.assertEqual(1, len(created_tasks))
+        CHECK.assertTrue(created_tasks[0].done())
+
+        await poller.start()
+        CHECK.assertTrue(poller._running)
+        CHECK.assertIsNotNone(poller._poll_task)
+        CHECK.assertIsNotNone(poller._position_poll_task)
+        await poller.stop()
+    finally:
+        for task in created_tasks:
+            if not task.done():
+                task.cancel()
+        for task in (
+            getattr(poller, "_poll_task", None),
+            getattr(poller, "_position_poll_task", None),
+        ):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(*created_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_issue224_gateway_partial_generation_is_reaped_before_retry():
+    module = _load_gateway_transaction_poller_module()
+    position_cancelled = asyncio.Event()
+
+    async def old_position_publisher():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            position_cancelled.set()
+
+    async def replacement_publisher():
+        await asyncio.Event().wait()
+
+    terminal_transaction = asyncio.create_task(asyncio.sleep(0))
+    old_position = asyncio.create_task(old_position_publisher())
+    await terminal_transaction
+    poller = object.__new__(module.GatewayTransactionPoller)
+    poller._running = True
+    poller._poll_task = terminal_transaction
+    poller._position_poll_task = old_position
+    poller._poll_loop = replacement_publisher
+    poller._position_poll_loop = replacement_publisher
+    poller.poll_interval = 1
+    poller.position_poll_interval = 1
+    try:
+        await poller.start()
+        CHECK.assertTrue(position_cancelled.is_set())
+        CHECK.assertTrue(old_position.done())
+        CHECK.assertIsNot(terminal_transaction, poller._poll_task)
+        CHECK.assertIsNot(old_position, poller._position_poll_task)
+        CHECK.assertFalse(poller._poll_task.done())
+        CHECK.assertFalse(poller._position_poll_task.done())
+        await poller.stop()
+    finally:
+        for task in (
+            terminal_transaction,
+            old_position,
+            getattr(poller, "_poll_task", None),
+            getattr(poller, "_position_poll_task", None),
+        ):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            terminal_transaction,
+            old_position,
+            *(
+                task
+                for task in (
+                    getattr(poller, "_poll_task", None),
+                    getattr(poller, "_position_poll_task", None),
+                )
+                if task is not None
+            ),
+            return_exceptions=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_issue224_wallet_close_failure_is_sanitized_and_retryable():
+    accounts_module = _load_accounts_service_module()
+    events = []
+
+    class GatewayPoller:
+        async def stop(self):
+            events.append("poller-stopped")
+
+    class WalletService:
+        def __init__(self):
+            self.close_calls = 0
+
+        async def close(self):
+            self.close_calls += 1
+            events.append("wallet-close")
+            if self.close_calls == 1:
+                raise RuntimeError("PRIVATE-WALLET-CLOSE-DETAIL")
+
+    class ConnectorService:
+        async def stop_all(self):
+            events.append("connectors-stopped")
+
+    wallet = WalletService()
+    service = object.__new__(accounts_module.AccountsService)
+    service._connector_service = ConnectorService()
+    service.gateway_wallet_service = wallet
+    service.gateway_tx_poller = GatewayPoller()
+    service.accounts_state = {}
+    service._update_account_state_task = None
+    service._order_status_polling_task = None
+    service._gateway_poller_start_task = None
+    service._gateway_poller_started = False
+    service._account_continuations = set()
+    service._publisher_tasks = set()
+    service._stopping = False
+    service._stopped = False
+    service._stop_in_progress = False
+    service._stop_lock = asyncio.Lock()
+
+    with pytest.raises(RuntimeError) as failure:
+        await service.stop()
+    CHECK.assertEqual("gateway_wallet_close_failed", str(failure.value))
+    CHECK.assertNotIn("PRIVATE", str(failure.value))
+    CHECK.assertIsNone(failure.value.__cause__)
+    CHECK.assertEqual(
+        ["poller-stopped", "wallet-close", "connectors-stopped"], events
+    )
+    CHECK.assertTrue(service._stopping)
+    CHECK.assertFalse(service._stopped)
+    with pytest.raises(RuntimeError, match="accounts_service_stop_incomplete"):
+        service.start()
+
+    await service.stop()
+    CHECK.assertEqual(2, wallet.close_calls)
+    CHECK.assertTrue(service._stopping)
+    CHECK.assertTrue(service._stopped)
+
+
+@pytest.mark.asyncio
+async def test_issue224_executor_validation_precedes_capabilities_and_defaults_only_none():
+    from models.connectors import CapabilityErrorResponse
+    from services.connector_capabilities import ConnectorCapabilityError
+
+    module = _load_executor_service_module()
+    capability_calls = []
+
+    class ConnectorService:
+        def require_capability(self, *args, **kwargs):
+            capability_calls.append((args, kwargs))
+            raise AssertionError("capability gate ran before config validation")
+
+    class TradingService:
+        connector_service = ConnectorService()
+
+        def get_trading_interface(self, account_name):
+            raise AssertionError("invalid input reached interface creation")
+
+    service = object.__new__(module.ExecutorService)
+    service._trading_service = TradingService()
+    service._trading_interfaces = {}
+    service.default_account = "master_account"
+
+    with pytest.raises(ConnectorCapabilityError) as missing_type:
+        await service.create_executor(
+            {
+                "connector_name": "manzana",
+                "trading_pair": "BTC-USD",
+            },
+            account_name="master_account",
+        )
+    CHECK.assertEqual("missing_type", missing_type.value.detail["reason"])
+    CHECK.assertEqual([], capability_calls)
+
+    for executor_type in ([], {}, 0, False):
+        with pytest.raises(ConnectorCapabilityError) as invalid_type:
+            await service.create_executor(
+                {"type": executor_type}, account_name="master_account"
+            )
+        CHECK.assertEqual(
+            "invalid_executor_config", invalid_type.value.detail["code"]
+        )
+        CHECK.assertEqual("invalid_type", invalid_type.value.detail["reason"])
+        CapabilityErrorResponse.model_validate(
+            {"detail": invalid_type.value.detail}
+        )
+
+    for account_name in ("", 0, False, [], {}):
+        with pytest.raises(ConnectorCapabilityError) as invalid_account:
+            await service.create_executor({}, account_name=account_name)
+        CHECK.assertEqual(
+            "invalid_account_resource_name",
+            invalid_account.value.detail["code"],
+        )
+    CHECK.assertEqual({}, service._trading_interfaces)
+
+
+@pytest.mark.asyncio
+async def test_issue224_executor_constructor_failure_is_typed_and_unpublished(monkeypatch):
+    from models.connectors import CapabilityErrorResponse
+    from services.connector_capabilities import ConnectorCapabilityError
+
+    module = _load_executor_service_module()
+    events = []
+
+    class ConnectorService:
+        def require_capability(self, *args, **kwargs):
+            events.append("capability")
+
+        def get_account_connectors(self, account_name):
+            return {}
+
+    class CandidateInterface:
+        def __init__(self, connector_service, market_data_service, account_name):
+            self.current_timestamp = 123.0
+            self.account_name = account_name
+            events.append("candidate-created")
+
+        async def add_market(self, connector_name, trading_pair):
+            events.append("market-prepared")
+
+        async def ensure_connector(self, connector_name):
+            events.append("connector-prepared")
+
+    class TradingService:
+        def __init__(self):
+            self.connector_service = ConnectorService()
+            self.market_data_service = object()
+            self._trading_interfaces = {}
+
+        def get_trading_interface(self, account_name):
+            interface = CandidateInterface(
+                self.connector_service, self.market_data_service, account_name
+            )
+            self._trading_interfaces[account_name] = interface
+            return interface
+
+    class StrictConfig(BaseModel):
+        type: str
+        id: str = "candidate-executor"
+        connector_name: str
+        trading_pair: str
+
+    class RejectingExecutor:
+        def __init__(self, **kwargs):
+            events.append("constructor")
+            raise ValueError("PRIVATE-CONSTRUCTOR-DETAIL")
+
+    monkeypatch.setattr(module, "AccountTradingInterface", CandidateInterface)
+    trading_service = TradingService()
+    service = object.__new__(module.ExecutorService)
+    service._trading_service = trading_service
+    service._trading_interfaces = {}
+    service._active_executors = {}
+    service._executor_metadata = {}
+    service.default_account = "master_account"
+    service.update_interval = 1
+    service.max_retries = 1
+    service.EXECUTOR_REGISTRY = {
+        "position_executor": (RejectingExecutor, StrictConfig)
+    }
+
+    with pytest.raises(ConnectorCapabilityError) as constructor_failure:
+        await service.create_executor(
+            {
+                "type": "position_executor",
+                "connector_name": "generic",
+                "trading_pair": "BTC-USD",
+            },
+            account_name="master_account",
+        )
+    CHECK.assertEqual(
+        "invalid_executor_config", constructor_failure.value.detail["code"]
+    )
+    CHECK.assertEqual(
+        "constructor_failed", constructor_failure.value.detail["reason"]
+    )
+    CHECK.assertNotIn(
+        "PRIVATE", json.dumps(constructor_failure.value.detail)
+    )
+    CapabilityErrorResponse.model_validate(
+        {"detail": constructor_failure.value.detail}
+    )
+    CHECK.assertIn("candidate-created", events)
+    CHECK.assertIn("constructor", events)
+    CHECK.assertNotIn("market-prepared", events)
+    CHECK.assertNotIn("connector-prepared", events)
+    CHECK.assertEqual({}, service._trading_interfaces)
+    CHECK.assertEqual({}, trading_service._trading_interfaces)
+    CHECK.assertEqual({}, service._active_executors)
+    CHECK.assertEqual({}, service._executor_metadata)
 
 
 @pytest.mark.asyncio
